@@ -143,7 +143,8 @@ class FrozenTetModel(BaseModel):
         
         # Load state dict to ensure all parameters are properly loaded
         model.load_state_dict(ckpt)
-        model.min_t = model.scene_scaling * config.base_min_t
+        base_min_t = getattr(config, "base_min_t", getattr(config, "min_t", 0.4))
+        model.min_t = model.scene_scaling * base_min_t
         
         return model
 

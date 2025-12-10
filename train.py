@@ -193,11 +193,11 @@ S = model.vertices.shape[0]
 dschedule = list(range(args.densify_start, args.densify_end, args.densify_interval))
 
 print("Encoding LR")
-xs = list(range(args.iterations))
-ys = [tet_optim.encoder_scheduler_args(x) for x in xs]
-fig = tpl.figure()
-fig.plot(xs, ys, width=150, height=20)
-fig.show()
+# xs = list(range(args.iterations))
+# ys = [tet_optim.encoder_scheduler_args(x) for x in xs]
+# fig = tpl.figure()
+# fig.plot(xs, ys, width=150, height=20)
+# fig.show()
 
 densification_sampler = SimpleSampler(len(train_cameras), args.num_samples)
 

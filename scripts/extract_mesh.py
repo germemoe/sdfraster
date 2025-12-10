@@ -1,5 +1,12 @@
 import torch
 from pathlib import Path
+import sys
+
+# Ensure project root is importable when run from scripts/ or elsewhere
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from data import loader
 from utils.args import Args
 from models.ingp_color import Model
@@ -21,9 +28,9 @@ from utils.topo_utils import tet_volumes
 
 args = Args()
 args.tile_size = 4
-args.image_folder = "images_4"
-args.dataset_path = Path("/optane/nerf_datasets/360/bicycle")
-args.output_path = Path("output/test/")
+args.image_folder = "images"
+args.dataset_path = Path("/home/jk/data/dataset/DTU/scan37")
+args.output_path = Path("output/DTU/scan37/")
 args.eval = True
 args.use_ply = False
 args.contrib_threshold = 0.1
@@ -31,12 +38,14 @@ args.mu_val = -0.11
 args.factor = 0.1
 args.iterations = 25
 args.freeze_features = True
+args.merge_meshes = False
+args.merged_mesh_name = "merged.ply"
 args = Args.from_namespace(args.get_parser().parse_args())
 
 device = torch.device('cuda')
 try:
-    model = Model.load_ckpt(args.output_path, device, args)
-except:
+    model = Model.load_ckpt(args.output_path, device)
+except Exception:
     # if args.freeze_features:
     #     from models.frozen_features import FrozenTetModel, FrozenTetOptimizer
     # else:
@@ -150,9 +159,37 @@ meshes = mesh_util.extract_meshes(
     vcolors.detach().cpu().numpy(),
     verts.detach().cpu().numpy(),
     model.indices[mask].cpu().numpy())
+
+saved_meshes = []
 for i, mesh in enumerate(meshes):
     F = mesh['face']['vertex_indices'].shape[0]
     if F > 1000:
         mpath = path / f"{i}.ply"
         print(f"Saving #F:{F} to {mpath}")
         tinyplypy.write_ply(str(mpath), mesh, is_binary=False)
+        saved_meshes.append(mesh)
+
+if args.merge_meshes and len(saved_meshes) > 0:
+    # Concatenate all component meshes into a single mesh
+    merged_vertex = {}
+    merged_faces = []
+    offset = 0
+    for mesh in saved_meshes:
+        vdict = mesh["vertex"]
+        # Initialize keys
+        for k, arr in vdict.items():
+            merged_vertex.setdefault(k, [])
+            merged_vertex[k].append(arr)
+        f = mesh["face"]["vertex_indices"]
+        merged_faces.append(f + offset)
+        offset += len(vdict["x"])
+
+    merged_vertex = {k: np.concatenate(v).astype(np.float32) for k, v in merged_vertex.items()}
+    merged_faces = np.concatenate(merged_faces).astype(np.int32)
+    merged_mesh = {
+        "vertex": merged_vertex,
+        "face": {"vertex_indices": merged_faces}
+    }
+    merged_path = path / args.merged_mesh_name
+    print(f"Merging {len(saved_meshes)} meshes into {merged_path}")
+    tinyplypy.write_ply(str(merged_path), merged_mesh, is_binary=False)
