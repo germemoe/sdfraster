@@ -196,6 +196,8 @@ AlphaOut alpha_blend(TensorView<int32_t> sorted_gauss_idx,
                    TensorView<int32_t> indices,
                    DiffTensorView vertices,
                    DiffTensorView tet_density,
+                   DiffTensorView vert_sdf,  // [SDF-MODIFICATION] 全局顶点SDF数组
+                   DiffTensorView inv_s_tensor,  // [SDF-MODIFICATION] NeuS inv_s 参数 (可微，单元素tensor)
                    DiffTensorView final_pixel_state,
                    DiffTensorView final_distortion_state,
                    TensorView<int32_t> n_contributors,
@@ -240,7 +242,7 @@ AlphaOut alpha_blend(TensorView<int32_t> sorted_gauss_idx,
         {
             uint32_t coll_id = uint32_t(sorted_gauss_idx[tile_idx_start + splat_pointer_offset]);
             collected_idx[thread_rank] = coll_id;
-            collected_splats[thread_rank] = load_tet_alphablend_interp(coll_id, vertices, indices, tet_density);
+            collected_splats[thread_rank] = load_tet_alphablend_interp(coll_id, vertices, indices, tet_density, vert_sdf);
         }
         AllMemoryBarrierWithGroupSync();
         if (thread_active) {
@@ -249,7 +251,8 @@ AlphaOut alpha_blend(TensorView<int32_t> sorted_gauss_idx,
                 local_n_contrib++;
                 SplatTetrahedra_interp g = collected_splats[j];
                 CtrlPt tetra_ctrl;
-                if (evaluate_tetra_interp(g, ray.o, ray.d, cam.min_t, tetra_ctrl) && tetra_ctrl.rgba.a > 0) {
+                float inv_s = inv_s_tensor[uint(0)];  // [SDF-MODIFICATION] 从tensor读取inv_s
+                if (evaluate_tetra_interp(g, ray.o, ray.d, cam.min_t, inv_s, tetra_ctrl) && tetra_ctrl.rgba.a > 0) {
                     AlphaOut new_ao = update_alpha_out(ao, tetra_ctrl);
 
                     ao = new_ao;
@@ -274,6 +277,8 @@ void bwd_alpha_blend(TensorView<int32_t> sorted_gauss_idx,
                      TensorView<int32_t> indices,
                      DiffTensorView vertices,
                      DiffTensorView tet_density,
+                     DiffTensorView vert_sdf,  // [SDF-MODIFICATION] 全局顶点SDF数组
+                     DiffTensorView inv_s_tensor,  // [SDF-MODIFICATION] NeuS inv_s 参数 (可微tensor)
                      DiffTensorView final_pixel_state,
                      DiffTensorView final_distortion_state,
                      TensorView<int32_t> n_contributors,
@@ -317,6 +322,10 @@ void bwd_alpha_blend(TensorView<int32_t> sorted_gauss_idx,
 
     DifferentialPair<float2> dp_center_pix_coord = diffPair(center_pix_coord);
 
+    // [SDF-MODIFICATION] 从tensor读取inv_s并初始化梯度累加器
+    float inv_s = inv_s_tensor[uint(0)];
+    float d_inv_s = 0.0f;  // 累加inv_s的梯度
+
     uint32_t thread_rank = cudaThreadIdx().y * cudaBlockDim().x + cudaThreadIdx().x;
     for (int i = 0; i < rounds; i++)
     {
@@ -327,7 +336,7 @@ void bwd_alpha_blend(TensorView<int32_t> sorted_gauss_idx,
         {
             uint32_t coll_id = uint32_t(sorted_gauss_idx[tile_idx_end - progress - 1]);
             collected_idx[thread_rank] = coll_id;
-            collected_splats[thread_rank] = load_tet_alphablend_interp(coll_id, vertices, indices, tet_density);
+            collected_splats[thread_rank] = load_tet_alphablend_interp(coll_id, vertices, indices, tet_density, vert_sdf);
         }
         AllMemoryBarrierWithGroupSync();
         if (is_inside) {
@@ -340,7 +349,7 @@ void bwd_alpha_blend(TensorView<int32_t> sorted_gauss_idx,
                 SplatTetrahedra_interp g = collected_splats[j];
 
                 CtrlPt tetra_ctrl;
-                if (evaluate_tetra_interp(g, ray.o, ray.d, cam.min_t, tetra_ctrl) && tetra_ctrl.rgba.a > 0) {
+                if (evaluate_tetra_interp(g, ray.o, ray.d, cam.min_t, inv_s, tetra_ctrl) && tetra_ctrl.rgba.a > 0) {
                     ao = undo_alpha_out(ao, tetra_ctrl);
 
                     // Back-prop automatically through blending and gaussian evaluation.
@@ -349,6 +358,8 @@ void bwd_alpha_blend(TensorView<int32_t> sorted_gauss_idx,
                     DifferentialPair<float3> dp_ray_d = diffPair(ray.d);
                     DifferentialPair<CtrlPt> dp_tetra_ctrl = diffPair(tetra_ctrl);
                     DifferentialPair<AlphaOut> dp_ao = diffPair(ao);
+                    // [SDF-MODIFICATION] 创建inv_s的DifferentialPair用于梯度传播
+                    DifferentialPair<float> dp_inv_s = diffPair(inv_s, 0.0f);
 
                     bwd_diff(update_alpha_out)(dp_ao, dp_tetra_ctrl, d_ao);
                     d_ao = dp_ao.getDifferential();
@@ -358,13 +369,23 @@ void bwd_alpha_blend(TensorView<int32_t> sorted_gauss_idx,
                         dp_tetra_ctrl.d.dist,
                         dp_tetra_ctrl.d.density,
                     };
-                    bwd_diff(evaluate_tetra_interp)(dp_g, dp_ray_o, dp_ray_d, cam.min_t, d_tetra_scale);
-                    bwd_diff(load_tet_alphablend_interp)(g_idx, vertices, indices, tet_density, dp_g.d);
+                    // [SDF-MODIFICATION] 传递 inv_s DifferentialPair 到 evaluate_tetra_interp
+                    bwd_diff(evaluate_tetra_interp)(dp_g, dp_ray_o, dp_ray_d, cam.min_t, dp_inv_s, d_tetra_scale);
+                    // [SDF-MODIFICATION] 累加 inv_s 梯度
+                    d_inv_s += dp_inv_s.getDifferential();
+                    // [SDF-MODIFICATION] 传递 vert_sdf 到 load_tet_alphablend_interp
+                    bwd_diff(load_tet_alphablend_interp)(g_idx, vertices, indices, tet_density, vert_sdf, dp_g.d);
 
                 }
             }
         }
         splats_left_to_process -= block_size;
+    }
+
+    // [SDF-MODIFICATION] 将累加的inv_s梯度写回tensor (原子操作)
+    if (is_inside && abs(d_inv_s) > 1e-10f) {
+        float old_val;
+        inv_s_tensor.InterlockedAdd(uint(0), d_inv_s, old_val);
     }
 }
 
@@ -376,6 +397,8 @@ void splat_tiled(TensorView<int32_t> sorted_gauss_idx,
                  TensorView<int32_t> indices,
                  DiffTensorView vertices,
                  DiffTensorView tet_density,
+                 DiffTensorView vert_sdf,  // [SDF-MODIFICATION] 全局顶点SDF数组
+                 DiffTensorView inv_s_tensor,  // [SDF-MODIFICATION] NeuS inv_s 参数 (可微tensor)
                  DiffTensorView output_img,
                  DiffTensorView distortion_img,
                  TensorView<int32_t> n_contributors,
@@ -406,6 +429,8 @@ void splat_tiled(TensorView<int32_t> sorted_gauss_idx,
         indices,
         vertices,
         tet_density,
+        vert_sdf,          // [SDF-MODIFICATION] 全局顶点SDF数组
+        inv_s_tensor,      // [SDF-MODIFICATION] NeuS inv_s 参数 (可微tensor)
         output_img,
         distortion_img,
         n_contributors,
@@ -434,6 +459,8 @@ void kern_calc_tet_err(TensorView<int32_t> sorted_gauss_idx,
                   TensorView<int32_t> indices,
                   TensorView<float> vertices,
                   TensorView<float> tet_density,
+                  TensorView<float> vert_sdf,  // [SDF-MODIFICATION] 全局顶点SDF数组
+                  float inv_s,                 // [SDF-MODIFICATION] NeuS inv_s 参数
                   TensorView<float> final_pixel_state,
                   TensorView<float> tet_err,
                   TensorView<int32_t> tet_count,
@@ -476,7 +503,7 @@ void kern_calc_tet_err(TensorView<int32_t> sorted_gauss_idx,
         {
             uint32_t coll_id = uint32_t(sorted_gauss_idx[tile_idx_start + splat_pointer_offset]);
             collected_idx[thread_rank] = coll_id;
-            collected_splats[thread_rank] = load_tet_alphablend_interp(coll_id, vertices, indices, tet_density);
+            collected_splats[thread_rank] = load_tet_alphablend_interp(coll_id, vertices, indices, tet_density, vert_sdf);
         }
         AllMemoryBarrierWithGroupSync();
         if (thread_active) {
@@ -486,7 +513,7 @@ void kern_calc_tet_err(TensorView<int32_t> sorted_gauss_idx,
                 SplatTetrahedra_interp g = collected_splats[j];
                 uint32_t g_idx = collected_idx[j];
                 CtrlPt tetra_ctrl;
-                if (evaluate_tetra_interp(g, ray.o, ray.d, cam.min_t, tetra_ctrl) && tetra_ctrl.rgba.a > 0) {
+                if (evaluate_tetra_interp(g, ray.o, ray.d, cam.min_t, inv_s, tetra_ctrl) && tetra_ctrl.rgba.a > 0) {
                     AlphaOut new_ao = update_alpha_out(ao, tetra_ctrl);
 
                     float trans = exp(ao.rgba.a);
@@ -547,6 +574,8 @@ void calc_tet_err(TensorView<int32_t> sorted_gauss_idx,
                  TensorView<int32_t> indices,
                  TensorView<float> vertices,
                  TensorView<float> tet_density,
+                 TensorView<float> vert_sdf,  // [SDF-MODIFICATION] 全局顶点SDF数组
+                 float inv_s,                 // [SDF-MODIFICATION] NeuS inv_s 参数
                  TensorView<float> output_img,
                  TensorView<float> gt,
                  TensorView<float> pixel_err,
@@ -585,6 +614,8 @@ void calc_tet_err(TensorView<int32_t> sorted_gauss_idx,
         indices,
         vertices,
         tet_density,
+        vert_sdf,      // [SDF-MODIFICATION] 全局顶点SDF数组
+        inv_s,         // [SDF-MODIFICATION] NeuS inv_s 参数
         output_img,
         tet_err,
         tet_count,

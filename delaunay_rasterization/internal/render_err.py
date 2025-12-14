@@ -86,29 +86,38 @@ def render_err(gt_image, camera: Camera, model, tile_size=16, min_t=0.1, **kwarg
         f' {mod.keys()}'
     )
 
+    # [SDF-MODIFICATION] 查询全局顶点SDF并获取inv_s
+    vert_sdf = model.query_vert_sdf().reshape(-1, 1)  # (M, 1) 形状
+    inv_s = model.backbone.inv_s  # scalar tensor
+    # [SDF-MODIFICATION] 确保 inv_s 是一个 (1,) 的 tensor for splat_tiled
+    inv_s_tensor = inv_s.unsqueeze(0) if inv_s.dim() == 0 else inv_s
+
     shader = mod[(render_grid.tile_height, render_grid.tile_width)]
     st = time.time()
-    args = dict(
+    # [SDF-MODIFICATION] 共享参数 (不包含 inv_s，因为两个函数的参数名不同)
+    args_common = dict(
         sorted_gauss_idx=sorted_tetra_idx,
         tile_ranges=tile_ranges,
         indices=indices,
         vertices=vertices,
         tet_density=cell_values,
+        vert_sdf=vert_sdf,      # [SDF-MODIFICATION] 全局顶点SDF数组
         output_img=output_img,
         n_contributors=n_contributors,
         tcam=tcam,
     )
 
     splat_kernel_with_args = shader.splat_tiled(
-        **args,
+        **args_common,
+        inv_s_tensor=inv_s_tensor,  # [SDF-MODIFICATION] 可微tensor参数
         distortion_img=distortion_img,
         tet_alive=tet_alive,
         ray_jitter=ray_jitter,
     )
     splat_kernel_with_args.launchRaw(
-        blockSize=(render_grid.tile_width, 
+        blockSize=(render_grid.tile_width,
                     render_grid.tile_height, 1),
-        gridSize=(render_grid.grid_width, 
+        gridSize=(render_grid.grid_width,
                     render_grid.grid_height, 1)
     )
     torch.cuda.synchronize()
@@ -124,7 +133,7 @@ def render_err(gt_image, camera: Camera, model, tile_size=16, min_t=0.1, **kwarg
     pixel_err *= mask[0]
     ssim_err *= mask[0]
     render_img *= mask
-    
+
     assert(pixel_err.shape[0] == render_grid.image_height)
     assert(pixel_err.shape[1] == render_grid.image_width)
     assert(ssim_err.shape[0] == render_grid.image_height)
@@ -136,16 +145,17 @@ def render_err(gt_image, camera: Camera, model, tile_size=16, min_t=0.1, **kwarg
     tet_count = torch.zeros((tet_vertices.shape[0], 2), dtype=torch.int32, device=device)
 
     shader.calc_tet_err(
-        **args,
+        **args_common,
+        inv_s=inv_s.item() if inv_s.dim() == 0 else inv_s[0].item(),  # [SDF-MODIFICATION] float参数
         pixel_err=pixel_err.contiguous(),
         ssim_err=ssim_err.contiguous(),
         gt=gt_img.contiguous(),
         tet_err=tet_err,
         tet_count=tet_count,
     ).launchRaw(
-        blockSize=(render_grid.tile_width, 
+        blockSize=(render_grid.tile_width,
                     render_grid.tile_height, 1),
-        gridSize=(render_grid.grid_width, 
+        gridSize=(render_grid.grid_width,
                     render_grid.grid_height, 1)
     )
 

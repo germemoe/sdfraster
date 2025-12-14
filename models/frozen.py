@@ -39,7 +39,7 @@ class FrozenTetModel(BaseModel):
         ext_vertices: torch.Tensor,          # (N_ext, 3)
         indices: torch.Tensor,               # (T, 4)
         empty_indices: torch.Tensor,               # (T, 4)
-        density: torch.Tensor,               # (T, 1)
+        density: torch.Tensor,               # [DENSITY-RELATED] (T, 1) 四面体密度参数
         rgb: torch.Tensor,                   # (T, 3)
         gradient: torch.Tensor,              # (T, 3, 3)
         sh: torch.Tensor,                    # (T, ((max_sh_deg+1)**2-1), 3)
@@ -64,16 +64,17 @@ class FrozenTetModel(BaseModel):
         # learnable per‑tet parameters -------------------------------------------
         # self.density   = nn.Parameter(safe_log(density))    # (T, 1)
         # self.gradient  = nn.Parameter(torch.atanh(gradient.clip(min=-0.99, max=0.99)))   # (T, 3, 3)
+        # [DENSITY-RELATED] 存储每个四面体的密度参数
         self.density   = nn.Parameter(density, requires_grad=True)    # (T, 1)
         self.gradient  = nn.Parameter(gradient, requires_grad=True)   # (T, 3, 3)
         self.rgb       = nn.Parameter(rgb, requires_grad=True)        # (T, 3)
         self.sh        = nn.Parameter(sh.half(), requires_grad=True)         # (T, SH, 3)
 
         # misc --------------------------------------------------------------------
-        self.density_offset  = density_offset
+        self.density_offset  = density_offset  # [DENSITY-RELATED] 密度偏移值
         self.max_sh_deg      = max_sh_deg
         self.chunk_size      = chunk_size
-        self.device          = self.density.device
+        self.device          = self.density.device  # [DENSITY-RELATED] 从density获取设备
 
         self.mask_values = True
         self.frozen = True
@@ -114,6 +115,7 @@ class FrozenTetModel(BaseModel):
         else:
             empty_indices = torch.empty((0, 4), dtype=indices.dtype, device=indices.device)
 
+        # [DENSITY-RELATED] 从checkpoint加载密度参数
         density = ckpt['density']
         rgb = ckpt['rgb']
         gradient = ckpt['gradient']
@@ -129,13 +131,13 @@ class FrozenTetModel(BaseModel):
             ext_vertices=ext_vertices.to(device),
             indices=indices.to(device),
             empty_indices=empty_indices.to(device),
-            density=density.to(device),
+            density=density.to(device),  # [DENSITY-RELATED] 密度参数传递给模型
             rgb=rgb.to(device),
             gradient=gradient.to(device),
             sh=sh.to(device),
             center=center.to(device),
             scene_scaling=scene_scaling.to(device),
-            density_offset=config.density_offset,
+            density_offset=config.density_offset,  # [DENSITY-RELATED] 密度偏移配置
             max_sh_deg=config.max_sh_deg,
             chunk_size=config.chunk_size if hasattr(config, 'chunk_size') else 408_576,
         )
@@ -176,21 +178,26 @@ class FrozenTetModel(BaseModel):
             circumcenter = circumcenters
 
         if mask is not None:
+            # [DENSITY-RELATED] 按mask获取密度参数
             density  = self.density[mask]
             grd      = self.gradient[mask]
             rgb      = self.rgb[mask]
             sh       = self.sh[mask]
         else:
+            # [DENSITY-RELATED] 获取全部密度参数
             density  = self.density
             grd      = self.gradient
             rgb      = self.rgb
             sh       = self.sh
 
+        # [DENSITY-RELATED] 返回密度作为第二个值
         return circumcenter, density, rgb, grd, sh
 
+    # [DENSITY-RELATED] compute_features 返回密度
     def compute_features(self, offset=False):
         vertices = self.vertices
         indices = self.indices
+        # [DENSITY-RELATED] 获取密度和其他特征
         circumcenters, density, rgb, grd, sh = self.compute_batch_features(vertices, indices)
         tets = vertices[indices]
         if offset:
@@ -211,9 +218,11 @@ class FrozenTetModel(BaseModel):
     ):
         indices = self.indices[mask] if mask is not None else self.indices
         vertices = self.vertices
+        # [DENSITY-RELATED] compute_batch_features 返回密度
         cc, density, rgb, grd, sh = self.compute_batch_features(
             vertices, indices, mask, circumcenters=all_circumcenters
         )
+        # [DENSITY-RELATED] activate_output 接收密度参数
         cell_output = activate_output(
             camera.camera_center.to(self.device),
             density, rgb, grd,
@@ -234,9 +243,11 @@ class FrozenTetModel(BaseModel):
     def num_int_verts(self):
         return self.interior_vertices.shape[0]
 
+    # [DENSITY-RELATED] 计算四面体密度
     def calc_tet_density(self):
         densities = []
         verts = self.vertices
+        # [DENSITY-RELATED] 从 compute_batch_features 获取密度
         _, densities, _, _, _ = self.compute_batch_features(verts, self.indices)
         return densities.reshape(-1)
 
@@ -279,6 +290,7 @@ class FrozenTetOptimizer:
         # ------------------------------------------------------------------
         self.optim = torch.optim.RMSprop([
         # self.optim = torch.optim.Adam([
+            # [DENSITY-RELATED] density 参数优化器配置
             {"params": [model.density],  "lr": freeze_lr,  "name": "density"},
             {"params": [model.rgb],      "lr": freeze_lr,    "name": "color"},
             {"params": [model.gradient], "lr": freeze_lr, "name": "gradient"},
@@ -376,9 +388,11 @@ def bake_from_model(base_model, mask, chunk_size: int = 408_576) -> FrozenTetMod
     d_list, rgb_list, grd_list, sh_list = [], [], [], []
     for start in range(0, indices.shape[0], chunk_size):
         end = min(start + chunk_size, indices.shape[0])
+        # [DENSITY-RELATED] 从base_model提取密度
         _, density, rgb, grd, sh = base_model.compute_batch_features(
             vertices_full, indices, start, end
         )
+        # [DENSITY-RELATED] 保存密度到列表
         d_list.append(density.detach().cpu())
         rgb_list.append(rgb.detach().cpu())
         grd_list.append(grd.detach().cpu())
@@ -389,6 +403,7 @@ def bake_from_model(base_model, mask, chunk_size: int = 408_576) -> FrozenTetMod
     gc.collect()
     torch.cuda.empty_cache()
 
+    # [DENSITY-RELATED] 合并密度张量
     density  = torch.cat(d_list, 0).float()
     rgb      = torch.cat(rgb_list, 0).float()
     gradient = torch.cat(grd_list, 0).float()
@@ -399,7 +414,7 @@ def bake_from_model(base_model, mask, chunk_size: int = 408_576) -> FrozenTetMod
         ext_vertices=ext_vertices.to(device),
         indices=indices.to(device),
         empty_indices=empty_indices,
-        density=density.to(device),
+        density=density.to(device),  # [DENSITY-RELATED] 传递密度给FrozenTetModel
         rgb=rgb.to(device),
         gradient=gradient.to(device),
         sh=sh.to(device),

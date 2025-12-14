@@ -22,7 +22,7 @@ def render(camera: Camera, model, cell_values=None, tile_size=16, min_t=0.1,
         assert(ray_jitter.shape[1] == camera.image_width)
         assert(ray_jitter.shape[2] == 2)
     vertices = model.vertices
-    
+
     render_grid = RenderGrid(camera.image_height,
                              camera.image_width,
                              tile_height=tile_size,
@@ -51,6 +51,10 @@ def render(camera: Camera, model, cell_values=None, tile_size=16, min_t=0.1,
             shs, cell_values = model.get_cell_values(camera, all_circumcenters=circumcenter)
         sh_reg = (shs**2).mean()
 
+    # [SDF-MODIFICATION] 查询全局顶点SDF并获取inv_s
+    vert_sdf = model.query_vert_sdf().reshape(-1, 1)  # (M, 1) 形状
+    inv_s = model.backbone.inv_s  # scalar tensor
+
     image_rgb, distortion_img, tet_alive = AlphaBlendTiledRender.apply(
         sorted_tetra_idx,
         tile_ranges,
@@ -58,6 +62,8 @@ def render(camera: Camera, model, cell_values=None, tile_size=16, min_t=0.1,
         vertices,
         cell_values,
         render_grid,
+        vert_sdf,      # [SDF-MODIFICATION] 全局顶点SDF数组
+        inv_s,         # [SDF-MODIFICATION] NeuS inv_s 参数
         tcam,
         ray_jitter)
     alpha = image_rgb.permute(2,0,1)[3, ...]
@@ -162,6 +168,7 @@ class SpikingLR:
         return base_f + self.peak_fn(last_peak, height)
 
 def render_debug(render_tensor, model, camera, density_multi=1, tile_size=16):
+    # [SDF-MODIFICATION] density_multi 参数名保留以兼容，但现在用于SDF缩放
 
     # Convert to RGB (NxMx3) using the colormap
     _, features = model.get_cell_values(camera)
@@ -175,7 +182,12 @@ def render_debug(render_tensor, model, camera, density_multi=1, tile_size=16):
         normalized_tensor = render_tensor
     tet_grad_color[:, :normalized_tensor.shape[1]] = normalized_tensor
     if render_tensor.shape[1] < 4:
-        tet_grad_color[:, 3] = features[:, 0] * density_multi# * render_tensor.reshape(-1)
+        # [SDF-MODIFICATION] 使用SDF(features[:,0])乘以density_multi作为alpha通道
+        # TODO: 对于SDF，可能需要不同的可视化策略 (例如: sigmoid(sdf) 或 abs(sdf))
+        tet_grad_color[:, 3] = features[:, 0] * density_multi
+        # === [DENSITY-RELATED] 原密度代码 (已注释) ===
+        # tet_grad_color[:, 3] = features[:, 0] * density_multi  # density 作为alpha
+        # === [DENSITY-RELATED] 原密度代码结束 ===
     render_pkg = render_constant_color(model.indices, model.vertices, None, camera, cell_values=tet_grad_color, tile_size=tile_size)
 
     image = render_pkg['render']

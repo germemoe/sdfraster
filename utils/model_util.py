@@ -91,7 +91,11 @@ def offset_normalize(rgb, grd, circumcenters, tets):
     return base_color_v0_raw, normed_grd
 
 @torch.jit.script
-def activate_output(camera_center, density, rgb, grd, sh, indices, circumcenters, vertices, current_sh_deg:int, max_sh_deg:int):
+# [SDF-MODIFICATION] 激活输出函数 - sdf 作为输入参数
+def activate_output(camera_center, sdf, rgb, grd, sh, indices, circumcenters, vertices, current_sh_deg:int, max_sh_deg:int):
+    # === [DENSITY-RELATED] 原密度代码签名 (已注释) ===
+    # def activate_output(camera_center, density, rgb, grd, sh, indices, circumcenters, vertices, current_sh_deg:int, max_sh_deg:int):
+    # === [DENSITY-RELATED] 原密度代码结束 ===
     tets = vertices[indices]
     base_color_v0_raw, normed_grd = offset_normalize(rgb, grd, circumcenters, tets)
     tet_color_raw = eval_sh(
@@ -101,5 +105,56 @@ def activate_output(camera_center, density, rgb, grd, sh, indices, circumcenters
         camera_center,
         current_sh_deg).float()
     base_color_v0 = torch.nn.functional.softplus(tet_color_raw.reshape(-1, 3, 1), beta=10)
-    features = torch.cat([density, base_color_v0.reshape(-1, 3), normed_grd.reshape(-1, 3)], dim=1)
+    # [SDF-MODIFICATION] sdf 作为特征的第一个维度 (dim=0)
+    # TODO: 后续渲染代码需要将SDF转换为alpha (使用NeuS公式)
+    features = torch.cat([sdf, base_color_v0.reshape(-1, 3), normed_grd.reshape(-1, 3)], dim=1)
+    # === [DENSITY-RELATED] 原密度代码 (已注释) ===
+    # features = torch.cat([density, base_color_v0.reshape(-1, 3), normed_grd.reshape(-1, 3)], dim=1)
+    # === [DENSITY-RELATED] 原密度代码结束 ===
     return features.float()
+
+
+# ============================================================================
+# Eikonal Loss 和 Curvature Loss（参考 Neuralangelo）
+# ============================================================================
+
+def eikonal_loss(gradients: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+    """
+    Eikonal Loss: 约束 SDF 梯度的范数为 1
+
+    Args:
+        gradients: (N, 3) SDF 的梯度向量
+        mask: (N,) 可选的掩码，只在 mask=True 的位置计算 loss
+
+    Returns:
+        scalar loss
+    """
+    # ||∇SDF|| - 1 的平方
+    gradient_error = (gradients.norm(dim=-1) - 1.0) ** 2  # (N,)
+    gradient_error = gradient_error.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
+
+    if mask is not None:
+        return (gradient_error * mask.float()).sum() / (mask.float().sum() + 1e-8)
+    else:
+        return gradient_error.mean()
+
+
+def curvature_loss(hessian_diag: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+    """
+    Curvature Loss: 最小化 SDF 的拉普拉斯量（促进光滑表面）
+
+    Args:
+        hessian_diag: (N, 3) Hessian 对角元素 [∂²f/∂x², ∂²f/∂y², ∂²f/∂z²]
+        mask: (N,) 可选的掩码，只在 mask=True 的位置计算 loss
+
+    Returns:
+        scalar loss
+    """
+    # Laplacian = ∂²f/∂x² + ∂²f/∂y² + ∂²f/∂z²
+    laplacian = hessian_diag.sum(dim=-1).abs()  # (N,)
+    laplacian = laplacian.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
+
+    if mask is not None:
+        return (laplacian * mask.float()).sum() / (mask.float().sum() + 1e-8)
+    else:
+        return laplacian.mean()

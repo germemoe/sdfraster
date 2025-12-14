@@ -17,6 +17,7 @@ from tqdm import tqdm
 import numpy as np
 from utils import cam_util
 from utils.train_util import *
+from utils.model_util import eikonal_loss, curvature_loss
 # from models.vertex_color import Model, TetOptimizer
 from models.ingp_color import Model, TetOptimizer
 from models.frozen import freeze_model
@@ -117,6 +118,13 @@ args.final_freeze_lr = 1e-4
 args.lambda_dist = 0.0
 args.lambda_sh = 0.0
 
+# [SDF-MODIFICATION] Eikonal 和 Curvature Loss 设置（参考 Neuralangelo）
+args.lambda_eikonal = 0.1       # Eikonal loss 权重
+args.lambda_curvature = 5e-4   # Curvature loss 权重
+args.gradient_mode = "numerical"  # "analytical" 或 "numerical"
+args.gradient_taps = 4            # 数值梯度采样点数：4 或 6
+args.gradient_eps = 1e-3          # 数值梯度步长
+
 # Clone Settings
 args.num_samples = 200
 args.k_samples = 1
@@ -135,7 +143,9 @@ args.lambda_ssim = 0.2
 args.min_t = 0.4
 args.sample_cam = 8
 args.data_device = 'cpu'
-args.density_threshold = 0.1
+# [SDF-MODIFICATION] sdf_eps: CDF 贡献阈值 ε
+# 保留 CDF 贡献 > ε 的四面体，例如 0.01 表示保留贡献 > 1% 的
+args.sdf_eps = 0.01
 args.alpha_threshold = 0.1
 args.contrib_threshold = 0.0
 args.threshold_start = 4500
@@ -216,7 +226,7 @@ for iteration in progress_bar:
     if do_delaunay or do_freeze:
         st = time.time()
         tet_optim.update_triangulation(
-            density_threshold=args.density_threshold if iteration > args.threshold_start else 0,
+            sdf_eps=args.sdf_eps if iteration > args.threshold_start else 0,
             alpha_threshold=args.alpha_threshold if iteration > args.threshold_start else 0, high_precision=do_freeze)
         if do_freeze:
             del tet_optim
@@ -250,11 +260,30 @@ for iteration in progress_bar:
     reg = tet_optim.regularizer(render_pkg, **args.as_dict())
     ssim_loss = (1-fused_ssim(image.unsqueeze(0), target.unsqueeze(0))).clip(min=0, max=1)
     dl_loss = render_pkg['distortion_loss']
+
+    # [SDF-MODIFICATION] Eikonal 和 Curvature Loss
+    eik_loss = torch.tensor(0.0, device=device)
+    curv_loss = torch.tensor(0.0, device=device)
+    if args.lambda_eikonal > 0 or args.lambda_curvature > 0:
+        # 只在活跃顶点（属于未被裁剪四面体的顶点）上计算 SDF 梯度
+        _, gradients, hessian_diag = model.compute_sdf_gradients(
+            points=model.active_vertices,
+            mode=args.gradient_mode,
+            taps=args.gradient_taps,
+            eps=args.gradient_eps
+        )
+        if args.lambda_eikonal > 0:
+            eik_loss = eikonal_loss(gradients)
+        if args.lambda_curvature > 0 and hessian_diag is not None:
+            curv_loss = curvature_loss(hessian_diag)
+
     loss = (1-args.lambda_ssim)*l1_loss + \
            args.lambda_ssim*ssim_loss + \
            reg + \
            args.lambda_dist * dl_loss + \
-           args.lambda_sh * render_pkg['sh_reg']
+           args.lambda_sh * render_pkg['sh_reg'] + \
+           args.lambda_eikonal * eik_loss + \
+           args.lambda_curvature * curv_loss
 
     loss.backward()
 
@@ -329,7 +358,8 @@ for iteration in progress_bar:
         "Mean": repr(f"{avg_psnr:>5.2f}"),
         "#V": len(model),
         "#T": model.indices.shape[0],
-        "DL": repr(f"{dl_loss:>5.2f}"),
+        "Eik": repr(f"{eik_loss.item():.3f}"),
+        "Curv": repr(f"{curv_loss.item():.1e}"),
     })
 
 avged_psnrs = [sum(v)/len(v) for v in psnrs if len(v) == len(train_cameras)]

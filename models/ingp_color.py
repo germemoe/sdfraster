@@ -26,6 +26,24 @@ from utils import hashgrid
 import tinycudann as tcnn
 import time
 
+# [SDF-MODIFICATION] 几何初始化函数，参考Neuralangelo的MLPforNeuralSDF
+def geometric_init_sdf_layer(linear: nn.Linear, k_in: int, out_bias: float = 0.5, invert: bool = False):
+    """
+    Initialize the SDF output layer with geometric initialization.
+    This initialization makes the network output approximate a sphere SDF initially.
+
+    Args:
+        linear: The linear layer to initialize
+        k_in: Input dimension
+        out_bias: Initial bias value (controls initial sphere radius)
+        invert: If True, invert the SDF (inside becomes outside)
+    """
+    nn.init.normal_(linear.weight, mean=np.sqrt(np.pi / k_in), std=0.0001)
+    nn.init.constant_(linear.bias, -out_bias)
+    if invert:
+        linear.weight.data *= -1
+        linear.bias.data *= -1
+
 torch.set_float32_matmul_precision('high')
 
 def pad_for_tinycudann(x: torch.Tensor, granularity: int):
@@ -86,7 +104,7 @@ def approx_erf(x):
   return torch.sign(x) * torch.sqrt(1 - torch.exp(-(4 / torch.pi) * x**2))
 
 class iNGPDW(nn.Module):
-    def __init__(self, 
+    def __init__(self,
                  sh_dim=0,
                  scale_multi=0.5,
                  log2_hashmap_size=16,
@@ -99,7 +117,13 @@ class iNGPDW(nn.Module):
                  s_init=1e-4,
                  d_init=0.1,
                  c_init=0.6,
-                 density_offset=-4,
+                 density_offset=-4,  # [DENSITY-RELATED] 密度偏移参数 (保留用于兼容性)
+                 sdf_bias=0.5,  # [SDF-MODIFICATION] SDF初始偏移，控制初始球体半径
+                 sdf_inside_out=False,  # [SDF-MODIFICATION] 是否反转SDF内外
+                 # [SDF-MODIFICATION] NeuS s_var 参数 (参考 Neuralangelo)
+                 s_var_init=3.0,  # 初始值 (存储的是 log(inv_s)，较大=较模糊表面)
+                 s_var_anneal_end=0.1,  # schedule 模式的结束进度
+                 s_var_learn=True,  # True: 可学习; False: 按 schedule 衰减
                  ablate_downweighing=False,
                  k_samples=1,
                  trunc_sigma=1,
@@ -111,10 +135,25 @@ class iNGPDW(nn.Module):
         self.dim = hashmap_dim
         self.per_level_scale = per_level_scale
         self.base_resolution = base_resolution
-        self.density_offset = density_offset
+        self.density_offset = density_offset  # [DENSITY-RELATED] 保留用于兼容性
+        self.sdf_bias = sdf_bias  # [SDF-MODIFICATION] SDF偏移参数
+        self.sdf_inside_out = sdf_inside_out  # [SDF-MODIFICATION] SDF内外反转标志
         self.ablate_downweighing = ablate_downweighing
         self.k_samples = k_samples
         self.trunc_sigma = trunc_sigma
+
+        # [SDF-MODIFICATION] NeuS s_var 参数初始化 (参考 Neuralangelo)
+        # s_var 存储的是 log(inv_s)，使用时 inv_s = exp(s_var)
+        # Φ(sdf) = sigmoid(sdf * inv_s) = sigmoid(sdf * exp(s_var))
+        self.s_var_init = s_var_init
+        self.s_var_anneal_end = s_var_anneal_end
+        self.s_var_learn = s_var_learn
+        if s_var_learn:
+            # 可学习参数
+            self.s_var = nn.Parameter(torch.tensor(s_var_init, dtype=torch.float32))
+        else:
+            # 不可学习，通过 buffer 存储（会被保存到 checkpoint）
+            self.register_buffer('s_var', torch.tensor(s_var_init, dtype=torch.float32))
 
         self.config = dict(
             per_level_scale=per_level_scale,
@@ -152,7 +191,10 @@ class iNGPDW(nn.Module):
 
         self.network = mk_head(1+12+sh_dim)
 
-        self.density_net   = mk_head(1)
+        # [SDF-MODIFICATION] 创建SDF预测网络，替代原来的density_net
+        # SDF网络使用几何初始化，使初始输出近似为球体SDF
+        self.sdf_net = mk_head(1)  # [SDF-MODIFICATION] SDF预测网络头
+        self.density_net = self.sdf_net  # [DENSITY-RELATED] 保留别名用于兼容性
         self.color_net     = mk_head(3)
         self.gradient_net  = mk_head(3)
         self.sh_net        = mk_head(sh_dim)
@@ -161,14 +203,19 @@ class iNGPDW(nn.Module):
         with torch.no_grad():
             last.weight[4:, :].zero_()
             last.bias[4:].zero_()
+            # 颜色、梯度、SH网络使用Xavier初始化
             for network, eps in zip(
-                [self.gradient_net, self.sh_net, self.density_net, self.color_net], 
-                [g_init, s_init, d_init, c_init]):
+                [self.gradient_net, self.sh_net, self.color_net],
+                [g_init, s_init, c_init]):
                 last = network[-1]
                 with torch.no_grad():
                     nn.init.uniform_(last.weight.data, a=-eps, b=eps)
-                    # nn.init.xavier_uniform_(m.weight, gain)
                     last.bias.zero_()
+
+            # [SDF-MODIFICATION] SDF网络使用几何初始化
+            sdf_last = self.sdf_net[-1]
+            geometric_init_sdf_layer(sdf_last, sdf_last.in_features,
+                                    out_bias=sdf_bias, invert=sdf_inside_out)
 
 
     def _encode(self, x: torch.Tensor, cr: torch.Tensor):
@@ -194,18 +241,50 @@ class iNGPDW(nn.Module):
 
         h = output.reshape(-1, self.L * self.dim).float()
 
-        sigma = self.density_net(h)
+        # [SDF-MODIFICATION] SDF网络前向传播，直接输出SDF值
+        sdf = self.sdf_net(h)  # [SDF-MODIFICATION] 输出SDF值 (可正可负)
+        # === [DENSITY-RELATED] 原密度代码 (已注释) ===
+        # sigma = self.density_net(h)  # [DENSITY-RELATED] 密度网络前向传播
+        # density = safe_exp(sigma + self.density_offset)  # [DENSITY-RELATED] 密度激活函数
+        # === [DENSITY-RELATED] 原密度代码结束 ===
+
         rgb = self.color_net(h)
         field_samples = self.gradient_net(h)
         sh  = self.sh_net(h).half()
 
         rgb = rgb.reshape(-1, 3, 1) + 0.5
-        density = safe_exp(sigma+self.density_offset)
+        # [SDF-MODIFICATION] SDF直接输出，不需要激活函数
+        # 注意：后续渲染代码需要将SDF转换为alpha (使用NeuS公式)
         # grd = torch.tanh(field_samples.reshape(-1, 1, 3)) / math.sqrt(3)
         grd = field_samples.reshape(-1, 1, 3)
         grd = grd / ((grd * grd).sum(dim=-1, keepdim=True) + 1).sqrt()
         # grd = rgb * torch.tanh(field_samples.reshape(-1, 3, 3))  # shape (T, 3, 3)
-        return density, rgb.reshape(-1, 3), grd, sh
+        # [SDF-MODIFICATION] 返回SDF作为第一个元素
+        return sdf, rgb.reshape(-1, 3), grd, sh
+
+    # [SDF-MODIFICATION] NeuS s_var 相关方法
+    @property
+    def inv_s(self):
+        """获取 inv_s = exp(s_var)，用于 NeuS alpha 计算"""
+        return self.s_var.exp()
+
+    def update_s_var(self, progress: float):
+        """
+        更新 s_var 值（仅在 s_var_learn=False 时生效）
+        使用指数衰减 schedule，使表面逐渐变得锐利
+
+        Args:
+            progress: 训练进度 [0, 1]，例如 iteration / max_iteration
+        """
+        if not self.s_var_learn:
+            # 在 anneal_end 进度之前进行衰减
+            if progress < self.s_var_anneal_end:
+                # 线性衰减 s_var (log 空间)
+                # 从 s_var_init 衰减到更小的值
+                anneal_progress = progress / self.s_var_anneal_end
+                # s_var 从 init 线性衰减到 init * 0.1
+                new_s_var = self.s_var_init * (1 - 0.9 * anneal_progress)
+                self.s_var.fill_(new_s_var)
 
 class Model(BaseModel):
     def __init__(self,
@@ -213,7 +292,9 @@ class Model(BaseModel):
                  ext_vertices: torch.Tensor,
                  center: torch.Tensor,
                  scene_scaling: float,
-                 density_offset=-1,
+                 density_offset=-1,  # [DENSITY-RELATED] Model类的密度偏移参数 (保留用于兼容性)
+                 sdf_bias=0.5,  # [SDF-MODIFICATION] SDF初始偏移参数
+                 sdf_inside_out=False,  # [SDF-MODIFICATION] SDF内外反转标志
                  current_sh_deg=2,
                  max_sh_deg=2,
                  ablate_circumsphere=False,
@@ -221,7 +302,9 @@ class Model(BaseModel):
                  **kwargs):
         super().__init__()
         self.device = vertices.device
-        self.density_offset = density_offset
+        self.density_offset = density_offset  # [DENSITY-RELATED] 存储密度偏移 (保留用于兼容性)
+        self.sdf_bias = sdf_bias  # [SDF-MODIFICATION] 存储SDF偏移参数
+        self.sdf_inside_out = sdf_inside_out  # [SDF-MODIFICATION] 存储SDF内外反转标志
         self.max_sh_deg = max_sh_deg
         self.current_sh_deg = current_sh_deg
         self.dir_offset = torch.tensor([
@@ -231,7 +314,8 @@ class Model(BaseModel):
         ], device=self.device)
         sh_dim = ((1+max_sh_deg)**2-1)*3
 
-        module = iNGPDW(sh_dim, **kwargs)
+        # [SDF-MODIFICATION] iNGPDW接收SDF参数 (sdf_bias, sdf_inside_out) 通过kwargs传递
+        module = iNGPDW(sh_dim, sdf_bias=sdf_bias, sdf_inside_out=sdf_inside_out, **kwargs)
         self.compile = module.compile
         if module.compile:
             self.backbone = torch.compile(module).to(self.device)
@@ -369,14 +453,20 @@ class Model(BaseModel):
         start = 0
         for start in range(0, indices.shape[0], self.chunk_size):
             end = min(start + self.chunk_size, indices.shape[0])
-            circumcenters, density, rgb, grd, sh = self.compute_batch_features(
+            # [SDF-MODIFICATION] compute_batch_features 返回 sdf
+            circumcenters, sdf, rgb, grd, sh = self.compute_batch_features(
                 vertices, indices, start, end, circumcenters=all_circumcenters)
+            # === [DENSITY-RELATED] 原密度代码 (已注释) ===
+            # circumcenters, density, rgb, grd, sh = self.compute_batch_features(...)
+            # === [DENSITY-RELATED] 原密度代码结束 ===
             if self.ablate_gradient:
                 grd = torch.zeros_like(grd)
             centroids = vertices[indices[start:end]].mean(dim=1)
             shs[start:end] = sh.reshape(-1, sh_dim, 3)
+            # [SDF-MODIFICATION] activate_output 接收 sdf 参数
+            # TODO: activate_output 需要修改以处理SDF而非density
             dvrgbs = activate_output(camera.camera_center.to(self.device),
-                                     density, rgb, grd,
+                                     sdf, rgb, grd,  # [SDF-MODIFICATION] sdf 替代 density
                                      sh.reshape(-1, sh_dim, 3),
                                      indices[start:end],
                                      centroids,
@@ -474,28 +564,217 @@ class Model(BaseModel):
         model.empty_indices = torch.as_tensor(empty_indices).cuda()
         return model
 
-    def calc_tet_density(self):
-        densities = []
+    # [SDF-MODIFICATION] 重命名为 calc_tet_sdf，返回SDF值
+    def calc_tet_sdf(self):
+        """计算所有四面体的SDF值"""
+        sdf_list = []
         verts = self.vertices
         for start in range(0, self.indices.shape[0], self.chunk_size):
             end = min(start + self.chunk_size, self.indices.shape[0])
-            
-            _, density, _, _, _ = self.compute_batch_features(verts, self.indices, start, end)
 
-            densities.append(density.reshape(-1))
-        return torch.cat(densities)
+            # [SDF-MODIFICATION] 从 compute_batch_features 获取 sdf
+            _, sdf, _, _, _ = self.compute_batch_features(verts, self.indices, start, end)
+
+            sdf_list.append(sdf.reshape(-1))
+        return torch.cat(sdf_list)
+
+    # === [DENSITY-RELATED] 原密度代码 (已注释) ===
+    # def calc_tet_density(self):
+    #     """计算所有四面体的密度值"""
+    #     densities = []
+    #     verts = self.vertices
+    #     for start in range(0, self.indices.shape[0], self.chunk_size):
+    #         end = min(start + self.chunk_size, self.indices.shape[0])
+    #         _, density, _, _, _ = self.compute_batch_features(verts, self.indices, start, end)
+    #         densities.append(density.reshape(-1))
+    #     return torch.cat(densities)
+    # === [DENSITY-RELATED] 原密度代码结束 ===
+
+    # [SDF-MODIFICATION] 保留别名以兼容现有代码调用
+    def calc_tet_density(self):
+        """[DEPRECATED] 请使用 calc_tet_sdf()，此方法保留用于兼容"""
+        return self.calc_tet_sdf()
+
+    # [SDF-MODIFICATION] 直接查询顶点SDF值（方案B：全局顶点SDF）
+    def query_vert_sdf(self, points=None):
+        """
+        直接查询点的SDF值，不使用 downweighing（因为 SDF 只和位置有关）
+
+        Args:
+            points: (N, 3) 世界坐标，如果为 None 则查询所有顶点
+        Returns:
+            sdf: (N,) SDF 值
+        """
+        if points is None:
+            points = self.vertices
+
+        sdf_list = []
+        for start in range(0, points.shape[0], self.chunk_size):
+            end = min(start + self.chunk_size, points.shape[0])
+            pts = points[start:end]
+
+            # 1. 坐标归一化
+            normalized = (pts - self.center) / self.scene_scaling
+
+            # 2. 空间收缩 (只需要坐标，不需要 std)
+            cv, _ = contract_mean_std(normalized, torch.zeros(pts.shape[0], device=pts.device))
+            x = (cv / 2 + 1) / 2
+
+            # 3. Hash Grid 编码 (直接用 encoding，不经过 _encode 避免 downweighing)
+            h = self.backbone.encoding(x)
+            h = h.reshape(-1, self.backbone.L * self.backbone.dim).float()
+
+            # 4. SDF 网络
+            sdf = self.backbone.sdf_net(h)
+            sdf_list.append(sdf.reshape(-1))
+
+        return torch.cat(sdf_list)
+
+    def compute_sdf_gradients(self, points=None, mode="numerical", taps=4, eps=1e-3):
+        """
+        计算 SDF 的梯度和 Hessian 对角元素（用于 Eikonal 和 Curvature Loss）
+
+        Args:
+            points: (N, 3) 查询点坐标，如果为 None 则使用所有顶点
+            mode: "analytical" 使用 autograd，"numerical" 使用数值差分
+            taps: 数值差分的采样点数，4 或 6（仅 mode="numerical" 时有效）
+            eps: 数值差分的步长
+
+        Returns:
+            sdf: (N,) SDF 值
+            gradients: (N, 3) 一阶梯度
+            hessian_diag: (N, 3) Hessian 对角元素 [∂²f/∂x², ∂²f/∂y², ∂²f/∂z²]
+        """
+        if points is None:
+            points = self.vertices
+
+        if mode == "analytical":
+            return self._compute_gradients_analytical(points)
+        elif mode == "numerical":
+            if taps == 6:
+                return self._compute_gradients_numerical_6(points, eps)
+            elif taps == 4:
+                return self._compute_gradients_numerical_4(points, eps)
+            else:
+                raise ValueError(f"taps must be 4 or 6, got {taps}")
+        else:
+            raise ValueError(f"mode must be 'analytical' or 'numerical', got {mode}")
+
+    def _compute_gradients_analytical(self, points):
+        """解析梯度：使用 autograd"""
+        requires_grad = points.requires_grad
+        with torch.enable_grad():
+            points = points.detach().requires_grad_(True)
+            sdf = self.query_vert_sdf(points)
+
+            # 一阶梯度
+            gradients = torch.autograd.grad(
+                sdf.sum(), points, create_graph=self.training
+            )[0]
+
+            # 二阶梯度 (Hessian 对角元素)
+            if self.training:
+                hessian_diag = torch.autograd.grad(
+                    gradients.sum(), points, create_graph=True
+                )[0]
+            else:
+                hessian_diag = None
+                gradients = gradients.detach()
+
+        points.requires_grad_(requires_grad)
+        return sdf.detach() if not self.training else sdf, gradients, hessian_diag
+
+    def _compute_gradients_numerical_6(self, points, eps):
+        """数值梯度：6点采样（中心差分）"""
+        device = points.device
+        dtype = points.dtype
+
+        # 中心点 SDF
+        sdf = self.query_vert_sdf(points)  # (N,)
+
+        # 6个偏移方向
+        eps_x = torch.tensor([eps, 0., 0.], dtype=dtype, device=device)
+        eps_y = torch.tensor([0., eps, 0.], dtype=dtype, device=device)
+        eps_z = torch.tensor([0., 0., eps], dtype=dtype, device=device)
+
+        # 计算6个偏移点的 SDF
+        sdf_x_pos = self.query_vert_sdf(points + eps_x)
+        sdf_x_neg = self.query_vert_sdf(points - eps_x)
+        sdf_y_pos = self.query_vert_sdf(points + eps_y)
+        sdf_y_neg = self.query_vert_sdf(points - eps_y)
+        sdf_z_pos = self.query_vert_sdf(points + eps_z)
+        sdf_z_neg = self.query_vert_sdf(points - eps_z)
+
+        # 一阶梯度（中心差分）
+        gradient_x = (sdf_x_pos - sdf_x_neg) / (2 * eps)
+        gradient_y = (sdf_y_pos - sdf_y_neg) / (2 * eps)
+        gradient_z = (sdf_z_pos - sdf_z_neg) / (2 * eps)
+        gradients = torch.stack([gradient_x, gradient_y, gradient_z], dim=-1)  # (N, 3)
+
+        # 二阶梯度（Hessian 对角元素）
+        hessian_xx = (sdf_x_pos + sdf_x_neg - 2 * sdf) / (eps ** 2)
+        hessian_yy = (sdf_y_pos + sdf_y_neg - 2 * sdf) / (eps ** 2)
+        hessian_zz = (sdf_z_pos + sdf_z_neg - 2 * sdf) / (eps ** 2)
+        hessian_diag = torch.stack([hessian_xx, hessian_yy, hessian_zz], dim=-1)  # (N, 3)
+
+        return sdf, gradients, hessian_diag
+
+    def _compute_gradients_numerical_4(self, points, eps):
+        """数值梯度：4点采样（四面体采样）"""
+        device = points.device
+        dtype = points.dtype
+
+        # 中心点 SDF
+        sdf = self.query_vert_sdf(points)  # (N,)
+
+        # 四面体的4个顶点方向
+        eps_adj = eps / math.sqrt(3)  # 调整步长使得偏移距离为 eps
+        k1 = torch.tensor([1., -1., -1.], dtype=dtype, device=device) * eps_adj
+        k2 = torch.tensor([-1., -1., 1.], dtype=dtype, device=device) * eps_adj
+        k3 = torch.tensor([-1., 1., -1.], dtype=dtype, device=device) * eps_adj
+        k4 = torch.tensor([1., 1., 1.], dtype=dtype, device=device) * eps_adj
+
+        # 计算4个偏移点的 SDF
+        sdf1 = self.query_vert_sdf(points + k1)
+        sdf2 = self.query_vert_sdf(points + k2)
+        sdf3 = self.query_vert_sdf(points + k3)
+        sdf4 = self.query_vert_sdf(points + k4)
+
+        # 一阶梯度
+        # gradient = (k1*sdf1 + k2*sdf2 + k3*sdf3 + k4*sdf4) / (4 * eps_adj)
+        k1_norm = torch.tensor([1., -1., -1.], dtype=dtype, device=device)
+        k2_norm = torch.tensor([-1., -1., 1.], dtype=dtype, device=device)
+        k3_norm = torch.tensor([-1., 1., -1.], dtype=dtype, device=device)
+        k4_norm = torch.tensor([1., 1., 1.], dtype=dtype, device=device)
+
+        gradients = (k1_norm * sdf1.unsqueeze(-1) +
+                     k2_norm * sdf2.unsqueeze(-1) +
+                     k3_norm * sdf3.unsqueeze(-1) +
+                     k4_norm * sdf4.unsqueeze(-1)) / (4.0 * eps_adj)  # (N, 3)
+
+        # 二阶梯度（Hessian 对角元素的近似）
+        # 4点采样只能得到 Laplacian 的近似，假设各向同性
+        hessian_trace = ((sdf1 + sdf2 + sdf3 + sdf4) / 2.0 - 2 * sdf) / (eps_adj ** 2)
+        hessian_diag = torch.stack([hessian_trace, hessian_trace, hessian_trace], dim=-1) / 3.0  # (N, 3)
+
+        return sdf, gradients, hessian_diag
 
     def compute_features(self, offset=False):
         vertices = self.vertices
         indices = self.indices
-        cs, ds, rs, gs, ss = [], [], [], [], []
+        cs, sdf_list, rs, gs, ss = [], [], [], [], []  # [SDF-MODIFICATION] ds -> sdf_list
         for start in range(0, indices.shape[0], self.chunk_size):
             end = min(start + self.chunk_size, indices.shape[0])
 
-            circumcenters, density, rgb, grd, sh = self.compute_batch_features(vertices, indices, start, end)
+            # [SDF-MODIFICATION] compute_features 返回 sdf
+            circumcenters, sdf, rgb, grd, sh = self.compute_batch_features(vertices, indices, start, end)
+            # === [DENSITY-RELATED] 原密度代码 (已注释) ===
+            # circumcenters, density, rgb, grd, sh = self.compute_batch_features(...)
+            # ds.append(density)
+            # === [DENSITY-RELATED] 原密度代码结束 ===
             tets = vertices[indices[start:end]]
             cs.append(circumcenters)
-            ds.append(density)
+            sdf_list.append(sdf)  # [SDF-MODIFICATION] 收集sdf
             ss.append(sh)
             if offset:
                 base_color_v0_raw, normed_grd = offset_normalize(rgb, grd, circumcenters, tets)
@@ -506,34 +785,55 @@ class Model(BaseModel):
                 rs.append(rgb)
                 gs.append(grd)
         cs = torch.cat(cs, dim=0)
-        ds = torch.cat(ds, dim=0)
+        sdf_all = torch.cat(sdf_list, dim=0)  # [SDF-MODIFICATION] ds -> sdf_all
         rs = torch.cat(rs, dim=0)
         gs = torch.cat(gs, dim=0)
         ss = torch.cat(ss, dim=0)
-        return cs, ds, rs, gs, ss
+        return cs, sdf_all, rs, gs, ss  # [SDF-MODIFICATION] 返回 sdf_all
 
     @property
     def vertices(self):
         verts = self.contracted_vertices
         return torch.cat([verts, self.ext_vertices])
 
+    @property
+    def active_vertices(self):
+        """获取活跃顶点（属于未被裁剪四面体的顶点）"""
+        active_indices = self.indices.unique()
+        return self.vertices[active_indices]
+
+    @property
+    def active_vertex_indices(self):
+        """获取活跃顶点的索引"""
+        return self.indices.unique()
+
     def sh_up(self):
         self.current_sh_deg = min(self.max_sh_deg, self.current_sh_deg+1)
 
     @torch.no_grad()
-    def update_triangulation(self, high_precision=False, density_threshold=0.0, alpha_threshold=0.0):
+    def update_triangulation(self, high_precision=False, sdf_eps=0.0, alpha_threshold=0.0, **kwargs):
+        """
+        更新 Delaunay 三角剖分并裁剪远离表面的四面体
+
+        Args:
+            high_precision: 是否使用高精度 Delaunay
+            sdf_eps: CDF 贡献阈值 ε，保留 CDF 贡献 > ε 的四面体
+                     例如 ε=0.01 表示保留贡献 > 1% 的四面体
+                     内部计算 k = ln((1-ε)/ε)，SDF 阈值 = k / inv_s
+                     设为 0 禁用此裁剪
+            alpha_threshold: NeuS alpha 阈值，如果四面体最大可能 alpha < threshold，则裁剪
+                            设为 0 禁用此裁剪
+        """
         torch.cuda.empty_cache()
         verts = self.vertices
         if high_precision:
             indices_np = Delaunay(verts.detach().cpu().numpy()).simplices.astype(np.int32)
-            # self.indices = torch.tensor(indices_np, device=verts.device).int().cuda()
         else:
             v = Del(verts.shape[0])
             indices_np, prev = v.compute(verts.detach().cpu().double())
             indices_np = indices_np.numpy()
             indices_np = indices_np[(indices_np < verts.shape[0]).all(axis=1)]
             del prev
-        
 
         # Ensure volume is positive
         indices = torch.as_tensor(indices_np).cuda()
@@ -542,20 +842,42 @@ class Model(BaseModel):
         if reverse_mask.sum() > 0:
             indices[reverse_mask] = indices[reverse_mask][:, [1, 0, 2, 3]]
 
-        # Cull tets with low density
-        # self.full_indices = indices.clone()
+        # [SDF-MODIFICATION] 使用 NeuS 风格的裁剪逻辑
         self.indices = indices
-        if density_threshold > 0 or alpha_threshold > 0:
-            tet_density = self.calc_tet_density()
-            tet_alpha = self.calc_tet_alpha(mode="min", density=tet_density)
-            mask = (tet_density > density_threshold) | (tet_alpha > alpha_threshold)
+        if sdf_eps > 0 or alpha_threshold > 0:
+            # 获取所有顶点的 SDF
+            vert_sdf = self.query_vert_sdf()  # (M,)
+
+            # 获取每个四面体 4 个顶点的 SDF
+            tet_vert_sdf = vert_sdf[indices.long()]  # (N, 4)
+
+            # 条件1: 基于 CDF 贡献阈值 ε 计算动态 SDF 阈值
+            # k = ln((1-ε)/ε)，当 |sdf| * inv_s > k 时，CDF 贡献 < ε
+            # 真正的 SDF 阈值 = k / inv_s
+            if sdf_eps > 0:
+                inv_s = self.backbone.inv_s
+                k = math.log((1 - sdf_eps) / sdf_eps)  # 从 ε 计算 k
+                sdf_threshold = k / inv_s  # 动态计算真正的 SDF 阈值
+                tet_min_abs_sdf = tet_vert_sdf.abs().min(dim=1)[0]  # (N,)
+                sdf_mask = tet_min_abs_sdf < sdf_threshold  # 保留靠近表面的
+            else:
+                sdf_mask = torch.ones(indices.shape[0], dtype=torch.bool, device=indices.device)
+
+            # 条件2: NeuS alpha 阈值
+            if alpha_threshold > 0:
+                tet_alpha = self.calc_tet_alpha()  # 使用新的 NeuS alpha 计算
+                alpha_mask = tet_alpha > alpha_threshold  # 保留有贡献的
+            else:
+                alpha_mask = torch.ones(indices.shape[0], dtype=torch.bool, device=indices.device)
+
+            # 两个条件取并集 (只要满足其一就保留)
+            mask = sdf_mask | alpha_mask
             self.empty_indices = self.indices[~mask]
             self.indices = self.indices[mask]
             self.mask = mask
         else:
             self.empty_indices = torch.empty((0, 4), dtype=self.indices.dtype, device='cuda')
-            # self.mask = torch.ones((self.full_indices.shape[0]), dtype=bool, device='cuda')
-            
+
         torch.cuda.empty_cache()
 
     def __len__(self):
@@ -604,8 +926,9 @@ class TetOptimizer:
         ], ignore_param_list=["encoding", "network"], betas=[0.9, 0.999], eps=1e-15)
 
         self.net_optim = optim.CustomAdam([
-            # {"params": model.backbone.network.parameters(),   "lr": network_lr,  "name": "density"},
-            {"params": model.backbone.density_net.parameters(),   "lr": network_lr,  "name": "density"},
+            # [SDF-MODIFICATION] sdf_net 优化器配置 (通过density_net别名访问)
+            # [DENSITY-RELATED] 保留name="density"以兼容现有代码
+            {"params": model.backbone.sdf_net.parameters(),   "lr": network_lr,  "name": "sdf"},
             {"params": model.backbone.color_net.parameters(),     "lr": network_lr,    "name": "color"},
             # {"params": model.backbone.density_color_net.parameters(),     "lr": network_lr,    "name": "color"},
             {"params": model.backbone.gradient_net.parameters(),  "lr": network_lr, "name": "gradient"},
@@ -731,12 +1054,19 @@ class TetOptimizer:
     def update_triangulation(self, **kwargs):
         self.model.update_triangulation(**kwargs)
 
+    # [SDF-MODIFICATION] 基于SDF差异的顶点裁剪
     def prune(self, diff_threshold, **kwargs):
         if diff_threshold <= 0:
             return
-        density = self.model.calc_tet_density()
-        diff  = density[self.pairs[:,0]] - density[self.pairs[:,1]]
-        tet_diff  = (self.face_area * diff.abs()).reshape(-1)
+        # [SDF-MODIFICATION] 计算四面体SDF
+        tet_sdf = self.model.calc_tet_sdf()
+        # === [DENSITY-RELATED] 原密度代码 (已注释) ===
+        # density = self.model.calc_tet_density()
+        # diff = density[self.pairs[:,0]] - density[self.pairs[:,1]]
+        # === [DENSITY-RELATED] 原密度代码结束 ===
+        # [SDF-MODIFICATION] 计算相邻四面体SDF差异
+        diff = tet_sdf[self.pairs[:,0]] - tet_sdf[self.pairs[:,1]]
+        tet_diff = (self.face_area * diff.abs()).reshape(-1)
 
         indices = self.model.indices.long()
         device = indices.device
