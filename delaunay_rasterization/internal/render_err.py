@@ -89,27 +89,27 @@ def render_err(gt_image, camera: Camera, model, tile_size=16, min_t=0.1, **kwarg
     # [SDF-MODIFICATION] 查询全局顶点SDF并获取inv_s
     vert_sdf = model.query_vert_sdf().reshape(-1, 1)  # (M, 1) 形状
     inv_s = model.backbone.inv_s  # scalar tensor
-    # [SDF-MODIFICATION] 确保 inv_s 是一个 (1,) 的 tensor for splat_tiled
+    # [SDF-MODIFICATION] 确保 inv_s 是一个 (1,) 的 tensor
     inv_s_tensor = inv_s.unsqueeze(0) if inv_s.dim() == 0 else inv_s
 
     shader = mod[(render_grid.tile_height, render_grid.tile_width)]
     st = time.time()
-    # [SDF-MODIFICATION] 共享参数 (不包含 inv_s，因为两个函数的参数名不同)
-    args_common = dict(
+    # [SDF-MODIFICATION] splat_tiled 参数
+    splat_args = dict(
         sorted_gauss_idx=sorted_tetra_idx,
         tile_ranges=tile_ranges,
         indices=indices,
         vertices=vertices,
         tet_density=cell_values,
-        vert_sdf=vert_sdf,      # [SDF-MODIFICATION] 全局顶点SDF数组
+        vert_sdf=vert_sdf,          # [SDF-MODIFICATION] 全局顶点SDF数组
+        inv_s_tensor=inv_s_tensor,  # [SDF-MODIFICATION] NeuS inv_s 参数 (可微tensor)
         output_img=output_img,
         n_contributors=n_contributors,
         tcam=tcam,
     )
 
     splat_kernel_with_args = shader.splat_tiled(
-        **args_common,
-        inv_s_tensor=inv_s_tensor,  # [SDF-MODIFICATION] 可微tensor参数
+        **splat_args,
         distortion_img=distortion_img,
         tet_alive=tet_alive,
         ray_jitter=ray_jitter,
@@ -144,9 +144,19 @@ def render_err(gt_image, camera: Camera, model, tile_size=16, min_t=0.1, **kwarg
     tet_err = torch.zeros((tet_vertices.shape[0], 16), dtype=torch.float, device=device)
     tet_count = torch.zeros((tet_vertices.shape[0], 2), dtype=torch.int32, device=device)
 
+    # [SDF-MODIFICATION] calc_tet_err 使用 float inv_s，需要单独传递参数
+    inv_s_value = inv_s.item() if inv_s.dim() == 0 else inv_s[0].item()
     shader.calc_tet_err(
-        **args_common,
-        inv_s=inv_s.item() if inv_s.dim() == 0 else inv_s[0].item(),  # [SDF-MODIFICATION] float参数
+        sorted_gauss_idx=sorted_tetra_idx,
+        tile_ranges=tile_ranges,
+        indices=indices,
+        vertices=vertices,
+        tet_density=cell_values,
+        vert_sdf=vert_sdf,
+        inv_s=inv_s_value,  # [SDF-MODIFICATION] calc_tet_err 使用 float
+        output_img=output_img,
+        n_contributors=n_contributors,
+        tcam=tcam,
         pixel_err=pixel_err.contiguous(),
         ssim_err=ssim_err.contiguous(),
         gt=gt_img.contiguous(),

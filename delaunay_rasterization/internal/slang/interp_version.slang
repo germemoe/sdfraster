@@ -156,7 +156,7 @@ inline bool evaluate_tetra_interp(
     float exit = max(dist.y, enter);
 
     if (!hit) {
-        ctrl_pt = { (float4)(0.f, 0.f, 0.f, 0.f), {0.f, 0.f}, 0.f };  // [SDF-MODIFICATION]
+        ctrl_pt = { float4(0.f, 0.f, 0.f, 0.f), float2(0.f, 0.f), 0.f };  // [SDF-MODIFICATION]
         return false;
     } else {
         ctrl_pt = integrate_tetra_segment(g, ray_o, ray_d, enter, exit, inv_s);

@@ -48,6 +48,13 @@ float safe_exp4alpha(float x) {
     return safe_clip(safe_exp(x), 0, 1);
 }
 
+// [SDF-MODIFICATION] 辅助函数：从 DiffTensorView 读取 inv_s
+// 使用单独的函数使得 bwd_diff 可以自动处理梯度累积
+[Differentiable]
+float read_inv_s(DiffTensorView inv_s_tensor) {
+    return inv_s_tensor[uint(0)];
+}
+
 // [Differentiable]
 // float moment_0_int(float a, float b, float s1, float T) {
 //     return T * safe_div((-safe_expm1(s1*(a - b))),s1);
@@ -197,7 +204,7 @@ AlphaOut alpha_blend(TensorView<int32_t> sorted_gauss_idx,
                    DiffTensorView vertices,
                    DiffTensorView tet_density,
                    DiffTensorView vert_sdf,  // [SDF-MODIFICATION] 全局顶点SDF数组
-                   DiffTensorView inv_s_tensor,  // [SDF-MODIFICATION] NeuS inv_s 参数 (可微，单元素tensor)
+                   DiffTensorView inv_s_tensor,  // [SDF-MODIFICATION] NeuS inv_s 参数 (可微tensor)
                    DiffTensorView final_pixel_state,
                    DiffTensorView final_distortion_state,
                    TensorView<int32_t> n_contributors,
@@ -251,7 +258,8 @@ AlphaOut alpha_blend(TensorView<int32_t> sorted_gauss_idx,
                 local_n_contrib++;
                 SplatTetrahedra_interp g = collected_splats[j];
                 CtrlPt tetra_ctrl;
-                float inv_s = inv_s_tensor[uint(0)];  // [SDF-MODIFICATION] 从tensor读取inv_s
+                // [SDF-MODIFICATION] 使用 read_inv_s 读取 inv_s
+                float inv_s = read_inv_s(inv_s_tensor);
                 if (evaluate_tetra_interp(g, ray.o, ray.d, cam.min_t, inv_s, tetra_ctrl) && tetra_ctrl.rgba.a > 0) {
                     AlphaOut new_ao = update_alpha_out(ao, tetra_ctrl);
 
@@ -322,9 +330,8 @@ void bwd_alpha_blend(TensorView<int32_t> sorted_gauss_idx,
 
     DifferentialPair<float2> dp_center_pix_coord = diffPair(center_pix_coord);
 
-    // [SDF-MODIFICATION] 从tensor读取inv_s并初始化梯度累加器
-    float inv_s = inv_s_tensor[uint(0)];
-    float d_inv_s = 0.0f;  // 累加inv_s的梯度
+    // [SDF-MODIFICATION] 从 tensor 读取 inv_s
+    float inv_s = read_inv_s(inv_s_tensor);
 
     uint32_t thread_rank = cudaThreadIdx().y * cudaBlockDim().x + cudaThreadIdx().x;
     for (int i = 0; i < rounds; i++)
@@ -358,7 +365,7 @@ void bwd_alpha_blend(TensorView<int32_t> sorted_gauss_idx,
                     DifferentialPair<float3> dp_ray_d = diffPair(ray.d);
                     DifferentialPair<CtrlPt> dp_tetra_ctrl = diffPair(tetra_ctrl);
                     DifferentialPair<AlphaOut> dp_ao = diffPair(ao);
-                    // [SDF-MODIFICATION] 创建inv_s的DifferentialPair用于梯度传播
+                    // [SDF-MODIFICATION] 创建 inv_s 的 DifferentialPair
                     DifferentialPair<float> dp_inv_s = diffPair(inv_s, 0.0f);
 
                     bwd_diff(update_alpha_out)(dp_ao, dp_tetra_ctrl, d_ao);
@@ -369,10 +376,10 @@ void bwd_alpha_blend(TensorView<int32_t> sorted_gauss_idx,
                         dp_tetra_ctrl.d.dist,
                         dp_tetra_ctrl.d.density,
                     };
-                    // [SDF-MODIFICATION] 传递 inv_s DifferentialPair 到 evaluate_tetra_interp
+                    // [SDF-MODIFICATION] 传递 inv_s DifferentialPair 到 bwd_diff
                     bwd_diff(evaluate_tetra_interp)(dp_g, dp_ray_o, dp_ray_d, cam.min_t, dp_inv_s, d_tetra_scale);
-                    // [SDF-MODIFICATION] 累加 inv_s 梯度
-                    d_inv_s += dp_inv_s.getDifferential();
+                    // [SDF-MODIFICATION] 使用 bwd_diff(read_inv_s) 累积 inv_s 梯度到 tensor
+                    bwd_diff(read_inv_s)(inv_s_tensor, dp_inv_s.getDifferential());
                     // [SDF-MODIFICATION] 传递 vert_sdf 到 load_tet_alphablend_interp
                     bwd_diff(load_tet_alphablend_interp)(g_idx, vertices, indices, tet_density, vert_sdf, dp_g.d);
 
@@ -381,12 +388,7 @@ void bwd_alpha_blend(TensorView<int32_t> sorted_gauss_idx,
         }
         splats_left_to_process -= block_size;
     }
-
-    // [SDF-MODIFICATION] 将累加的inv_s梯度写回tensor (原子操作)
-    if (is_inside && abs(d_inv_s) > 1e-10f) {
-        float old_val;
-        inv_s_tensor.InterlockedAdd(uint(0), d_inv_s, old_val);
-    }
+    // [SDF-MODIFICATION] inv_s 梯度通过 bwd_diff(read_inv_s) 累积到 tensor
 }
 
 [AutoPyBindCUDA]
@@ -550,7 +552,7 @@ void kern_calc_tet_err(TensorView<int32_t> sorted_gauss_idx,
                     tet_err.InterlockedAdd(uint2(g_idx, 15), w * centroid.z, old_val);
 
                     tet_count.InterlockedAdd(uint2(g_idx, 0), 1, old_ival);
-                    int T_int = (65535 * T);
+                    int T_int = int(65535.0 * T);
                     tet_count.InterlockedMax(uint2(g_idx, 1), T_int, old_ival);
 
                     ao = new_ao;
