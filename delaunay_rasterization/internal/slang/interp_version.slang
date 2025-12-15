@@ -81,57 +81,73 @@ inline CtrlPt integrate_tetra_segment(
     in float3 ray_d,
     in float enter,
     in float exit,
-    in float inv_s,  // [SDF-MODIFICATION] NeuS inv_s 参数 (可微)
+    in float inv_s,
 )
 {
     float dt = max(exit - enter, 0.0f);
 
-    // 计算入口和出口点的世界坐标
     float3 p_enter = enter * ray_d + ray_o;
-    float3 p_exit = exit * ray_d + ray_o;
+    float3 p_exit  = exit  * ray_d + ray_o;
 
-    // 颜色计算 (相对于v0的偏移)
+    // 颜色仍然线性（你的 base_color + grd）
     float3 v_enter = p_enter - g.tet.verts[0];
-    float3 v_exit = p_exit - g.tet.verts[0];
-    float3 c_enter = dot(g.grd, v_enter) + g.base_color;
-    float3 c_exit = dot(g.grd, v_exit) + g.base_color;
+    float3 v_exit  = p_exit  - g.tet.verts[0];
+    float3 c_enter = dot(g.grd, v_enter) + g.base_color;  // c0
+    float3 c_exit  = dot(g.grd, v_exit)  + g.base_color;  // c1
 
-    // [SDF-MODIFICATION] NeuS alpha 计算
-    // 1. 计算入口和出口点的重心坐标
+    // SDF at endpoints（顶点 sdf 重心插值）
     float4 bary_enter = compute_barycentric(p_enter, g.tet.verts[0], g.tet.verts[1], g.tet.verts[2], g.tet.verts[3]);
-    float4 bary_exit = compute_barycentric(p_exit, g.tet.verts[0], g.tet.verts[1], g.tet.verts[2], g.tet.verts[3]);
+    float4 bary_exit  = compute_barycentric(p_exit , g.tet.verts[0], g.tet.verts[1], g.tet.verts[2], g.tet.verts[3]);
 
-    // 2. 插值得到入口和出口点的SDF值
     float sdf_enter = interpolate_sdf(bary_enter, g.vert_sdf);
-    float sdf_exit = interpolate_sdf(bary_exit, g.vert_sdf);
+    float sdf_exit  = interpolate_sdf(bary_exit , g.vert_sdf);
 
-    // 3. NeuS CDF: Φ(x) = sigmoid(x * inv_s) = 1 / (1 + exp(-x * inv_s))
-    // 使用 safe_exp 避免数值问题
-    float cdf_enter = safe_div(1.0f, 1.0f + safe_exp(-sdf_enter * inv_s));
-    float cdf_exit = safe_div(1.0f, 1.0f + safe_exp(-sdf_exit * inv_s));
+    // Φ = sigmoid(sdf * inv_s)
+    float u0 = sdf_enter * inv_s;
+    float u1 = sdf_exit  * inv_s;
+    float Phi0 = safe_sigmoid(u0);   // cdf_enter
+    float Phi1 = safe_sigmoid(u1);   // cdf_exit
 
-    // 4. NeuS alpha: α = max((Φ(sdf_enter) - Φ(sdf_exit)) / Φ(sdf_enter), 0)
-    // 注意：当从外部（sdf>0）进入内部（sdf<0）时，cdf_enter > cdf_exit，alpha > 0
-    float alpha = max(safe_div(cdf_enter - cdf_exit, cdf_enter + 1e-10f), 0.0f);
+    // alpha = 1 - Phi1/Phi0  (与 (Phi0-Phi1)/Phi0 等价)
+    float denom0 = max(Phi0, 1e-10f);
+    float alpha = 1.0f - safe_div(Phi1, denom0);
     alpha = safe_clip(alpha, 0.0f, 1.0f);
 
-    // === [DENSITY-RELATED] 原密度公式 (已注释) ===
-    // float alpha = max(-safe_expm1(-g.sdf * dt), 0.f);
-    // === [DENSITY-RELATED] 原密度代码结束 ===
+    // 计算 J = ∫_0^1 Phi(tau) d tau = (softplus(u1)-softplus(u0)) / (u1-u0)
+    float du = u1 - u0;
+    float J;
+    if (abs(du) > 1e-6f) {
+        float sp0 = safe_softplus(u0);
+        float sp1 = safe_softplus(u1);
+        J = safe_div(sp1 - sp0, du);
+    } else {
+        // du -> 0: J -> Phi0
+        J = Phi0;
+    }
 
-    // [SDF-MODIFICATION] 颜色积分仍使用四面体中心SDF (g.sdf) 作为密度近似
-    // 这是为了保持颜色渐变的平滑性
-    float effective_density = max(g.sdf, 0.0f);  // 使用正SDF作为密度
-    float3 final_color = compute_integral(c_exit, c_enter, dt * effective_density);
+    // c_eff = (c0*Phi0 - c1*Phi1 + (c1-c0)*J) / (Phi0 - Phi1)
+    float denomPhi = Phi0 - Phi1;
+    float3 c_eff;
+    if (abs(denomPhi) > 1e-10f) {
+        float3 dc = c_exit - c_enter;
+        float3 numer = c_enter * Phi0 - c_exit * Phi1 + dc * J;
+        c_eff = numer * safe_div(1.0f, denomPhi);
+    } else {
+        // Phi0≈Phi1: 权重几乎为0，段内颜色取中点即可
+        c_eff = 0.5f * (c_enter + c_exit);
+    }
 
-    // 将 alpha 转换为 -log(1-alpha) 以便累积 (与原代码兼容)
-    float log_transmittance = -safe_log(max(1.0f - alpha, 1e-10f));
+    // 段 RGB 贡献（外层再乘当前 T）
+    float3 seg_rgb = c_eff * alpha;
 
-    float4 rgba = {final_color.x * alpha,
-                    final_color.y * alpha,
-                    final_color.z * alpha,
-                    log_transmittance};  // [SDF-MODIFICATION] 使用 log transmittance
-    return { rgba, {enter, exit}, effective_density };  // [SDF-MODIFICATION] 返回 effective_density 用于 distortion
+    // 光学厚度 tau = -log(1-alpha)（用于外层更新 T，也兼容你原来的 rgba.w 用法）
+    float tau = -safe_log(max(1.0f - alpha, 1e-10f));
+
+    // 如果你需要一个“等效密度”给 distortion：rho_hat = tau / dt
+    float rho_hat = (dt > 1e-8f) ? (tau / dt) : 0.0f;
+
+    float4 rgba = { seg_rgb.x, seg_rgb.y, seg_rgb.z, tau };
+    return { rgba, {enter, exit}, rho_hat };
 }
 
 [Differentiable]

@@ -155,6 +155,9 @@ args.ablate_gradient = False
 args.ablate_circumsphere = True
 args.ablate_downweighing = False
 
+# 渲染图保存设置
+args.save_render_interval = 500  # 每k次迭代保存渲染图，0表示不保存
+
 
 args = Args.from_namespace(args.get_parser().parse_args())
 
@@ -213,6 +216,11 @@ densification_sampler = SimpleSampler(len(train_cameras), args.num_samples)
 
 video_writer = cv2.VideoWriter(str(args.output_path / "training.mp4"), cv2.VideoWriter_fourcc(*'mp4v'), 30,
                                pad_hw2even(sample_camera.image_width, sample_camera.image_height))
+
+# 创建渲染图保存目录
+render_save_dir = args.output_path / "renders"
+if args.save_render_interval > 0:
+    render_save_dir.mkdir(exist_ok=True, parents=True)
 
 progress_bar = tqdm(range(args.iterations))
 torch.cuda.empty_cache()
@@ -361,6 +369,16 @@ for iteration in progress_bar:
         "Eik": repr(f"{eik_loss.item():.3f}"),
         "Curv": repr(f"{curv_loss.item():.1e}"),
     })
+
+    # 每k次迭代保存渲染图
+    if args.save_render_interval > 0 and iteration % args.save_render_interval == 0:
+        with torch.no_grad():
+            render_pkg = render(sample_camera, model, min_t=min_t, tile_size=args.tile_size)
+            save_image = render_pkg['render']
+            save_image = save_image.permute(1, 2, 0)
+            save_image = (save_image.detach().cpu().numpy() * 255).clip(min=0, max=255).astype(np.uint8)
+            save_path = render_save_dir / f"iter_{iteration:06d}.png"
+            imageio.imwrite(str(save_path), save_image)
 
 avged_psnrs = [sum(v)/len(v) for v in psnrs if len(v) == len(train_cameras)]
 video_writer.release()

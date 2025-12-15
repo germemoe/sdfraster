@@ -125,6 +125,17 @@ float safe_sqrt(in float a) {
 }
 
 [Differentiable]
+float safe_sigmoid(float x) {
+    return safe_div(1.0f, 1.0f + safe_exp(-x));
+}
+
+[Differentiable]
+float safe_softplus(float x) {
+    return safe_log(1.0f + safe_exp(x));
+}
+
+
+[Differentiable]
 float4 l2_normalize(float4 x) {
   return safe_div(x, sqrt(max(dot(x, x), TINY_VAL)));
 }
