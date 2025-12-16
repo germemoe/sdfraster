@@ -118,15 +118,16 @@ class MeshRegularizer(nn.Module):
         Returns:
             normal_map: (H, W, 3) normal map in view space
             valid_mask: (H, W) boolean mask for valid pixels
+            depth_map: (H, W) mesh depth map
         """
         renderer = self._get_renderer(camera)
 
-        # Render mesh
+        # Render mesh (同时渲染 depth 和 normals，与 MILo 保持一致)
         output = renderer(
             mesh,
             cameras=[camera],
             cam_idx=0,
-            return_depth=False,
+            return_depth=True,
             return_normals=True,
             return_pix_to_face=True,
         )
@@ -134,9 +135,10 @@ class MeshRegularizer(nn.Module):
         # Get normals (in world space from face_normals)
         normals_world = output['normals']  # (1, H, W, 3)
         pix_to_face = output['pix_to_face']  # (1, H, W, 1)
+        mesh_depth = output['depth'].squeeze()  # (H, W)
 
-        # Valid mask where mesh is visible
-        valid_mask = (pix_to_face.squeeze() >= 0)  # (H, W)
+        # Valid mask where mesh is visible (depth > 0)
+        valid_mask = (mesh_depth > 0)  # (H, W)
 
         # Transform normals from world to view space
         normals_view = transform_normal_world_to_view(

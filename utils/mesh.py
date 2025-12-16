@@ -77,7 +77,7 @@ def nvdiff_rasterization(
     device = verts.device
 
     # Get full projection matrix
-    camera_mtx = camera.full_proj_transform
+    camera_mtx = camera.full_proj_transform.to(device)
 
     # Convert to homogeneous coordinates
     pos = torch.cat([verts, torch.ones([verts.shape[0], 1], device=device)], axis=1)
@@ -355,18 +355,19 @@ class MeshRenderer(nn.Module):
             color_idx = features.shape[-1]
             features = torch.cat([features, mesh.verts_colors], dim=-1)
 
-        # Compute image via interpolation
-        feature_img, _ = dr.interpolate(features[None], rast_out, mesh.faces)
+        # Compute image via interpolation (only if we have features to interpolate)
+        if features.shape[-1] > 0:
+            feature_img, _ = dr.interpolate(features[None], rast_out, mesh.faces)
 
-        # Antialiasing for propagating gradients
-        if use_antialiasing:
-            feature_img = dr.antialias(feature_img, rast_out, pos, mesh.faces)
+            # Antialiasing for propagating gradients
+            if use_antialiasing:
+                feature_img = dr.antialias(feature_img, rast_out, pos, mesh.faces)
 
-        if return_depth:
-            output_pkg["depth"] = feature_img[..., depth_idx:depth_idx + 1]
+            if return_depth:
+                output_pkg["depth"] = feature_img[..., depth_idx:depth_idx + 1]
 
-        if return_colors:
-            output_pkg["rgb"] = feature_img[..., color_idx:color_idx + 3]
+            if return_colors:
+                output_pkg["rgb"] = feature_img[..., color_idx:color_idx + 3]
 
         # Compute per-face normals
         if return_normals:
