@@ -1,0 +1,153 @@
+~/da/p/radmesh on main !7 > PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=5 uv run train.py --dataset_p
+ath /home/jk/data/dataset/DTU/scan37 --image_folder images --output_path output/sdf/DTU/scan37noeikcurv_normal --lambda_eikonal
+ 0.0 --lambda_curvature 0.0                                                                                                    
+warning: The `extra-build-dependencies` option is experimental and may change without warning. Pass `--preview-features extra-b
+uild-dependencies` to disable this warning.                                                                                    
+/data/jk/project                                                                                                               
+/data/jk/project/radmesh/.venv/lib/python3.10/site-packages/slangtorch/slangtorch.py:3: UserWarning: pkg_resources is deprecate
+d as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as ea
+rly as 2025-11-30. Refrain from using this package or pin to Setuptools<81.                                                    
+  import pkg_resources                                                                                                         
+Reading camera 49/49                                                                                                           
+Loading cameras: 100%|█████████████████████████████████████████████████████████████████████████| 49/49 [00:03<00:00, 13.57it/s]
+CameraInfo(uid=1, R=array([[ 0.97026269, -0.01474287, -0.24160498],                                                            
+       [ 0.00747991,  0.99949291, -0.030951  ],                                                                                
+       [ 0.24193877,  0.02822342,  0.96988096]]), T=array([-0.21085528, -0.01704116,  2.5999138 ]), fovy=0.397701717462152, fov
+x=0.524890485879586, cx=777.0, cy=581.0, image=None, image_path='/home/jk/data/dataset/DTU/scan37/images/0000.png', image_name=
+'0000', width=1554, height=1162, model=<ProjectionType.PERSPECTIVE: 0>, distortion_params=array([0., 0., 0., 0.]), exposure=1, 
+iso=100, aperature=1)                                                                                                          
+Loaded Train Cameras: 49                                                                                                       
+Loading cameras: 0it [00:00, ?it/s]                                                                                            
+Loaded Test Cameras: 0                                                                                                         
+Transforming poses                                                                                                             
+Scene scaling: 1.846290946006775. Center: tensor([7.4201700784e-08, 3.6735923459e-07, 8.2108435606e-08], device='cuda:0')      
+Using PyTorch iNGP                                                                                                             
+Encoding LR                                                                                                                    
+  0%|                  | 0/30000 [00:14<?, ?it/s, PSNR=' 5.74', Mean=' 0.00', #V=18333, #T=109372, Eik='0.000', Curv='0.0e+00']
+/data/jk/project/radmesh/.venv/lib/python3.10/site-packages/torch/utils/checkpoint.py:85: UserWarning: None of the inputs have 
+requires_grad=True. Gradients will be None                                                                                     
+  warnings.warn(                                                                                                               
+  2%|      | 500/30000 [01:48<1:14:10,  6.63it/s, PSNR='12.36', Mean='14.49', #V=18333, #T=109853, Eik='0.000', Curv='0.0e+00']
+/data/jk/project/radmesh/.venv/lib/python3.10/site-packages/torch/utils/checkpoint.py:85: UserWarning: None of the inputs have  
+requires_grad=True. Gradients will be None                                                                                     
+  warnings.warn(                                                                                                               
+  7%|▎    | 2000/30000 [05:56<1:32:36,  5.04it/s, PSNR='21.23', Mean='22.11', #V=18333, #T=109887, Eik='0.000', Curv='0.0e+00']
+/data/jk/project/radmesh/.venv/lib/python3.10/site-packages/torch/utils/checkpoint.py:85: UserWarning: None of the inputs have 
+requires_grad=True. Gradients will be None                                                                                     
+  warnings.warn(                                                                                                               
+#Grow: 38276 #Split: 31784 | Total Avg: 22.1396 Within Avg: 0.8166                                                             
+  8%|▍    | 2500/30000 [08:26<2:05:36,  3.65it/s, PSNR='28.12', Mean='25.97', #V=59345, #T=368937, Eik='0.000', Curv='0.0e+00']
+#Grow: 77072 #Split: 97637 | Total Avg: 2.4587 Within Avg: 0.4105                                                              
+ 10%|▎  | 3000/30000 [12:21<3:11:25,  2.35it/s, PSNR='29.60', Mean='26.78', #V=175296, #T=1111962, Eik='0.000', Curv='0.0e+00']
+#Grow: 58816 #Split: 148167 | Total Avg: 0.5336 Within Avg: 0.2105                                                             
+ 12%|▎  | 3500/30000 [18:22<4:53:25,  1.51it/s, PSNR='27.46', Mean='26.80', #V=340093, #T=2183598, Eik='0.000', Curv='0.0e+00']
+#Grow: 35195 #Split: 138853 | Total Avg: 0.1881 Within Avg: 0.1187                                                             
+ 13%|▍  | 4000/30000 [26:02<6:04:14,  1.19it/s, PSNR='25.88', Mean='27.51', #V=488465, #T=3155810, Eik='0.000', Curv='0.0e+00']
+#Grow: 16424 #Split: 72975 | Total Avg: 0.0852 Within Avg: 0.0693                                                              
+ 15%|▍  | 4500/30000 [34:34<6:40:35,  1.06it/s, PSNR='28.18', Mean='27.76', #V=567475, #T=3672689, Eik='0.000', Curv='0.0e+00']
+#Grow: 11588 #Split: 48027 | Total Avg: 0.0637 Within Avg: 0.0538                                                              
+ 17%|▌  | 5000/30000 [43:25<6:45:08,  1.03it/s, PSNR='25.71', Mean='27.94', #V=620538, #T=3955490, Eik='0.000', Curv='0.0e+00']
+#Grow: 8496 #Split: 40178 | Total Avg: 0.0537 Within Avg: 0.0481                                                               
+ 18%|▌  | 5500/30000 [52:39<7:00:53,  1.03s/it, PSNR='23.16', Mean='28.11', #V=664425, #T=4245903, Eik='0.000', Curv='0.0e+00']
+#Grow: 6015 #Split: 30866 | Total Avg: 0.0456 Within Avg: 0.0430                                                               
+ 20%|▏| 6000/30000 [1:02:06<6:31:37,  1.02it/s, PSNR='26.68', Mean='28.19', #V=698007, #T=4485125, Eik='0.000', Curv='0.0e+00']
+#Grow: 4557 #Split: 24092 | Total Avg: 0.0413 Within Avg: 0.0392                                                               
+ 22%|▏| 6500/30000 [1:11:47<6:34:58,  1.01s/it, PSNR='29.90', Mean='28.20', #V=724272, #T=4581952, Eik='0.000', Curv='0.0e+00']
+#Grow: 7987 #Split: 56454 | Total Avg: 0.0428 Within Avg: 0.0450                                                               
+ 23%|▏| 7000/30000 [1:22:00<7:01:25,  1.10s/it, PSNR='30.04', Mean='28.56', #V=783565, #T=5021988, Eik='0.000', Curv='0.0e+00']
+#Grow: 3534 #Split: 18522 | Total Avg: 0.0334 Within Avg: 0.0329                                                               
+ 25%|▎| 7500/30000 [1:32:23<7:17:17,  1.17s/it, PSNR='31.02', Mean='28.68', #V=803877, #T=5164539, Eik='0.000', Curv='0.0e+00']
+#Grow: 3206 #Split: 14864 | Total Avg: 0.0323 Within Avg: 0.0309                                                               
+ 27%|▎| 8000/30000 [1:42:55<7:11:07,  1.18s/it, PSNR='30.07', Mean='28.77', #V=820625, #T=5281428, Eik='0.000', Curv='0.0e+00']
+#Grow: 3014 #Split: 12964 | Total Avg: 0.0316 Within Avg: 0.0294                                                               
+ 28%|▎| 8500/30000 [1:53:35<7:01:35,  1.18s/it, PSNR='25.35', Mean='28.78', #V=835512, #T=5375885, Eik='0.000', Curv='0.0e+00']
+#Grow: 2533 #Split: 12740 | Total Avg: 0.0313 Within Avg: 0.0289                                                               
+ 30%|▎| 9000/30000 [2:04:25<6:53:56,  1.18s/it, PSNR='23.80', Mean='29.05', #V=849695, #T=5477072, Eik='0.000', Curv='0.0e+00']
+#Grow: 2304 #Split: 10146 | Total Avg: 0.0298 Within Avg: 0.0272                
+ 32%|▎| 9500/30000 [2:15:19<6:46:04,  1.19s/it, PSNR='31.38', Mean='29.14', #V=861219, #T=5551787, Eik='0.000', Curv='0.0e+00']
+#Grow: 2759 #Split: 9408 | Total Avg: 0.0334 Within Avg: 0.0265                                                                
+ 33%|▎| 10000/30000 [2:26:18<6:24:09,  1.15s/it, PSNR='24.87', Mean='29.22', #V=872592, #T=5625203, Eik='0.000', Curv='0.0e+00'
+#Grow: 1844 #Split: 8577 | Total Avg: 0.0283 Within Avg: 0.0254                                                                
+ 35%|▎| 10500/30000 [2:37:15<6:27:41,  1.19s/it, PSNR='30.89', Mean='29.24', #V=882330, #T=5683049, Eik='0.000', Curv='0.0e+00'
+#Grow: 1942 #Split: 8095 | Total Avg: 0.0288 Within Avg: 0.0251                                                                
+ 37%|▎| 11000/30000 [2:48:22<6:23:55,  1.21s/it, PSNR='31.32', Mean='29.31', #V=891724, #T=5749692, Eik='0.000', Curv='0.0e+00'#Grow: 1663 #Split: 7841 | Total Avg: 0.0276 Within Avg: 0.0244                                                       [176/390] 
+ 38%|▍| 11500/30000 [2:59:33<6:16:27,  1.22s/it, PSNR='30.24', Mean='29.03', #V=900619, #T=5.8e+6, Eik='0.000', Curv='0.0e+00']
+#Grow: 1884 #Split: 9270 | Total Avg: 0.0283 Within Avg: 0.0251                                                                
+ 40%|▍| 12000/30000 [3:10:48<6:21:51,  1.27s/it, PSNR='29.18', Mean='29.50', #V=911075, #T=5877024, Eik='0.000', Curv='0.0e+00'
+#Grow: 1241 #Split: 5068 | Total Avg: 0.0272 Within Avg: 0.0229                                                                
+ 42%|▍| 12500/30000 [3:22:07<6:10:52,  1.27s/it, PSNR='27.43', Mean='29.60', #V=917021, #T=5918381, Eik='0.000', Curv='0.0e+00'
+#Grow: 1195 #Split: 5408 | Total Avg: 0.0262 Within Avg: 0.0223                                                                
+ 43%|▍| 13000/30000 [3:33:35<5:52:54,  1.25s/it, PSNR='31.54', Mean='29.68', #V=923237, #T=5962595, Eik='0.000', Curv='0.0e+00'
+#Grow: 1094 #Split: 4575 | Total Avg: 0.0258 Within Avg: 0.0214                                                                
+ 45%|█▎ | 13500/30000 [3:45:13<5:48:19,  1.27s/it, PSNR='31.58', Mean='29.73', #V=928598, #T=6e+6, Eik='0.000', Curv='0.0e+00']
+#Grow: 1125 #Split: 4368 | Total Avg: 0.0259 Within Avg: 0.0211                                                                
+ 47%|▍| 14000/30000 [3:56:56<5:46:22,  1.30s/it, PSNR='32.37', Mean='29.80', #V=933820, #T=6035074, Eik='0.000', Curv='0.0e+00'
+#Grow:  998 #Split: 3683 | Total Avg: 0.0255 Within Avg: 0.0205                                                                
+ 48%|▍| 14500/30000 [4:08:43<5:09:34,  1.20s/it, PSNR='27.38', Mean='29.91', #V=938249, #T=6066819, Eik='0.000', Curv='0.0e+00'
+#Grow:  836 #Split: 3088 | Total Avg: 0.0251 Within Avg: 0.0197                                                                
+ 50%|▌| 15000/30000 [4:20:32<5:01:43,  1.21s/it, PSNR='31.29', Mean='29.78', #V=941992, #T=6088558, Eik='0.000', Curv='0.0e+00'
+#Grow:  975 #Split: 2998 | Total Avg: 0.0258 Within Avg: 0.0199                                                                
+ 52%|▌| 15500/30000 [4:32:29<5:11:47,  1.29s/it, PSNR='25.03', Mean='29.90', #V=945811, #T=6115208, Eik='0.000', Curv='0.0e+00'
+#Grow:  717 #Split: 2459 | Total Avg: 0.0245 Within Avg: 0.0190                                                                
+ 60%|▌| 18000/30000 [5:30:33<4:02:18,  1.21s/it, PSNR='31.65', Mean='30.25', #V=948851, #T=6158732, Eik='0.000', Curv='0.0e+00'
+Kept 6157116 tets                                                                                                              
+Freezing model                                                                                                                 
+ 60%|▌| 18000/30000 [5:31:11<3:40:47,  1.10s/it, PSNR='31.65', Mean='30.25', #V=948851, #T=6158732, Eik='0.000', Curv='0.0e+00'
+Traceback (most recent call last):                                                                                             
+  File "/data/jk/project/radmesh/train.py", line 263, in <module>                                                              
+    render_pkg = render(camera, model, scene_scaling=model.scene_scaling, ray_jitter=ray_jitter, **args.as_dict())             
+  File "/data/jk/project/radmesh/utils/train_util.py", line 55, in render                                                      
+    vert_sdf = model.query_vert_sdf().reshape(-1, 1)  # (M, 1) 形状                                                            
+  File "/data/jk/project/radmesh/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1964, in __getattr__     
+    raise AttributeError(                                                                                                      
+AttributeError: 'FrozenTetModel' object has no attribute 'query_vert_sdf'                                                      
+[W1216 07:52:42.486694905 AllocatorConfig.cpp:28] Warning: PYTORCH_CUDA_ALLOC_CONF is deprecated, use PYTORCH_ALLOC_CONF instea
+d (function operator())                                                                                                        
+~/da/p/radmesh on main !7 > gpustat -cpu                                 took 5h 31m 52s py radmesh with jk@node11 at 07:52:42
+
+~/da/p/radmesh on main >1 !2 >                                                       INT py radmesh with jk@node11 at 13:52:21 
+~/da/p/radmesh on main >1 !2 > PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=5 uv run train.py --datase
+t_path /home/jk/data/dataset/DTU/scan37 --image_folder images --output_path output/sdf/DTU/scan37noeikcurv_normal2 --lambda_eik
+onal 0.0 --lambda_curvature 0.0                                                                                                
+warning: The `extra-build-dependencies` option is experimental and may change without warning. Pass `--preview-features extra-b
+uild-dependencies` to disable this warning.                                                                                    
+/data/jk/project                                                                                                               
+/data/jk/project/radmesh/.venv/lib/python3.10/site-packages/slangtorch/slangtorch.py:3: UserWarning: pkg_resources is deprecate
+d as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as ea
+rly as 2025-11-30. Refrain from using this package or pin to Setuptools<81.                                                    
+  import pkg_resources                                                                                                         
+Reading camera 49/49                                                                                                           
+Loading cameras: 100%|█████████████████████████████████████████████████████████████████████████| 49/49 [00:03<00:00, 13.69it/s]
+CameraInfo(uid=1, R=array([[ 0.97026269, -0.01474287, -0.24160498],                                                            
+       [ 0.00747991,  0.99949291, -0.030951  ],                                                                                
+       [ 0.24193877,  0.02822342,  0.96988096]]), T=array([-0.21085528, -0.01704116,  2.5999138 ]), fovy=0.397701717462152, fov
+x=0.524890485879586, cx=777.0, cy=581.0, image=None, image_path='/home/jk/data/dataset/DTU/scan37/images/0000.png', image_name=
+'0000', width=1554, height=1162, model=<ProjectionType.PERSPECTIVE: 0>, distortion_params=array([0., 0., 0., 0.]), exposure=1, 
+iso=100, aperature=1)                                                                                                          
+Loaded Train Cameras: 49                                                                                                       
+Loading cameras: 0it [00:00, ?it/s]                                                                                            
+Loaded Test Cameras: 0                                                                                                         
+Transforming poses                                                                                                             
+Scene scaling: 1.846290946006775. Center: tensor([7.4201700784e-08, 3.6735923459e-07, 8.2108435606e-08], device='cuda:0')      
+Using PyTorch iNGP                                                                                                             
+^[[A^[[BEncoding LR                                                                                                            
+  0%|                  | 0/30000 [00:15<?, ?it/s, PSNR=' 6.99', Mean=' 0.00', #V=18333, #T=109062, Eik='0.000', Curv='0.0e+00']
+/data/jk/project/radmesh/.venv/lib/python3.10/site-packages/torch/utils/checkpoint.py:85: UserWarning: None of the inputs have 
+requires_grad=True. Gradients will be None                                                                                     
+  warnings.warn(                                                                                                               
+  2%|      | 500/30000 [01:50<1:16:09,  6.46it/s, PSNR='14.57', Mean='14.88', #V=18333, #T=109590, Eik='0.000', Curv='0.0e+00']
+/data/jk/project/radmesh/.venv/lib/python3.10/site-packages/torch/utils/checkpoint.py:85: UserWarning: None of the inputs have 
+requires_grad=True. Gradients will be None                                                                                     
+  warnings.warn(                                                                                                               
+  6%|▏   | 1672/30000 [07:13<33:41:58,  4.28s/it, PSNR='12.87', Mean='15.07', #V=18333, #T=109406, Eik='0.000', Curv='0.0e+00']
+  7%|▎    | 2000/30000 [08:04<1:07:38,  6.90it/s, PSNR='16.97', Mean='14.87', #V=18333, #T=109558, Eik='0.000', Curv='0.0e+00']
+/data/jk/project/radmesh/.venv/lib/python3.10/site-packages/torch/utils/checkpoint.py:85: UserWarning: None of the inputs have 
+requires_grad=True. Gradients will be None                                                                                     
+  warnings.warn(                                                                                                               
+#Grow:   40 #Split:   74 | Total Avg: 0.5222 Within Avg: 0.0065                                                                
+  8%|▍    | 2500/30000 [09:29<1:08:59,  6.64it/s, PSNR='16.45', Mean='15.62', #V=18417, #T=109805, Eik='0.000', Curv='0.0e+00']
+#Grow: 2112 #Split: 2468 | Total Avg: 11.4019 Within Avg: 0.2279                                                               
+  9%|▍    | 2669/30000 [10:02<1:07:02,  6.79it/s, PSNR='13.84', Mean='14.83', #V=21082, #T=127721, Eik='0.000', Curv='0.0e+00']
+  9%|▍    | 2672/30000 [10:02<1:19:18,  5.74it/s, PSNR='13.03', Mean='14.83', #V=21082, #T=127463, Eik='0.000', Curv='0.0e+00']
+  9%|▍    | 2680/30000 [10:03<1:08:08,  6.68it/s, PSNR='17.24', Mean='14.83', #V=21082, #T=127463, Eik='0.000', Curv='0.0e+00']
+  9%|▍    | 2680/30000 [10:03<1:42:36,  4.44it/s, PSNR='17.24', Mean='14.83', #V=21082, #T=127463, Eik='0.000', Curv='0.0e+00']

@@ -159,7 +159,7 @@ struct CtrlPt: IDifferentiable {
 };
 
 [Differentiable]
-CtrlPt evaluate_tetra(in SplatTetrahedra g, 
+CtrlPt evaluate_tetra(in SplatTetrahedra g,
                       in float3 ray_o,
                       in float3 ray_d)
 {
@@ -175,11 +175,13 @@ CtrlPt evaluate_tetra(in SplatTetrahedra g,
     float dt = max(abs(dist.y - dist.x), 0.0f);
     // float2 dist = cyrusBeckTetrahedronShearScale(ray_o, ray_d, g.tet.verts[0], g.tet.verts[1], g.tet.verts[2], g.tet.verts[3]);
     if (!hit) {
-        return {{0.f, 0.f, 0.f, 0.f}, dist, g.rgbs.w};
+        // [NORMAL-OUTPUT] 添加 normal 零值初始化
+        return {{0.f, 0.f, 0.f, 0.f}, dist, g.rgbs.w, float3(0.f, 0.f, 0.f)};
     } else {
         float alpha = safe_clip(1-safe_exp(-g.rgbs.w * dt), 0, 1);
         float4 rgba = {
             alpha * g.rgbs.x, alpha * g.rgbs.y, alpha * g.rgbs.z, alpha};
-        return {rgba, dist, g.rgbs.w};
+        // [NORMAL-OUTPUT] 添加 normal 零值（此函数不计算实际 normal）
+        return {rgba, dist, g.rgbs.w, float3(0.f, 0.f, 0.f)};
     }
 }

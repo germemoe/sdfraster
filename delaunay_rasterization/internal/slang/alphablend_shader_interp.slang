@@ -396,10 +396,12 @@ void bwd_alpha_blend(TensorView<int32_t> sorted_gauss_idx,
                     bwd_diff(update_alpha_out)(dp_ao, dp_tetra_ctrl, d_ao);
                     d_ao = dp_ao.getDifferential();
                     float midpt = tetra_ctrl.dist.x;
+                    // [NORMAL-OUTPUT] 添加 normal 梯度（即使不使用 normal loss，也需要正确初始化）
                     CtrlPt.Differential d_tetra_scale = {
                         dp_tetra_ctrl.d.rgba,
                         dp_tetra_ctrl.d.dist,
                         dp_tetra_ctrl.d.density,
+                        dp_tetra_ctrl.d.normal,  // [NORMAL-OUTPUT] 添加 normal 梯度
                     };
                     // [SDF-MODIFICATION] 传递 inv_s DifferentialPair 到 bwd_diff
                     bwd_diff(evaluate_tetra_interp)(dp_g, dp_ray_o, dp_ray_d, cam.min_t, dp_inv_s, d_tetra_scale);

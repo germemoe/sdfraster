@@ -20,19 +20,6 @@ from utils.args import Args
 from models.base_model import BaseModel
 
 
-class FrozenBackbone(nn.Module):
-    """[SDF-MODIFICATION] 轻量级 backbone 替身，仅存储 inv_s 参数用于 NeuS 渲染"""
-    def __init__(self, inv_s: torch.Tensor):
-        super().__init__()
-        # 可学习的 inv_s 参数
-        self.s_var = nn.Parameter(inv_s.log())  # 存储 log(inv_s)
-
-    @property
-    def inv_s(self):
-        """获取 inv_s = exp(s_var)，用于 NeuS alpha 计算"""
-        return self.s_var.exp()
-
-
 class FrozenTetModel(BaseModel):
     """Minimal field representation with *fixed* tetrahedral geometry.
 
@@ -59,8 +46,6 @@ class FrozenTetModel(BaseModel):
         center: torch.Tensor,                # (1, 3)
         scene_scaling: torch.Tensor | float,
         *,
-        vert_sdf: torch.Tensor = None,       # [SDF-MODIFICATION] (M,) 全局顶点SDF
-        inv_s: torch.Tensor = None,          # [SDF-MODIFICATION] (1,) NeuS inv_s 参数
         density_offset: float = -1.0,
         max_sh_deg: int = 2,
         chunk_size: int = 408_576,
@@ -95,22 +80,6 @@ class FrozenTetModel(BaseModel):
         self.frozen = True
         self.linear = False
         self.feature_dim = 7
-
-        # [SDF-MODIFICATION] 存储顶点 SDF 和 inv_s
-        if vert_sdf is not None:
-            self.register_buffer("_vert_sdf", vert_sdf)  # (M,) 全局顶点SDF
-        else:
-            # 默认初始化为零（兼容旧 checkpoint）
-            total_verts = int_vertices.shape[0] + ext_vertices.shape[0]
-            self.register_buffer("_vert_sdf", torch.zeros(total_verts, device=int_vertices.device))
-
-        # [SDF-MODIFICATION] 创建 FrozenBackbone 用于存储 inv_s
-        if inv_s is not None:
-            self.backbone = FrozenBackbone(inv_s)
-        else:
-            # 默认 inv_s = exp(3.0) ≈ 20，与 iNGPDW 初始值一致
-            default_inv_s = torch.tensor(20.0, device=int_vertices.device)
-            self.backbone = FrozenBackbone(default_inv_s)
 
     def sh_up(self):
         pass
@@ -154,14 +123,6 @@ class FrozenTetModel(BaseModel):
         center = ckpt['center']
         scene_scaling = ckpt['scene_scaling']
 
-        # [SDF-MODIFICATION] 从checkpoint加载顶点SDF和inv_s（兼容旧checkpoint）
-        vert_sdf = ckpt.get('_vert_sdf', None)
-        # backbone.s_var 存储的是 log(inv_s)，需要转换
-        if 'backbone.s_var' in ckpt:
-            inv_s = ckpt['backbone.s_var'].exp()
-        else:
-            inv_s = None  # 使用默认值
-
         print(f"Loaded {int_vertices.shape[0]} internal vertices")
 
         # Create model instance
@@ -176,8 +137,6 @@ class FrozenTetModel(BaseModel):
             sh=sh.to(device),
             center=center.to(device),
             scene_scaling=scene_scaling.to(device),
-            vert_sdf=vert_sdf.to(device) if vert_sdf is not None else None,  # [SDF-MODIFICATION]
-            inv_s=inv_s.to(device) if inv_s is not None else None,  # [SDF-MODIFICATION]
             density_offset=config.density_offset,  # [DENSITY-RELATED] 密度偏移配置
             max_sh_deg=config.max_sh_deg,
             chunk_size=config.chunk_size if hasattr(config, 'chunk_size') else 408_576,
@@ -185,7 +144,7 @@ class FrozenTetModel(BaseModel):
 
 
         # Load state dict to ensure all parameters are properly loaded
-        model.load_state_dict(ckpt, strict=False)  # [SDF-MODIFICATION] strict=False 兼容旧checkpoint
+        model.load_state_dict(ckpt)
         base_min_t = getattr(config, "base_min_t", getattr(config, "min_t", 0.4))
         model.min_t = model.scene_scaling * base_min_t
 
@@ -292,26 +251,6 @@ class FrozenTetModel(BaseModel):
         _, densities, _, _, _ = self.compute_batch_features(verts, self.indices)
         return densities.reshape(-1)
 
-    # [SDF-MODIFICATION] 查询顶点 SDF 值
-    def query_vert_sdf(self, points=None):
-        """
-        查询点的SDF值
-
-        Args:
-            points: (N, 3) 世界坐标，如果为 None 则返回所有顶点的 SDF
-        Returns:
-            sdf: (N,) 或 (M,) SDF 值
-        """
-        if points is None:
-            return self._vert_sdf
-        else:
-            # 对于 FrozenTetModel，暂不支持任意点查询，仅返回顶点 SDF
-            # 如果 points 与 vertices 相同，返回存储的 SDF
-            raise NotImplementedError(
-                "FrozenTetModel.query_vert_sdf() 仅支持查询顶点 SDF，"
-                "不支持任意点查询。请使用 points=None 获取所有顶点的 SDF。"
-            )
-
 
 
 # =============================================================================
@@ -355,8 +294,6 @@ class FrozenTetOptimizer:
             {"params": [model.density],  "lr": freeze_lr,  "name": "density"},
             {"params": [model.rgb],      "lr": freeze_lr,    "name": "color"},
             {"params": [model.gradient], "lr": freeze_lr, "name": "gradient"},
-            # [SDF-MODIFICATION] backbone.s_var (inv_s) 参数优化
-            {"params": [model.backbone.s_var], "lr": freeze_lr * 0.1, "name": "s_var"},
         ])
         self.sh_optim = torch.optim.RMSprop([
             {"params": [model.sh],       "lr": freeze_lr,       "name": "sh"},
@@ -448,10 +385,6 @@ def bake_from_model(base_model, mask, chunk_size: int = 408_576) -> FrozenTetMod
     center = base_model.center
     scene_scaling = base_model.scene_scaling
 
-    # [SDF-MODIFICATION] 提取顶点 SDF 和 inv_s（在 offload 之前）
-    vert_sdf = base_model.query_vert_sdf().detach().cpu()  # (M,)
-    inv_s = base_model.backbone.inv_s.detach().cpu()  # scalar tensor
-
     d_list, rgb_list, grd_list, sh_list = [], [], [], []
     for start in range(0, indices.shape[0], chunk_size):
         end = min(start + chunk_size, indices.shape[0])
@@ -487,8 +420,6 @@ def bake_from_model(base_model, mask, chunk_size: int = 408_576) -> FrozenTetMod
         sh=sh.to(device),
         center=center.detach().to(device),
         scene_scaling=scene_scaling.detach().to(device),
-        vert_sdf=vert_sdf.to(device),  # [SDF-MODIFICATION] 传递顶点SDF
-        inv_s=inv_s.to(device),        # [SDF-MODIFICATION] 传递 inv_s
         max_sh_deg=max_sh_deg,
         chunk_size=chunk_size,
     )
