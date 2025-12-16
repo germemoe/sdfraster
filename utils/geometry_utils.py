@@ -131,8 +131,10 @@ def transform_normal_world_to_view(normal_world, camera):
     Returns:
         normal_view: (..., 3) normals in view space
     """
+    device = normal_world.device
+
     # Get rotation part of world_view_transform (3x3)
-    R = camera.world_view_transform[:3, :3]
+    R = camera.world_view_transform[:3, :3].to(device)
 
     # Transform normals
     original_shape = normal_world.shape

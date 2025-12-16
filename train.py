@@ -128,8 +128,8 @@ args.gradient_taps = 4            # 数值梯度采样点数：4 或 6
 args.gradient_eps = 1e-3          # 数值梯度步长
 
 # [MESH-NORMAL-LOSS] Mesh 法线一致性 Loss 设置（参考 MILo）
-args.lambda_mesh_normal = 0.0    # mesh normal loss 权重
-args.mesh_normal_start = 8001     # 开始使用 mesh normal loss 的迭代
+args.lambda_mesh_normal = 0.01   # mesh normal loss 权重
+args.mesh_normal_start = 10001     # 开始使用 mesh normal loss 的迭代
 args.mesh_normal_stop = 18000     # 停止使用 mesh normal loss 的迭代
 args.mesh_sdf_threshold = 0.0     # mesh 提取的 SDF 阈值
 
@@ -138,7 +138,7 @@ args.num_samples = 200
 args.k_samples = 1
 args.trunc_sigma = 0.35
 args.min_tet_count = 9
-args.densify_start = 2000
+args.densify_start = 500
 args.densify_end = 16000
 args.densify_interval = 500
 args.budget = 2_000_000

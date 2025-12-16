@@ -34,11 +34,13 @@ def transform_points_world_to_view(points, cameras):
     if not isinstance(cameras, list):
         cameras = [cameras]
 
+    device = points.device
+
     if points.dim() == 2:
         points = points.unsqueeze(0).expand(len(cameras), -1, -1)
 
     world_view_transforms = torch.stack(
-        [camera.world_view_transform for camera in cameras], dim=0
+        [camera.world_view_transform.to(device) for camera in cameras], dim=0
     )  # (n_cameras, 4, 4)
 
     points_h = torch.cat([points, torch.ones_like(points[..., :1])], dim=-1)  # (n_cameras, N, 4)
