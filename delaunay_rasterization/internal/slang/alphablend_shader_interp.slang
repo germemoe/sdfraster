@@ -179,6 +179,7 @@ struct AlphaOut: IDifferentiable {
     float4 rgba;
     DistortionState5 distortion_state;
     float3 normal_state;  // [NORMAL-OUTPUT] 累积的 normal（alpha blending）
+    float depth_state;    // [DEPTH-OUTPUT] 累积的期望深度
 };
 
 // [NORMAL-OUTPUT] Normal blending: accumulated_normal += normal * alpha * T
@@ -195,13 +196,28 @@ float3 undo_normal_state(float3 curr_normal, float3 ctrl_normal, float4 ctrl_rgb
     return curr_normal - ctrl_normal * alpha * T;
 }
 
+// [DEPTH-OUTPUT] Expected depth: depth += T * alpha * t_mid
+[Differentiable]
+float update_depth_state(float prev_depth, float4 ctrl_rgba, float2 ctrl_dist, float T) {
+    float alpha = 1.0f - safe_exp(-ctrl_rgba.a);
+    float t_mid = (ctrl_dist.x + ctrl_dist.y) * 0.5f;
+    return prev_depth + T * alpha * t_mid;
+}
+
+float undo_depth_state(float curr_depth, float4 ctrl_rgba, float2 ctrl_dist, float T) {
+    float alpha = 1.0f - safe_exp(-ctrl_rgba.a);
+    float t_mid = (ctrl_dist.x + ctrl_dist.y) * 0.5f;
+    return curr_depth - T * alpha * t_mid;
+}
+
 [Differentiable]
 AlphaOut update_alpha_out(AlphaOut prev, CtrlPt ctrl) {
     float T = safe_exp(prev.rgba.a);
     return {
         update_pixel_state(prev.rgba, ctrl.rgba),
         update_distortion_state(prev.distortion_state, T, ctrl.density, ctrl.dist),
-        update_normal_state(prev.normal_state, ctrl.normal, ctrl.rgba, T)  // [NORMAL-OUTPUT]
+        update_normal_state(prev.normal_state, ctrl.normal, ctrl.rgba, T),  // [NORMAL-OUTPUT]
+        update_depth_state(prev.depth_state, ctrl.rgba, ctrl.dist, T)  // [DEPTH-OUTPUT]
     };
 }
 
@@ -211,7 +227,8 @@ AlphaOut undo_alpha_out(AlphaOut curr, CtrlPt ctrl) {
     return {
         pix_state,
         undo_distortion_state(curr.distortion_state, T, ctrl.density, ctrl.dist),
-        undo_normal_state(curr.normal_state, ctrl.normal, ctrl.rgba, T)  // [NORMAL-OUTPUT]
+        undo_normal_state(curr.normal_state, ctrl.normal, ctrl.rgba, T),  // [NORMAL-OUTPUT]
+        undo_depth_state(curr.depth_state, ctrl.rgba, ctrl.dist, T)  // [DEPTH-OUTPUT]
     };
 }
 
@@ -225,6 +242,7 @@ AlphaOut alpha_blend(TensorView<int32_t> sorted_gauss_idx,
                    DiffTensorView final_pixel_state,
                    DiffTensorView final_distortion_state,
                    DiffTensorView final_normal_state,  // [NORMAL-OUTPUT] 最终 normal 状态
+                   DiffTensorView final_depth_state,   // [DEPTH-OUTPUT] 最终深度状态
                    TensorView<int32_t> n_contributors,
                    TensorView<bool> tet_alive,
                    no_diff Camera cam,
@@ -238,8 +256,9 @@ AlphaOut alpha_blend(TensorView<int32_t> sorted_gauss_idx,
     float4 curr_pixel_state = float4(0.f, 0.f, 0.f, 0.f);
     DistortionState5 curr_distortion_state = {0.f, 0.f, 0.f, 0.f, 0.f};
     float3 curr_normal_state = float3(0.f, 0.f, 0.f);  // [NORMAL-OUTPUT] 初始化 normal 状态
+    float curr_depth_state = 0.f;  // [DEPTH-OUTPUT] 初始化深度状态
     AlphaOut ao = {
-        curr_pixel_state, curr_distortion_state, curr_normal_state
+        curr_pixel_state, curr_distortion_state, curr_normal_state, curr_depth_state
     };
     uint32_t block_size = cam.tile_height * cam.tile_width;
     bool is_inside = (pix_coord.x < cam.W && pix_coord.y < cam.H);
@@ -309,6 +328,7 @@ void bwd_alpha_blend(TensorView<int32_t> sorted_gauss_idx,
                      DiffTensorView final_pixel_state,
                      DiffTensorView final_distortion_state,
                      DiffTensorView final_normal_state,  // [NORMAL-OUTPUT] 最终 normal 状态
+                     DiffTensorView final_depth_state,   // [DEPTH-OUTPUT] 最终深度状态
                      TensorView<int32_t> n_contributors,
                      TensorView<bool> tet_alive,
                      no_diff Camera cam,
@@ -331,6 +351,7 @@ void bwd_alpha_blend(TensorView<int32_t> sorted_gauss_idx,
     float4 current_pixel_state;
     DistortionState5 curr_distortion_state;
     float3 curr_normal_state;  // [NORMAL-OUTPUT]
+    float curr_depth_state;    // [DEPTH-OUTPUT]
     int32_t n_contrib_fwd;
     if (is_inside) {
         curr_distortion_state = {final_distortion_state[uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 0)],
@@ -346,9 +367,11 @@ void bwd_alpha_blend(TensorView<int32_t> sorted_gauss_idx,
         curr_normal_state = float3(final_normal_state[uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 0)],
                                    final_normal_state[uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 1)],
                                    final_normal_state[uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 2)]);
+        // [DEPTH-OUTPUT] 从 final_depth_state 读取深度状态
+        curr_depth_state = final_depth_state[uint2(uint32_t(pix_coord.y), uint32_t(pix_coord.x))];
         n_contrib_fwd = n_contributors[uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 0)];
     }
-    AlphaOut ao = {current_pixel_state, curr_distortion_state, curr_normal_state};  // [NORMAL-OUTPUT]
+    AlphaOut ao = {current_pixel_state, curr_distortion_state, curr_normal_state, curr_depth_state};  // [DEPTH-OUTPUT]
 
     Ray ray = get_ray(cam, center_pix_coord);
     int exit_face;
@@ -396,10 +419,12 @@ void bwd_alpha_blend(TensorView<int32_t> sorted_gauss_idx,
                     bwd_diff(update_alpha_out)(dp_ao, dp_tetra_ctrl, d_ao);
                     d_ao = dp_ao.getDifferential();
                     float midpt = tetra_ctrl.dist.x;
+                    // [NORMAL-OUTPUT] 添加 normal 梯度
                     CtrlPt.Differential d_tetra_scale = {
                         dp_tetra_ctrl.d.rgba,
                         dp_tetra_ctrl.d.dist,
                         dp_tetra_ctrl.d.density,
+                        dp_tetra_ctrl.d.normal,
                     };
                     // [SDF-MODIFICATION] 传递 inv_s DifferentialPair 到 bwd_diff
                     bwd_diff(evaluate_tetra_interp)(dp_g, dp_ray_o, dp_ray_d, cam.min_t, dp_inv_s, d_tetra_scale);
@@ -429,6 +454,7 @@ void splat_tiled(TensorView<int32_t> sorted_gauss_idx,
                  DiffTensorView output_img,
                  DiffTensorView distortion_img,
                  DiffTensorView normal_img,  // [NORMAL-OUTPUT] normal 输出
+                 DiffTensorView depth_img,   // [DEPTH-OUTPUT] 深度输出
                  TensorView<int32_t> n_contributors,
                  TensorView<bool> tet_alive,
                  TensorView<float> ray_jitter,
@@ -462,6 +488,7 @@ void splat_tiled(TensorView<int32_t> sorted_gauss_idx,
         output_img,
         distortion_img,
         normal_img,        // [NORMAL-OUTPUT]
+        depth_img,         // [DEPTH-OUTPUT]
         n_contributors,
         tet_alive,
         cam,
@@ -485,6 +512,8 @@ void splat_tiled(TensorView<int32_t> sorted_gauss_idx,
       normal_img.storeOnce(uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 0), pixel_states.normal_state.x);
       normal_img.storeOnce(uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 1), pixel_states.normal_state.y);
       normal_img.storeOnce(uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 2), pixel_states.normal_state.z);
+      // [DEPTH-OUTPUT] 写入深度输出
+      depth_img.storeOnce(uint2(uint32_t(pix_coord.y), uint32_t(pix_coord.x)), pixel_states.depth_state);
     }
 }
 

@@ -7,3 +7,6 @@
 [submodule "neuralangelo"]
 	path = neuralangelo
 	url = https://github.com/NVlabs/neuralangelo.git
+[submodule "MILo"]
+	path = MILo
+	url = https://github.com/Anttwo/MILo.git
