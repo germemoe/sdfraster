@@ -86,7 +86,13 @@ class MeshRegularizer(nn.Module):
 
         # Get vertices and tetrahedra indices
         vertices = model.vertices.detach()  # (N_verts, 3)
+
+        # 只使用活跃的四面体（排除 empty_indices）
         tets = model.indices  # (N_tets, 4)
+        if hasattr(model, 'empty_indices') and model.empty_indices is not None and model.empty_indices.shape[0] > 0:
+            # indices 已经是活跃的四面体，empty_indices 是被裁剪的
+            # 确保我们只用 indices
+            pass  # model.indices 应该已经是正确的
 
         # Query SDF values at all vertices
         vert_sdf = model.query_vert_sdf().detach()  # (N_verts,)
@@ -201,6 +207,7 @@ class MeshRegularizer(nn.Module):
         camera,
         gaussian_depth: torch.Tensor,
         iteration: int = None,
+        gt_mask: torch.Tensor = None,  # GT alpha mask，排除背景散乱法线
     ) -> dict:
         """Compute mesh regularization loss.
 
@@ -209,6 +216,7 @@ class MeshRegularizer(nn.Module):
             camera: Camera object for rendering
             gaussian_depth: (H, W) depth from Gaussian rendering
             iteration: Current training iteration (for scheduling)
+            gt_mask: (H, W) or (1, H, W) GT alpha mask，背景为0前景为1
 
         Returns:
             dict with:
@@ -237,21 +245,23 @@ class MeshRegularizer(nn.Module):
             return result
 
         # Render mesh normals
-        mesh_normal, valid_mask = self.render_mesh_normal(mesh, camera)
+        mesh_normal, rasterization_mask = self.render_mesh_normal(mesh, camera)
 
         # Compute Gaussian normals from depth
         gaussian_normal = self.compute_gaussian_normal(gaussian_depth, camera)
 
-        # Also mask out edge pixels (where finite difference is invalid)
+        # Build combined mask
         H, W = gaussian_depth.shape
-        edge_mask = torch.ones((H, W), dtype=torch.bool, device=gaussian_depth.device)
-        edge_mask[0, :] = False
-        edge_mask[-1, :] = False
-        edge_mask[:, 0] = False
-        edge_mask[:, -1] = False
 
-        # Combined mask
-        combined_mask = valid_mask & edge_mask
+        # 1. Mesh rasterization mask (mesh渲染到的位置)
+        combined_mask = rasterization_mask
+
+        # 2. GT alpha mask (排除背景散乱法线)
+        if gt_mask is not None:
+            if gt_mask.dim() == 3:
+                gt_mask = gt_mask.squeeze(0)
+            gt_mask_bool = gt_mask > 0.5
+            combined_mask = combined_mask & gt_mask_bool
 
         # Compute normal consistency loss
         normal_loss = self.compute_normal_consistency_loss(

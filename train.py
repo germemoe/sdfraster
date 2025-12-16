@@ -15,6 +15,7 @@ import random
 import time
 from tqdm import tqdm
 import numpy as np
+import matplotlib.pyplot as plt
 from utils import cam_util
 from utils.train_util import *
 from utils.model_util import eikonal_loss, curvature_loss
@@ -313,6 +314,7 @@ for iteration in progress_bar:
             camera=camera,
             gaussian_depth=gaussian_depth,
             iteration=iteration,
+            gt_mask=gt_mask,  # 传入GT alpha mask，排除背景散乱法线
         )
         mesh_normal_loss = mesh_reg_result['loss']
         mesh_normal_active = mesh_reg_result['active']
@@ -411,19 +413,66 @@ for iteration in progress_bar:
     if args.save_render_interval > 0 and iteration % args.save_render_interval == 0:
         with torch.no_grad():
             render_pkg = render(sample_camera, model, min_t=min_t, tile_size=args.tile_size)
-            # 保存 RGB 渲染图
-            save_image = render_pkg['render']
-            save_image = save_image.permute(1, 2, 0)
-            save_image = (save_image.detach().cpu().numpy() * 255).clip(min=0, max=255).astype(np.uint8)
-            save_path = render_save_dir / f"iter_{iteration:06d}.png"
-            imageio.imwrite(str(save_path), save_image)
 
-            # [NORMAL-OUTPUT] 保存 normal 图（将 [-1, 1] 映射到 [0, 255]）
-            normal_map = render_pkg['normal']
-            normal_map = normal_map.permute(1, 2, 0)
-            normal_vis = ((normal_map.detach().cpu().numpy() + 1) / 2 * 255).clip(0, 255).astype(np.uint8)
-            normal_path = render_save_dir / f"normal_{iteration:06d}.png"
-            imageio.imwrite(str(normal_path), normal_vis)
+            # 1. RGB 渲染图
+            rgb_img = render_pkg['render'].permute(1, 2, 0)
+            rgb_img = (rgb_img.detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+
+            # 2. 深度图（归一化可视化）
+            depth_map = render_pkg['depth']  # (H, W)
+            depth_np = depth_map.detach().cpu().numpy()
+            # 排除无效深度（0或极大值）进行归一化
+            valid_mask = (depth_np > 0) & (depth_np < 1e6)
+            if valid_mask.any():
+                d_min, d_max = depth_np[valid_mask].min(), depth_np[valid_mask].max()
+                depth_norm = (depth_np - d_min) / (d_max - d_min + 1e-8)
+            else:
+                depth_norm = np.zeros_like(depth_np)
+            depth_norm = np.where(valid_mask, depth_norm, 0)
+            # 使用 turbo colormap
+            depth_vis = (plt.cm.turbo(depth_norm)[:, :, :3] * 255).astype(np.uint8)
+
+            # 3. Gaussian 法线图（从渲染的 normal 输出）
+            gauss_normal = render_pkg['normal'].permute(1, 2, 0)  # (H, W, 3)
+            gauss_normal_vis = ((gauss_normal.detach().cpu().numpy() + 1) / 2 * 255).clip(0, 255).astype(np.uint8)
+
+            # 4. Mesh 法线图（如果 mesh regularizer 激活）
+            mesh_normal_vis = np.zeros_like(rgb_img)
+            if args.lambda_mesh_normal > 0 and mesh_regularizer.should_apply(iteration):
+                # 获取 sample_camera 的 gt_mask（如果有）
+                sample_gt_mask = getattr(sample_camera, 'gt_alpha_mask', None)
+                if sample_gt_mask is not None:
+                    sample_gt_mask = sample_gt_mask.cuda()
+                mesh_reg_vis = mesh_regularizer(
+                    model=model,
+                    camera=sample_camera,
+                    gaussian_depth=render_pkg['depth'],
+                    iteration=iteration,
+                    gt_mask=sample_gt_mask,
+                )
+                if mesh_reg_vis['active'] and mesh_reg_vis['mesh_normal'] is not None:
+                    mesh_normal = mesh_reg_vis['mesh_normal']  # (H, W, 3)
+                    mesh_normal_vis = ((mesh_normal.detach().cpu().numpy() + 1) / 2 * 255).clip(0, 255).astype(np.uint8)
+
+            # 整合成 2x2 网格图
+            H, W = rgb_img.shape[:2]
+            combined = np.zeros((H * 2, W * 2, 3), dtype=np.uint8)
+            combined[:H, :W] = rgb_img                    # 左上: RGB
+            combined[:H, W:] = depth_vis                  # 右上: Depth
+            combined[H:, :W] = gauss_normal_vis           # 左下: Gaussian Normal
+            combined[H:, W:] = mesh_normal_vis            # 右下: Mesh Normal
+
+            # 添加标签
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale, thickness = 0.6, 2
+            cv2.putText(combined, 'RGB', (10, 25), font, font_scale, (255, 255, 255), thickness)
+            cv2.putText(combined, 'Depth', (W + 10, 25), font, font_scale, (255, 255, 255), thickness)
+            cv2.putText(combined, 'Gauss Normal', (10, H + 25), font, font_scale, (255, 255, 255), thickness)
+            cv2.putText(combined, 'Mesh Normal', (W + 10, H + 25), font, font_scale, (255, 255, 255), thickness)
+
+            # 保存整合图
+            save_path = render_save_dir / f"iter_{iteration:06d}.png"
+            imageio.imwrite(str(save_path), combined)
 
 avged_psnrs = [sum(v)/len(v) for v in psnrs if len(v) == len(train_cameras)]
 video_writer.release()
