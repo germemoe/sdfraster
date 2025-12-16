@@ -178,14 +178,30 @@ float4 undo_pixel_state(float4 pixel_state_t_n, float4 gauss_rgba_t_n)
 struct AlphaOut: IDifferentiable {
     float4 rgba;
     DistortionState5 distortion_state;
+    float3 normal_state;  // [NORMAL-OUTPUT] 累积的 normal（alpha blending）
 };
+
+// [NORMAL-OUTPUT] Normal blending: accumulated_normal += normal * alpha * T
+[Differentiable]
+float3 update_normal_state(float3 prev_normal, float3 ctrl_normal, float4 ctrl_rgba, float T) {
+    // ctrl_rgba.rgb 已经是 color * alpha，所以这里直接用 alpha
+    // alpha = 1 - exp(-tau)，tau 存在 ctrl_rgba.a
+    float alpha = 1.0f - safe_exp(-ctrl_rgba.a);
+    return prev_normal + ctrl_normal * alpha * T;
+}
+
+float3 undo_normal_state(float3 curr_normal, float3 ctrl_normal, float4 ctrl_rgba, float T) {
+    float alpha = 1.0f - safe_exp(-ctrl_rgba.a);
+    return curr_normal - ctrl_normal * alpha * T;
+}
 
 [Differentiable]
 AlphaOut update_alpha_out(AlphaOut prev, CtrlPt ctrl) {
     float T = safe_exp(prev.rgba.a);
     return {
         update_pixel_state(prev.rgba, ctrl.rgba),
-        update_distortion_state(prev.distortion_state, T, ctrl.density, ctrl.dist)
+        update_distortion_state(prev.distortion_state, T, ctrl.density, ctrl.dist),
+        update_normal_state(prev.normal_state, ctrl.normal, ctrl.rgba, T)  // [NORMAL-OUTPUT]
     };
 }
 
@@ -194,7 +210,8 @@ AlphaOut undo_alpha_out(AlphaOut curr, CtrlPt ctrl) {
     float T = safe_exp(pix_state.a);
     return {
         pix_state,
-        undo_distortion_state(curr.distortion_state, T, ctrl.density, ctrl.dist)
+        undo_distortion_state(curr.distortion_state, T, ctrl.density, ctrl.dist),
+        undo_normal_state(curr.normal_state, ctrl.normal, ctrl.rgba, T)  // [NORMAL-OUTPUT]
     };
 }
 
@@ -207,6 +224,7 @@ AlphaOut alpha_blend(TensorView<int32_t> sorted_gauss_idx,
                    DiffTensorView inv_s_tensor,  // [SDF-MODIFICATION] NeuS inv_s 参数 (可微tensor)
                    DiffTensorView final_pixel_state,
                    DiffTensorView final_distortion_state,
+                   DiffTensorView final_normal_state,  // [NORMAL-OUTPUT] 最终 normal 状态
                    TensorView<int32_t> n_contributors,
                    TensorView<bool> tet_alive,
                    no_diff Camera cam,
@@ -219,8 +237,9 @@ AlphaOut alpha_blend(TensorView<int32_t> sorted_gauss_idx,
     float2 center_pix_coord = {pix_coord.x+ray_jitter_x, pix_coord.y+ray_jitter_y};
     float4 curr_pixel_state = float4(0.f, 0.f, 0.f, 0.f);
     DistortionState5 curr_distortion_state = {0.f, 0.f, 0.f, 0.f, 0.f};
+    float3 curr_normal_state = float3(0.f, 0.f, 0.f);  // [NORMAL-OUTPUT] 初始化 normal 状态
     AlphaOut ao = {
-        curr_pixel_state, curr_distortion_state
+        curr_pixel_state, curr_distortion_state, curr_normal_state
     };
     uint32_t block_size = cam.tile_height * cam.tile_width;
     bool is_inside = (pix_coord.x < cam.W && pix_coord.y < cam.H);
@@ -289,6 +308,7 @@ void bwd_alpha_blend(TensorView<int32_t> sorted_gauss_idx,
                      DiffTensorView inv_s_tensor,  // [SDF-MODIFICATION] NeuS inv_s 参数 (可微tensor)
                      DiffTensorView final_pixel_state,
                      DiffTensorView final_distortion_state,
+                     DiffTensorView final_normal_state,  // [NORMAL-OUTPUT] 最终 normal 状态
                      TensorView<int32_t> n_contributors,
                      TensorView<bool> tet_alive,
                      no_diff Camera cam,
@@ -310,6 +330,7 @@ void bwd_alpha_blend(TensorView<int32_t> sorted_gauss_idx,
 
     float4 current_pixel_state;
     DistortionState5 curr_distortion_state;
+    float3 curr_normal_state;  // [NORMAL-OUTPUT]
     int32_t n_contrib_fwd;
     if (is_inside) {
         curr_distortion_state = {final_distortion_state[uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 0)],
@@ -321,9 +342,13 @@ void bwd_alpha_blend(TensorView<int32_t> sorted_gauss_idx,
                                      final_pixel_state[uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 1)],
                                      final_pixel_state[uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 2)],
                                      final_pixel_state[uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 3)]);
+        // [NORMAL-OUTPUT] 从 final_normal_state 读取 normal 状态
+        curr_normal_state = float3(final_normal_state[uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 0)],
+                                   final_normal_state[uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 1)],
+                                   final_normal_state[uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 2)]);
         n_contrib_fwd = n_contributors[uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 0)];
     }
-    AlphaOut ao = {current_pixel_state, curr_distortion_state};
+    AlphaOut ao = {current_pixel_state, curr_distortion_state, curr_normal_state};  // [NORMAL-OUTPUT]
 
     Ray ray = get_ray(cam, center_pix_coord);
     int exit_face;
@@ -403,6 +428,7 @@ void splat_tiled(TensorView<int32_t> sorted_gauss_idx,
                  DiffTensorView inv_s_tensor,  // [SDF-MODIFICATION] NeuS inv_s 参数 (可微tensor)
                  DiffTensorView output_img,
                  DiffTensorView distortion_img,
+                 DiffTensorView normal_img,  // [NORMAL-OUTPUT] normal 输出
                  TensorView<int32_t> n_contributors,
                  TensorView<bool> tet_alive,
                  TensorView<float> ray_jitter,
@@ -435,6 +461,7 @@ void splat_tiled(TensorView<int32_t> sorted_gauss_idx,
         inv_s_tensor,      // [SDF-MODIFICATION] NeuS inv_s 参数 (可微tensor)
         output_img,
         distortion_img,
+        normal_img,        // [NORMAL-OUTPUT]
         n_contributors,
         tet_alive,
         cam,
@@ -443,7 +470,7 @@ void splat_tiled(TensorView<int32_t> sorted_gauss_idx,
         pix_coord,
         tile_idx_start,
         tile_idx_end);
-                                    
+
     if (is_inside) {
       output_img.storeOnce(uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 0), pixel_states.rgba.r);
       output_img.storeOnce(uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 1), pixel_states.rgba.g);
@@ -454,6 +481,10 @@ void splat_tiled(TensorView<int32_t> sorted_gauss_idx,
       distortion_img.storeOnce(uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 2), pixel_states.distortion_state.z);
       distortion_img.storeOnce(uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 3), pixel_states.distortion_state.w);
       distortion_img.storeOnce(uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 4), pixel_states.distortion_state.v);
+      // [NORMAL-OUTPUT] 写入 normal 输出
+      normal_img.storeOnce(uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 0), pixel_states.normal_state.x);
+      normal_img.storeOnce(uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 1), pixel_states.normal_state.y);
+      normal_img.storeOnce(uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 2), pixel_states.normal_state.z);
     }
 }
 
@@ -478,8 +509,9 @@ void kern_calc_tet_err(TensorView<int32_t> sorted_gauss_idx,
     float2 center_pix_coord = {pix_coord.x+0.5, pix_coord.y+0.5};
     float4 curr_pixel_state = float4(0.f, 0.f, 0.f, 1.f);
     DistortionState5 curr_distortion_state = {0.f, 0.f, 0.f, 0.f, 0.f};
+    float3 curr_normal_state = float3(0.f, 0.f, 0.f);  // [NORMAL-OUTPUT]
     AlphaOut ao = {
-        curr_pixel_state, curr_distortion_state
+        curr_pixel_state, curr_distortion_state, curr_normal_state
     };
     uint32_t block_size = cam.tile_height * cam.tile_width;
     bool is_inside = (pix_coord.x < cam.W && pix_coord.y < cam.H);

@@ -67,13 +67,17 @@ def render_err(gt_image, camera: Camera, model, tile_size=16, min_t=0.1, **kwarg
     # torch.cuda.synchronize()
     # st = time.time()
     tet_vertices = vertices[indices]
-    distortion_img = torch.zeros((render_grid.image_height, 
-                                render_grid.image_width, 4), 
+    distortion_img = torch.zeros((render_grid.image_height,
+                                render_grid.image_width, 4),
                                 device=device)
-    output_img = torch.zeros((render_grid.image_height, 
-                                render_grid.image_width, 4), 
+    output_img = torch.zeros((render_grid.image_height,
+                                render_grid.image_width, 4),
                                 device=device)
-    n_contributors = torch.zeros((render_grid.image_height, 
+    # [NORMAL-OUTPUT] 添加 normal_img tensor
+    normal_img = torch.zeros((render_grid.image_height,
+                              render_grid.image_width, 3),
+                             device=device)
+    n_contributors = torch.zeros((render_grid.image_height,
                                     render_grid.image_width, 1),
                                     dtype=torch.int32, device=device)
     tet_alive = torch.zeros((indices.shape[0]), dtype=bool, device=device)
@@ -111,6 +115,7 @@ def render_err(gt_image, camera: Camera, model, tile_size=16, min_t=0.1, **kwarg
     splat_kernel_with_args = shader.splat_tiled(
         **splat_args,
         distortion_img=distortion_img,
+        normal_img=normal_img,  # [NORMAL-OUTPUT]
         tet_alive=tet_alive,
         ray_jitter=ray_jitter,
     )

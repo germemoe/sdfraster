@@ -53,6 +53,40 @@ inline float interpolate_sdf(float4 bary, float4 vert_sdf) {
     return bary.x * vert_sdf.x + bary.y * vert_sdf.y + bary.z * vert_sdf.z + bary.w * vert_sdf.w;
 }
 
+// [NORMAL-OUTPUT] 计算四面体内 SDF 线性场的梯度（法向量）
+// 由于四面体内 SDF 是通过重心坐标线性插值的，梯度为常值
+// ∇sdf = s0 * ∇λ0 + s1 * ∇λ1 + s2 * ∇λ2 + s3 * ∇λ3
+// 其中 ∇λi 是重心坐标的梯度，可从四面体几何计算
+[Differentiable]
+inline float3 compute_tet_sdf_gradient(float3 v0, float3 v1, float3 v2, float3 v3, float4 vert_sdf) {
+    // 计算四面体边向量
+    float3 e0 = v0 - v3;
+    float3 e1 = v1 - v3;
+    float3 e2 = v2 - v3;
+
+    // 计算四面体体积的 6 倍（带符号）
+    float det = dot(e0, cross(e1, e2));
+    float inv_det = safe_div(1.0f, det);
+
+    // 重心坐标的梯度
+    // ∇λ0 = (v1-v3) × (v2-v3) / (6V) = cross(e1, e2) / det
+    // ∇λ1 = (v2-v3) × (v0-v3) / (6V) = cross(e2, e0) / det
+    // ∇λ2 = (v0-v3) × (v1-v3) / (6V) = cross(e0, e1) / det
+    // ∇λ3 = -∇λ0 - ∇λ1 - ∇λ2
+    float3 grad_lambda0 = cross(e1, e2) * inv_det;
+    float3 grad_lambda1 = cross(e2, e0) * inv_det;
+    float3 grad_lambda2 = cross(e0, e1) * inv_det;
+    float3 grad_lambda3 = -grad_lambda0 - grad_lambda1 - grad_lambda2;
+
+    // SDF 梯度 = Σ sdf_i * ∇λi
+    float3 sdf_gradient = vert_sdf.x * grad_lambda0
+                        + vert_sdf.y * grad_lambda1
+                        + vert_sdf.z * grad_lambda2
+                        + vert_sdf.w * grad_lambda3;
+
+    return sdf_gradient;
+}
+
 [Differentiable]
 inline float phi(float x) {
     if (abs(x) < 1e-6) {
@@ -143,11 +177,19 @@ inline CtrlPt integrate_tetra_segment(
     // 光学厚度 tau = -log(1-alpha)（用于外层更新 T，也兼容你原来的 rgba.w 用法）
     float tau = -safe_log(max(1.0f - alpha, 1e-10f));
 
-    // 如果你需要一个“等效密度”给 distortion：rho_hat = tau / dt
+    // 如果你需要一个"等效密度"给 distortion：rho_hat = tau / dt
     float rho_hat = (dt > 1e-8f) ? (tau / dt) : 0.0f;
 
+    // [NORMAL-OUTPUT] 计算四面体内 SDF 梯度作为法向量
+    float3 sdf_grad = compute_tet_sdf_gradient(
+        g.tet.verts[0], g.tet.verts[1], g.tet.verts[2], g.tet.verts[3],
+        g.vert_sdf);
+    // 归一化得到法向量（指向 SDF 增大方向，即表面外侧）
+    float grad_len = length(sdf_grad);
+    float3 normal = (grad_len > 1e-8f) ? (sdf_grad / grad_len) : float3(0.0f, 0.0f, 1.0f);
+
     float4 rgba = { seg_rgb.x, seg_rgb.y, seg_rgb.z, tau };
-    return { rgba, {enter, exit}, rho_hat };
+    return { rgba, {enter, exit}, rho_hat, normal };
 }
 
 [Differentiable]
@@ -172,7 +214,7 @@ inline bool evaluate_tetra_interp(
     float exit = max(dist.y, enter);
 
     if (!hit) {
-        ctrl_pt = { float4(0.f, 0.f, 0.f, 0.f), float2(0.f, 0.f), 0.f };  // [SDF-MODIFICATION]
+        ctrl_pt = { float4(0.f, 0.f, 0.f, 0.f), float2(0.f, 0.f), 0.f, float3(0.f, 0.f, 0.f) };  // [NORMAL-OUTPUT] 添加 normal 零值
         return false;
     } else {
         ctrl_pt = integrate_tetra_segment(g, ray_o, ray_d, enter, exit, inv_s);

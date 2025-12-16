@@ -155,6 +155,7 @@ struct CtrlPt: IDifferentiable {
     float4 rgba;
     float2 dist;
     float density;
+    float3 normal;  // [NORMAL-OUTPUT] 四面体内 SDF 梯度（法向量）
 };
 
 [Differentiable]

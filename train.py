@@ -374,11 +374,19 @@ for iteration in progress_bar:
     if args.save_render_interval > 0 and iteration % args.save_render_interval == 0:
         with torch.no_grad():
             render_pkg = render(sample_camera, model, min_t=min_t, tile_size=args.tile_size)
+            # 保存 RGB 渲染图
             save_image = render_pkg['render']
             save_image = save_image.permute(1, 2, 0)
             save_image = (save_image.detach().cpu().numpy() * 255).clip(min=0, max=255).astype(np.uint8)
             save_path = render_save_dir / f"iter_{iteration:06d}.png"
             imageio.imwrite(str(save_path), save_image)
+
+            # [NORMAL-OUTPUT] 保存 normal 图（将 [-1, 1] 映射到 [0, 255]）
+            normal_map = render_pkg['normal']
+            normal_map = normal_map.permute(1, 2, 0)
+            normal_vis = ((normal_map.detach().cpu().numpy() + 1) / 2 * 255).clip(0, 255).astype(np.uint8)
+            normal_path = render_save_dir / f"normal_{iteration:06d}.png"
+            imageio.imwrite(str(normal_path), normal_vis)
 
 avged_psnrs = [sum(v)/len(v) for v in psnrs if len(v) == len(train_cameras)]
 video_writer.release()
