@@ -34,6 +34,7 @@ from utils.lib_bilagrid import BilateralGrid, total_variation_loss, slice
 from torch.optim.lr_scheduler import ExponentialLR, LinearLR, ChainedScheduler
 import gc
 from utils.densification import collect_render_stats, apply_densification, determine_cull_mask
+from utils.mesh_regularization import MeshRegularizer
 import mediapy
 from icecream import ic
 
@@ -125,6 +126,12 @@ args.gradient_mode = "numerical"  # "analytical" 或 "numerical"
 args.gradient_taps = 4            # 数值梯度采样点数：4 或 6
 args.gradient_eps = 1e-3          # 数值梯度步长
 
+# [MESH-NORMAL-LOSS] Mesh 法线一致性 Loss 设置（参考 MILo）
+args.lambda_mesh_normal = 0.0    # mesh normal loss 权重
+args.mesh_normal_start = 8001     # 开始使用 mesh normal loss 的迭代
+args.mesh_normal_stop = 18000     # 停止使用 mesh normal loss 的迭代
+args.mesh_sdf_threshold = 0.0     # mesh 提取的 SDF 阈值
+
 # Clone Settings
 args.num_samples = 200
 args.k_samples = 1
@@ -183,6 +190,16 @@ else:
 min_t = args.min_t
 
 tet_optim = TetOptimizer(model, **args.as_dict())
+
+# [MESH-NORMAL-LOSS] 创建 Mesh 正则化器
+mesh_regularizer = MeshRegularizer(
+    start_iter=args.mesh_normal_start,
+    stop_iter=args.mesh_normal_stop,
+    normal_weight=args.lambda_mesh_normal,
+    sdf_threshold=args.mesh_sdf_threshold,
+    use_opengl=True,
+)
+
 if args.eval:
     sample_camera = test_cameras[args.sample_cam]
     # sample_camera = train_cameras[args.sample_cam]
@@ -285,13 +302,29 @@ for iteration in progress_bar:
         if args.lambda_curvature > 0 and hessian_diag is not None:
             curv_loss = curvature_loss(hessian_diag)
 
+    # [MESH-NORMAL-LOSS] Mesh Normal 一致性 Loss
+    mesh_normal_loss = torch.tensor(0.0, device=device)
+    mesh_normal_active = False
+    if args.lambda_mesh_normal > 0 and mesh_regularizer.should_apply(iteration):
+        # 使用渲染的深度计算 mesh normal loss
+        gaussian_depth = render_pkg['depth']  # (H, W)
+        mesh_reg_result = mesh_regularizer(
+            model=model,
+            camera=camera,
+            gaussian_depth=gaussian_depth,
+            iteration=iteration,
+        )
+        mesh_normal_loss = mesh_reg_result['loss']
+        mesh_normal_active = mesh_reg_result['active']
+
     loss = (1-args.lambda_ssim)*l1_loss + \
            args.lambda_ssim*ssim_loss + \
            reg + \
            args.lambda_dist * dl_loss + \
            args.lambda_sh * render_pkg['sh_reg'] + \
            args.lambda_eikonal * eik_loss + \
-           args.lambda_curvature * curv_loss
+           args.lambda_curvature * curv_loss + \
+           mesh_normal_loss  # [MESH-NORMAL-LOSS] 已经乘过权重
 
     loss.backward()
 
@@ -361,14 +394,18 @@ for iteration in progress_bar:
 
     disp_ind = max(len(psnrs)-2, 0)
     avg_psnr = sum(psnrs[disp_ind]) / max(len(psnrs[disp_ind]), 1)
-    progress_bar.set_postfix({
+    postfix_dict = {
         "PSNR": repr(f"{psnr:>5.2f}"),
         "Mean": repr(f"{avg_psnr:>5.2f}"),
         "#V": len(model),
         "#T": model.indices.shape[0],
         "Eik": repr(f"{eik_loss.item():.3f}"),
         "Curv": repr(f"{curv_loss.item():.1e}"),
-    })
+    }
+    # [MESH-NORMAL-LOSS] 显示 mesh normal loss（仅当激活时）
+    if mesh_normal_active:
+        postfix_dict["MeshN"] = repr(f"{mesh_normal_loss.item():.3f}")
+    progress_bar.set_postfix(postfix_dict)
 
     # 每k次迭代保存渲染图
     if args.save_render_interval > 0 and iteration % args.save_render_interval == 0:
