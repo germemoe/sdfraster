@@ -129,6 +129,9 @@ args.gradient_eps = 1e-3          # 数值梯度步长
 
 # [MESH-NORMAL-LOSS] Mesh 法线一致性 Loss 设置（参考 MILo）
 args.lambda_mesh_normal = 0.01   # mesh normal loss 权重
+args.lambda_mesh_depth = 0.0     # mesh depth loss 权重
+args.lambda_mesh_occupancy = 0.0 # surface occupancy loss 权重
+args.mesh_depth_scale = 0.1      # depth loss 的 scale 参数
 args.mesh_normal_start = 10001     # 开始使用 mesh normal loss 的迭代
 args.mesh_normal_stop = 18000     # 停止使用 mesh normal loss 的迭代
 args.mesh_sdf_threshold = 0.0     # mesh 提取的 SDF 阈值
@@ -197,6 +200,9 @@ mesh_regularizer = MeshRegularizer(
     start_iter=args.mesh_normal_start,
     stop_iter=args.mesh_normal_stop,
     normal_weight=args.lambda_mesh_normal,
+    depth_weight=args.lambda_mesh_depth,
+    occupancy_weight=args.lambda_mesh_occupancy,
+    depth_scale=args.mesh_depth_scale,
     sdf_threshold=args.mesh_sdf_threshold,
     use_opengl=True,
 )
@@ -303,11 +309,14 @@ for iteration in progress_bar:
         if args.lambda_curvature > 0 and hessian_diag is not None:
             curv_loss = curvature_loss(hessian_diag)
 
-    # [MESH-NORMAL-LOSS] Mesh Normal 一致性 Loss
-    mesh_normal_loss = torch.tensor(0.0, device=device)
-    mesh_normal_active = False
-    if args.lambda_mesh_normal > 0 and mesh_regularizer.should_apply(iteration):
-        # 使用渲染的深度计算 mesh normal loss
+    # [MESH-LOSS] Mesh 正则化 Loss (normal + depth + occupancy)
+    mesh_loss = torch.tensor(0.0, device=device)
+    mesh_loss_active = False
+    mesh_has_any_weight = (args.lambda_mesh_normal > 0 or
+                           args.lambda_mesh_depth > 0 or
+                           args.lambda_mesh_occupancy > 0)
+    if mesh_has_any_weight and mesh_regularizer.should_apply(iteration):
+        # 使用渲染的深度计算 mesh loss
         gaussian_depth = render_pkg['depth']  # (H, W)
         mesh_reg_result = mesh_regularizer(
             model=model,
@@ -316,8 +325,8 @@ for iteration in progress_bar:
             iteration=iteration,
             gt_mask=gt_mask,  # 传入GT alpha mask，排除背景散乱法线
         )
-        mesh_normal_loss = mesh_reg_result['loss']
-        mesh_normal_active = mesh_reg_result['active']
+        mesh_loss = mesh_reg_result['loss']
+        mesh_loss_active = mesh_reg_result['active']
 
     loss = (1-args.lambda_ssim)*l1_loss + \
            args.lambda_ssim*ssim_loss + \
@@ -326,7 +335,7 @@ for iteration in progress_bar:
            args.lambda_sh * render_pkg['sh_reg'] + \
            args.lambda_eikonal * eik_loss + \
            args.lambda_curvature * curv_loss + \
-           mesh_normal_loss  # [MESH-NORMAL-LOSS] 已经乘过权重
+           mesh_loss  # [MESH-LOSS] 已经乘过权重
 
     loss.backward()
 
@@ -404,9 +413,9 @@ for iteration in progress_bar:
         "Eik": repr(f"{eik_loss.item():.3f}"),
         "Curv": repr(f"{curv_loss.item():.1e}"),
     }
-    # [MESH-NORMAL-LOSS] 显示 mesh normal loss（仅当激活时）
-    if mesh_normal_active:
-        postfix_dict["MeshN"] = repr(f"{mesh_normal_loss.item():.3f}")
+    # [MESH-LOSS] 显示 mesh loss（仅当激活时）
+    if mesh_loss_active:
+        postfix_dict["Mesh"] = repr(f"{mesh_loss.item():.3f}")
     progress_bar.set_postfix(postfix_dict)
 
     # 每k次迭代保存渲染图
@@ -438,7 +447,7 @@ for iteration in progress_bar:
 
             # 4. Mesh 法线图（如果 mesh regularizer 激活）
             mesh_normal_vis = np.zeros_like(rgb_img)
-            if args.lambda_mesh_normal > 0 and mesh_regularizer.should_apply(iteration):
+            if mesh_has_any_weight and mesh_regularizer.should_apply(iteration):
                 # 获取 sample_camera 的 gt_mask（如果有）
                 sample_gt_mask = getattr(sample_camera, 'gt_alpha_mask', None)
                 if sample_gt_mask is not None:
