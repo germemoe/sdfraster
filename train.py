@@ -30,6 +30,28 @@ import json
 import imageio
 from utils import test_util
 import termplotlib as tpl
+import matplotlib.pyplot as plt
+
+def viz_tensordepth(x, alpha_mass=None, mode='log'):
+    """深度图可视化函数，参考 svraster 实现"""
+    if alpha_mass is not None:
+        m = (alpha_mass > 0.01) & (x > 0)
+    else:
+        m = (x > 0)
+
+    x = x.cpu().numpy()
+    m = m.cpu().numpy()
+    if m.sum() == 0:
+        h, w = x.shape[-2:]
+        return np.zeros((h, w, 3), dtype=np.uint8)
+    dmin, dmax = np.quantile(x[m], q=[0.03, 0.97])
+    x = np.log(np.clip(1 + x - dmin, 1, 1e9))
+    x = x / np.log(1 + dmax - dmin)
+    x = np.clip(x, 0, 1) * 255
+    viz = cv2.applyColorMap(x.astype(np.uint8), cv2.COLORMAP_VIRIDIS)
+    viz = cv2.cvtColor(viz, cv2.COLOR_BGR2RGB)
+    viz[~m] = 0
+    return viz
 from utils.lib_bilagrid import BilateralGrid, total_variation_loss, slice
 from torch.optim.lr_scheduler import ExponentialLR, LinearLR, ChainedScheduler
 import gc
@@ -387,6 +409,13 @@ for iteration in progress_bar:
             normal_vis = ((normal_map.detach().cpu().numpy() + 1) / 2 * 255).clip(0, 255).astype(np.uint8)
             normal_path = render_save_dir / f"normal_{iteration:06d}.png"
             imageio.imwrite(str(normal_path), normal_vis)
+
+            # [DEPTH-OUTPUT] 保存深度图（使用 viz_tensordepth 可视化）
+            depth_map = render_pkg['depth']
+            alpha_map = render_pkg['alpha']
+            depth_vis = viz_tensordepth(depth_map, alpha_map)
+            depth_path = render_save_dir / f"depth_{iteration:06d}.png"
+            imageio.imwrite(str(depth_path), depth_vis)
 
 avged_psnrs = [sum(v)/len(v) for v in psnrs if len(v) == len(train_cameras)]
 video_writer.release()
