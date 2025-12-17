@@ -75,7 +75,7 @@ def render(camera: Camera, model, cell_values=None, tile_size=16, min_t=0.1,
         'render': image_rgb.permute(2,0,1)[:3, ...] * camera.gt_alpha_mask.to(device),
         'alpha': alpha,
         'normal': normal_img.permute(2,0,1),  # [NORMAL-OUTPUT] (3, H, W)
-        'depth': depth_img,  # [DEPTH-OUTPUT] (H, W)
+        'depth': depth_img.detach(),  # [DEPTH-OUTPUT] (H, W) - detach 避免不必要的梯度传播
         'distortion_loss': distortion_loss.mean(),
         'mask': mask,
         'sh_reg': sh_reg,
