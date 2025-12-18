@@ -417,6 +417,12 @@ for iteration in progress_bar:
             depth_path = render_save_dir / f"depth_{iteration:06d}.png"
             imageio.imwrite(str(depth_path), depth_vis)
 
+            # [DEPTH-MED] 保存中位深度图（使用 viz_tensordepth 可视化）
+            depth_med_map = render_pkg['depth_med']
+            depth_med_vis = viz_tensordepth(depth_med_map, alpha_map)
+            depth_med_path = render_save_dir / f"depth_med_{iteration:06d}.png"
+            imageio.imwrite(str(depth_med_path), depth_med_vis)
+
 avged_psnrs = [sum(v)/len(v) for v in psnrs if len(v) == len(train_cameras)]
 video_writer.release()
 

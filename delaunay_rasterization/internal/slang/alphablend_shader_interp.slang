@@ -267,7 +267,8 @@ AlphaOut alpha_blend(TensorView<int32_t> sorted_gauss_idx,
     const int shared_memory_rounds = ((tile_idx_end - tile_idx_start) + block_size - 1) / block_size;
     uint32_t thread_rank = cudaThreadIdx().y * cudaBlockDim().x + cudaThreadIdx().x;
     //bool print = thread_rank == 0;
-    bool print = false;
+    // [DEBUG] 只在图像中心像素打印调试信息
+    bool print = (pix_coord.x == cam.W / 2) && (pix_coord.y == cam.H / 2);
 
     Ray ray = get_ray(cam, center_pix_coord);
     int exit_face;
@@ -300,7 +301,15 @@ AlphaOut alpha_blend(TensorView<int32_t> sorted_gauss_idx,
                 float inv_s = read_inv_s(inv_s_tensor);
                 if (evaluate_tetra_interp(g, ray.o, ray.d, cam.min_t, inv_s, tetra_ctrl) && tetra_ctrl.rgba.a > 0) {
                     AlphaOut new_ao = update_alpha_out(ao, tetra_ctrl);
-
+                    // [DEBUG] 打印深度累积过程
+                    if (print && local_n_contrib <= 5) {
+                        float T = safe_exp(ao.rgba.a);
+                        float alpha = 1.0f - safe_exp(-tetra_ctrl.rgba.a);
+                        float t_mid = (tetra_ctrl.dist.x + tetra_ctrl.dist.y) * 0.5f;
+                        printf("  tet[%d]: T=%f, alpha=%f, t_mid=%f, dist=(%f,%f), depth=%f->%f\n",
+                               local_n_contrib, T, alpha, t_mid, tetra_ctrl.dist.x, tetra_ctrl.dist.y,
+                               ao.depth_state, new_ao.depth_state);
+                    }
                     ao = new_ao;
                     // if (new_ao.rgba.a < 1./255.f) {
                     if (new_ao.rgba.a < -5.5) {
@@ -455,6 +464,7 @@ void splat_tiled(TensorView<int32_t> sorted_gauss_idx,
                  DiffTensorView distortion_img,
                  DiffTensorView normal_img,  // [NORMAL-OUTPUT] normal 输出
                  DiffTensorView depth_img,   // [DEPTH-OUTPUT] 深度输出
+                 TensorView<float> depth_med_img,  // [DEPTH-MED] 中位深度输出（不可微）
                  TensorView<int32_t> n_contributors,
                  TensorView<bool> tet_alive,
                  TensorView<float> ray_jitter,
@@ -478,6 +488,58 @@ void splat_tiled(TensorView<int32_t> sorted_gauss_idx,
         rjy = no_diff ray_jitter[uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), uint32_t(1))];
     }
 
+    // [DEPTH-MED] 单独计算中位深度（T 降到 0.5 时的深度）- 不可微
+    float depth_med = 0.f;
+    {
+        float2 center_pix_coord = {pix_coord.x+rjx, pix_coord.y+rjy};
+        Ray ray = no_diff get_ray(cam, center_pix_coord);
+        float T = 1.f;
+        bool found_med = false;
+
+        uint32_t block_size = cam.tile_height * cam.tile_width;
+        int splats_left = tile_idx_end - tile_idx_start;
+        const int rounds = ((tile_idx_end - tile_idx_start) + block_size - 1) / block_size;
+        uint32_t thread_rank = cudaThreadIdx().y * cudaBlockDim().x + cudaThreadIdx().x;
+
+        [MaxIters(1024)]
+        for (int i = 0; i < rounds && !found_med; i++)
+        {
+            AllMemoryBarrierWithGroupSync();
+            int offset = i * block_size + thread_rank;
+            if (tile_idx_start + offset < tile_idx_end)
+            {
+                uint32_t coll_id = uint32_t(sorted_gauss_idx[tile_idx_start + offset]);
+                collected_idx[thread_rank] = coll_id;
+                collected_splats[thread_rank] = load_tet_alphablend_interp(coll_id, vertices, indices, tet_density, vert_sdf);
+            }
+            AllMemoryBarrierWithGroupSync();
+
+            if (is_inside) {
+                [MaxIters(256)]
+                for (int j = 0; j < min(block_size, splats_left) && !found_med; j++)
+                {
+                    SplatTetrahedra_interp g = collected_splats[j];
+                    CtrlPt tetra_ctrl;
+                    float inv_s = no_diff inv_s_tensor[uint(0)];
+                    if (evaluate_tetra_interp(g, ray.o, ray.d, cam.min_t, inv_s, tetra_ctrl) && tetra_ctrl.rgba.a > 0) {
+                        float alpha = 1.0f - exp(-tetra_ctrl.rgba.a);
+                        float new_T = T * (1.0f - alpha);
+                        // 当 T 从 > 0.5 变为 <= 0.5 时，插值找到精确的中位深度
+                        if (T > 0.5f && new_T <= 0.5f) {
+                            // 在这个四面体内线性插值找到 T=0.5 的位置
+                            float t_mid = (tetra_ctrl.dist.x + tetra_ctrl.dist.y) * 0.5f;
+                            depth_med = t_mid;
+                            found_med = true;
+                        }
+                        T = new_T;
+                        if (T < 0.004f) break;  // early stop
+                    }
+                }
+            }
+            splats_left -= block_size;
+        }
+    }
+
     AlphaOut pixel_states = alpha_blend(
         sorted_gauss_idx,
         indices,
@@ -499,6 +561,10 @@ void splat_tiled(TensorView<int32_t> sorted_gauss_idx,
         tile_idx_end);
 
     if (is_inside) {
+      // [DEBUG] 打印深度值用于调试
+      if (pix_coord.x == cam.W / 2 && pix_coord.y == cam.H / 2) {
+          printf("DEBUG depth: pixel_states.depth_state=%f, depth_med=%f\n", pixel_states.depth_state, depth_med);
+      }
       output_img.storeOnce(uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 0), pixel_states.rgba.r);
       output_img.storeOnce(uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 1), pixel_states.rgba.g);
       output_img.storeOnce(uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 2), pixel_states.rgba.b);
@@ -514,6 +580,8 @@ void splat_tiled(TensorView<int32_t> sorted_gauss_idx,
       normal_img.storeOnce(uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 2), pixel_states.normal_state.z);
       // [DEPTH-OUTPUT] 写入深度输出
       depth_img.storeOnce(uint2(uint32_t(pix_coord.y), uint32_t(pix_coord.x)), pixel_states.depth_state);
+      // [DEPTH-MED] 写入中位深度
+      depth_med_img[uint2(uint32_t(pix_coord.y), uint32_t(pix_coord.x))] = depth_med;
     }
 }
 
