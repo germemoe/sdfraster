@@ -81,6 +81,10 @@ def render_err(gt_image, camera: Camera, model, tile_size=16, min_t=0.1, **kwarg
     depth_img = torch.zeros((render_grid.image_height,
                              render_grid.image_width),
                             device=device)
+    # [DEPTH-MED] 添加 depth_med_img tensor（不可微）
+    depth_med_img = torch.zeros((render_grid.image_height,
+                                 render_grid.image_width),
+                                device=device)
     n_contributors = torch.zeros((render_grid.image_height,
                                     render_grid.image_width, 1),
                                     dtype=torch.int32, device=device)
@@ -121,6 +125,7 @@ def render_err(gt_image, camera: Camera, model, tile_size=16, min_t=0.1, **kwarg
         distortion_img=distortion_img,
         normal_img=normal_img,  # [NORMAL-OUTPUT]
         depth_img=depth_img,    # [DEPTH-OUTPUT]
+        depth_med_img=depth_med_img,  # [DEPTH-MED] 中位深度
         tet_alive=tet_alive,
         ray_jitter=ray_jitter,
     )

@@ -243,6 +243,7 @@ AlphaOut alpha_blend(TensorView<int32_t> sorted_gauss_idx,
                    DiffTensorView final_distortion_state,
                    DiffTensorView final_normal_state,  // [NORMAL-OUTPUT] 最终 normal 状态
                    DiffTensorView final_depth_state,   // [DEPTH-OUTPUT] 最终深度状态
+                   TensorView<float> depth_med_img,    // [DEPTH-MED] 中位深度输出（不可微）
                    TensorView<int32_t> n_contributors,
                    TensorView<bool> tet_alive,
                    no_diff Camera cam,
@@ -275,6 +276,11 @@ AlphaOut alpha_blend(TensorView<int32_t> sorted_gauss_idx,
     //     printf("ray_o: %f, %f, %f, ray_d: %f, %f, %f\n", ray.o.x, ray.o.y, ray.o.z, ray.d.x, ray.d.y, ray.d.z);
     // }
 
+    // [DEPTH-MED] 中位深度追踪变量（不可微）
+    float depth_med = 0.f;
+    float T_med = 1.f;
+    bool found_med = false;
+
     int32_t local_n_contrib = 0;
     // int32_t low = 0;
     int splats_left_to_process = tile_idx_end - tile_idx_start;
@@ -301,6 +307,18 @@ AlphaOut alpha_blend(TensorView<int32_t> sorted_gauss_idx,
                 if (evaluate_tetra_interp(g, ray.o, ray.d, cam.min_t, inv_s, tetra_ctrl) && tetra_ctrl.rgba.a > 0) {
                     AlphaOut new_ao = update_alpha_out(ao, tetra_ctrl);
 
+                    // [DEPTH-MED] 追踪中位深度：当 T 从 >0.5 变为 <=0.5 时记录
+                    if (!found_med) {
+                        float alpha_seg = 1.0f - exp(-tetra_ctrl.rgba.a);
+                        float new_T_med = T_med * (1.0f - alpha_seg);
+                        if (T_med > 0.5f && new_T_med <= 0.5f) {
+                            float t_mid = (tetra_ctrl.dist.x + tetra_ctrl.dist.y) * 0.5f;
+                            depth_med = t_mid;
+                            found_med = true;
+                        }
+                        T_med = new_T_med;
+                    }
+
                     ao = new_ao;
                     // if (new_ao.rgba.a < 1./255.f) {
                     if (new_ao.rgba.a < -5.5) {
@@ -313,8 +331,11 @@ AlphaOut alpha_blend(TensorView<int32_t> sorted_gauss_idx,
         splats_left_to_process -= block_size;
     }
 
-    if (is_inside)
+    if (is_inside) {
         n_contributors[uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 0)] = local_n_contrib;
+        // [DEPTH-MED] 写入中位深度
+        depth_med_img[uint2(uint32_t(pix_coord.y), uint32_t(pix_coord.x))] = depth_med;
+    }
 
     return ao;
 }
@@ -329,6 +350,7 @@ void bwd_alpha_blend(TensorView<int32_t> sorted_gauss_idx,
                      DiffTensorView final_distortion_state,
                      DiffTensorView final_normal_state,  // [NORMAL-OUTPUT] 最终 normal 状态
                      DiffTensorView final_depth_state,   // [DEPTH-OUTPUT] 最终深度状态
+                     TensorView<float> depth_med_img,    // [DEPTH-MED] 中位深度（不可微，反向不处理）
                      TensorView<int32_t> n_contributors,
                      TensorView<bool> tet_alive,
                      no_diff Camera cam,
@@ -371,7 +393,7 @@ void bwd_alpha_blend(TensorView<int32_t> sorted_gauss_idx,
         curr_depth_state = final_depth_state[uint2(uint32_t(pix_coord.y), uint32_t(pix_coord.x))];
         n_contrib_fwd = n_contributors[uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 0)];
     }
-    AlphaOut ao = {current_pixel_state, curr_distortion_state, curr_normal_state, curr_depth_state};  // [DEPTH-OUTPUT]
+    AlphaOut ao = {current_pixel_state, curr_distortion_state, curr_normal_state, curr_depth_state};
 
     Ray ray = get_ray(cam, center_pix_coord);
     int exit_face;
@@ -455,6 +477,7 @@ void splat_tiled(TensorView<int32_t> sorted_gauss_idx,
                  DiffTensorView distortion_img,
                  DiffTensorView normal_img,  // [NORMAL-OUTPUT] normal 输出
                  DiffTensorView depth_img,   // [DEPTH-OUTPUT] 深度输出
+                 TensorView<float> depth_med_img,  // [DEPTH-MED] 中位深度输出（不可微）
                  TensorView<int32_t> n_contributors,
                  TensorView<bool> tet_alive,
                  TensorView<float> ray_jitter,
@@ -489,6 +512,7 @@ void splat_tiled(TensorView<int32_t> sorted_gauss_idx,
         distortion_img,
         normal_img,        // [NORMAL-OUTPUT]
         depth_img,         // [DEPTH-OUTPUT]
+        depth_med_img,     // [DEPTH-MED] 中位深度
         n_contributors,
         tet_alive,
         cam,
@@ -539,8 +563,9 @@ void kern_calc_tet_err(TensorView<int32_t> sorted_gauss_idx,
     float4 curr_pixel_state = float4(0.f, 0.f, 0.f, 1.f);
     DistortionState5 curr_distortion_state = {0.f, 0.f, 0.f, 0.f, 0.f};
     float3 curr_normal_state = float3(0.f, 0.f, 0.f);  // [NORMAL-OUTPUT]
+    float curr_depth_state = 0.f;  // [DEPTH-OUTPUT]
     AlphaOut ao = {
-        curr_pixel_state, curr_distortion_state, curr_normal_state
+        curr_pixel_state, curr_distortion_state, curr_normal_state, curr_depth_state
     };
     uint32_t block_size = cam.tile_height * cam.tile_width;
     bool is_inside = (pix_coord.x < cam.W && pix_coord.y < cam.H);

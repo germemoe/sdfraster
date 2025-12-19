@@ -55,8 +55,8 @@ def render(camera: Camera, model, cell_values=None, tile_size=16, min_t=0.1,
     vert_sdf = model.query_vert_sdf().reshape(-1, 1)  # (M, 1) 形状
     inv_s = model.backbone.inv_s  # scalar tensor
 
-    # [DEPTH-OUTPUT] AlphaBlendTiledRender 现在返回 5 个值
-    image_rgb, distortion_img, normal_img, depth_img, tet_alive = AlphaBlendTiledRender.apply(
+    # [DEPTH-MED] AlphaBlendTiledRender 现在返回 6 个值
+    image_rgb, distortion_img, normal_img, depth_img, depth_med_img, tet_alive = AlphaBlendTiledRender.apply(
         sorted_tetra_idx,
         tile_ranges,
         model.indices,
@@ -76,7 +76,8 @@ def render(camera: Camera, model, cell_values=None, tile_size=16, min_t=0.1,
         'render': image_rgb.permute(2,0,1)[:3, ...] * camera.gt_alpha_mask.to(device),
         'alpha': alpha,
         'normal': normal_img.permute(2,0,1),  # [NORMAL-OUTPUT] (3, H, W)
-        'depth': depth_img,  # [DEPTH-OUTPUT] (H, W)
+        'depth': depth_img,  # [DEPTH-OUTPUT] (H, W) 期望深度
+        'depth_med': depth_med_img,  # [DEPTH-MED] (H, W) 中位深度
         'distortion_loss': distortion_loss.mean(),
         'mask': mask,
         'sh_reg': sh_reg,

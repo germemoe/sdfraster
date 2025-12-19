@@ -14,7 +14,7 @@ class AlphaBlendTiledRender(torch.autograd.Function):
                 # [SDF-MODIFICATION] NeuS 渲染新增参数
                 vert_sdf,  # (M,) 全局顶点SDF
                 inv_s_tensor,     # (1,) tensor, exp(s_var) for NeuS alpha (可微)
-                tcam, ray_jitter, device="cuda") -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                tcam, ray_jitter, device="cuda") -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # === [DENSITY-RELATED] 原密度代码签名 (已注释) ===
         # indices, vertices, tet_density, render_grid, tcam, ray_jitter
         # === [DENSITY-RELATED] 原密度代码结束 ===
@@ -32,6 +32,10 @@ class AlphaBlendTiledRender(torch.autograd.Function):
         depth_img = torch.zeros((render_grid.image_height,
                                  render_grid.image_width),
                                 device=device)
+        # [DEPTH-MED] 添加中位深度输出 tensor（不可微）
+        depth_med_img = torch.zeros((render_grid.image_height,
+                                     render_grid.image_width),
+                                    device=device)
         n_contributors = torch.zeros((render_grid.image_height,
                                       render_grid.image_width, 1),
                                      dtype=torch.int32, device=device)
@@ -62,6 +66,7 @@ class AlphaBlendTiledRender(torch.autograd.Function):
             distortion_img=distortion_img,
             normal_img=normal_img,  # [NORMAL-OUTPUT]
             depth_img=depth_img,    # [DEPTH-OUTPUT]
+            depth_med_img=depth_med_img,  # [DEPTH-MED]
             n_contributors=n_contributors,
             tet_alive=tet_alive,
             tcam=tcam,
@@ -78,7 +83,7 @@ class AlphaBlendTiledRender(torch.autograd.Function):
             sorted_tetra_idx, tile_ranges,
             indices, vertices, tet_sdf,
             vert_sdf, inv_s_tensor,  # [SDF-MODIFICATION] 保存 NeuS 参数用于反向传播
-            output_img, distortion_img, normal_img, depth_img, n_contributors,  # [DEPTH-OUTPUT] 添加 depth_img
+            output_img, distortion_img, normal_img, depth_img, depth_med_img, n_contributors,  # [DEPTH-MED] 添加 depth_med_img
             ray_jitter
         ]
         non_tensor_data, tensor_data = split_tensors(tcam)
@@ -88,15 +93,15 @@ class AlphaBlendTiledRender(torch.autograd.Function):
 
         ctx.render_grid = render_grid
 
-        return output_img, distortion_img, normal_img, depth_img, tet_alive  # [DEPTH-OUTPUT]
+        return output_img, distortion_img, normal_img, depth_img, depth_med_img, tet_alive  # [DEPTH-MED]
 
     @staticmethod
-    def backward(ctx, grad_output_img, grad_distortion_img, grad_normal_img, grad_depth_img, grad_vert_alive):  # [DEPTH-OUTPUT]
+    def backward(ctx, grad_output_img, grad_distortion_img, grad_normal_img, grad_depth_img, grad_depth_med_img, grad_vert_alive):  # [DEPTH-MED]
         # [SDF-MODIFICATION] 从保存的张量中恢复参数
         (sorted_tetra_idx, tile_ranges,
          indices, vertices, tet_sdf,
          vert_sdf, inv_s_tensor,  # [SDF-MODIFICATION] NeuS 参数
-         output_img, distortion_img, normal_img, depth_img, n_contributors,  # [DEPTH-OUTPUT] 添加 depth_img
+         output_img, distortion_img, normal_img, depth_img, depth_med_img, n_contributors,  # [DEPTH-MED] 添加 depth_med_img
             ray_jitter) = ctx.saved_tensors[:ctx.len_tensors]
         tcam = recombine_tensors(ctx.non_tensor_data, ctx.saved_tensors[ctx.len_tensors:])
         render_grid = ctx.render_grid
@@ -106,7 +111,7 @@ class AlphaBlendTiledRender(torch.autograd.Function):
         vert_sdf_grad = torch.zeros_like(vert_sdf)  # [SDF-MODIFICATION] 顶点SDF梯度
         inv_s_grad = torch.zeros_like(inv_s_tensor)  # [SDF-MODIFICATION] inv_s 梯度 (可微)
         normal_img_grad = torch.zeros_like(normal_img)  # [NORMAL-OUTPUT] normal 梯度（暂时不使用）
-        depth_img_grad = grad_depth_img if grad_depth_img is not None else torch.zeros_like(depth_img)  # [DEPTH-OUTPUT]
+        depth_img_grad = torch.zeros_like(depth_img)  # [DEPTH-OUTPUT] depth 梯度（暂时不使用）
 
         assert (render_grid.tile_height, render_grid.tile_width) in slang_modules.alpha_blend_shaders_interp, (
             'Alpha Blend Shader was not compiled for this tile'
@@ -132,6 +137,7 @@ class AlphaBlendTiledRender(torch.autograd.Function):
             distortion_img=(distortion_img, grad_distortion_img),
             normal_img=(normal_img, normal_img_grad),  # [NORMAL-OUTPUT]
             depth_img=(depth_img, depth_img_grad),     # [DEPTH-OUTPUT]
+            depth_med_img=depth_med_img,               # [DEPTH-MED] 不可微，直接传递
             n_contributors=n_contributors,
             tet_alive=tet_alive,
             ray_jitter=ray_jitter)
