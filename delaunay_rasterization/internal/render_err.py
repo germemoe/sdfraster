@@ -68,7 +68,7 @@ def render_err(gt_image, camera: Camera, model, tile_size=16, min_t=0.1, **kwarg
     # st = time.time()
     tet_vertices = vertices[indices]
     distortion_img = torch.zeros((render_grid.image_height,
-                                render_grid.image_width, 4),
+                                render_grid.image_width, 5),
                                 device=device)
     output_img = torch.zeros((render_grid.image_height,
                                 render_grid.image_width, 4),
@@ -77,6 +77,10 @@ def render_err(gt_image, camera: Camera, model, tile_size=16, min_t=0.1, **kwarg
     normal_img = torch.zeros((render_grid.image_height,
                               render_grid.image_width, 3),
                              device=device)
+    # [DEPTH-OUTPUT] 添加 depth_img tensor
+    depth_img = torch.zeros((render_grid.image_height,
+                             render_grid.image_width),
+                            device=device)
     n_contributors = torch.zeros((render_grid.image_height,
                                     render_grid.image_width, 1),
                                     dtype=torch.int32, device=device)
@@ -116,6 +120,7 @@ def render_err(gt_image, camera: Camera, model, tile_size=16, min_t=0.1, **kwarg
         **splat_args,
         distortion_img=distortion_img,
         normal_img=normal_img,  # [NORMAL-OUTPUT]
+        depth_img=depth_img,    # [DEPTH-OUTPUT]
         tet_alive=tet_alive,
         ray_jitter=ray_jitter,
     )

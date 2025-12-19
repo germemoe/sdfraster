@@ -34,10 +34,14 @@ import matplotlib.pyplot as plt
 
 def viz_tensordepth(x, alpha_mass=None, mode='log'):
     """深度图可视化函数，参考 svraster 实现"""
+    # [DEBUG] 打印 depth tensor 的统计信息
+    print(f"[DEBUG viz_tensordepth] depth: min={x.min():.6f}, max={x.max():.6f}, mean={x.mean():.6f}")
     if alpha_mass is not None:
+        print(f"[DEBUG viz_tensordepth] alpha: min={alpha_mass.min():.6f}, max={alpha_mass.max():.6f}")
         m = (alpha_mass > 0.01) & (x > 0)
     else:
         m = (x > 0)
+    print(f"[DEBUG viz_tensordepth] valid pixels (m.sum): {m.sum()}")
 
     x = x.cpu().numpy()
     m = m.cpu().numpy()

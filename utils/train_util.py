@@ -67,7 +67,8 @@ def render(camera: Camera, model, cell_values=None, tile_size=16, min_t=0.1,
         inv_s,         # [SDF-MODIFICATION] NeuS inv_s 参数
         tcam,
         ray_jitter)
-    alpha = image_rgb.permute(2,0,1)[3, ...]
+    alpha_log_T = image_rgb.permute(2,0,1)[3, ...]  # log_transmittance (负值)
+    alpha = 1.0 - torch.exp(alpha_log_T)  # 转换为真正的 alpha = 1 - T
     total_density = (distortion_img[:, :, 2]**2).clip(min=1e-6)
     distortion_loss = (((distortion_img[:, :, 0] - distortion_img[:, :, 1]) + distortion_img[:, :, 4]) / total_density).clip(min=0)
 
