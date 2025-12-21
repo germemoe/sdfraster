@@ -110,8 +110,8 @@ class AlphaBlendTiledRender(torch.autograd.Function):
         tet_sdf_grad = torch.zeros_like(tet_sdf)
         vert_sdf_grad = torch.zeros_like(vert_sdf)  # [SDF-MODIFICATION] 顶点SDF梯度
         inv_s_grad = torch.zeros_like(inv_s_tensor)  # [SDF-MODIFICATION] inv_s 梯度 (可微)
-        normal_img_grad = torch.zeros_like(normal_img)  # [NORMAL-OUTPUT] normal 梯度（暂时不使用）
-        depth_img_grad = torch.zeros_like(depth_img)  # [DEPTH-OUTPUT] depth 梯度（暂时不使用）
+        normal_img_grad = grad_normal_img if grad_normal_img is not None else torch.zeros_like(normal_img)  # [NORMAL-OUTPUT]
+        depth_img_grad = grad_depth_img if grad_depth_img is not None else torch.zeros_like(depth_img)  # [DEPTH-OUTPUT]
 
         assert (render_grid.tile_height, render_grid.tile_width) in slang_modules.alpha_blend_shaders_interp, (
             'Alpha Blend Shader was not compiled for this tile'
