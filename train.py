@@ -60,6 +60,7 @@ from utils.lib_bilagrid import BilateralGrid, total_variation_loss, slice
 from torch.optim.lr_scheduler import ExponentialLR, LinearLR, ChainedScheduler
 import gc
 from utils.densification import collect_render_stats, apply_densification, determine_cull_mask
+from utils.mesh_regularization import MeshRegularizer
 import mediapy
 from icecream import ic
 
@@ -151,6 +152,12 @@ args.gradient_mode = "numerical"  # "analytical" 或 "numerical"
 args.gradient_taps = 4            # 数值梯度采样点数：4 或 6
 args.gradient_eps = 1e-3          # 数值梯度步长
 
+# [MESH-NORMAL-LOSS] Mesh 法线一致性 Loss 设置（参考 MILo）
+args.lambda_mesh_normal = 0.0   # mesh normal loss 权重
+args.mesh_normal_start = 10001     # 开始使用 mesh normal loss 的迭代
+args.mesh_normal_stop = 18000     # 停止使用 mesh normal loss 的迭代
+args.mesh_sdf_threshold = 0.0     # mesh 提取的 SDF 阈值
+
 # Clone Settings
 args.num_samples = 200
 args.k_samples = 1
@@ -209,6 +216,16 @@ else:
 min_t = args.min_t
 
 tet_optim = TetOptimizer(model, **args.as_dict())
+
+# [MESH-NORMAL-LOSS] 创建 Mesh 正则化器
+mesh_regularizer = MeshRegularizer(
+    start_iter=args.mesh_normal_start,
+    stop_iter=args.mesh_normal_stop,
+    normal_weight=args.lambda_mesh_normal,
+    sdf_threshold=args.mesh_sdf_threshold,
+    use_opengl=True,
+)
+
 if args.eval:
     sample_camera = test_cameras[args.sample_cam]
     # sample_camera = train_cameras[args.sample_cam]
@@ -311,13 +328,30 @@ for iteration in progress_bar:
         if args.lambda_curvature > 0 and hessian_diag is not None:
             curv_loss = curvature_loss(hessian_diag)
 
+    # [MESH-NORMAL-LOSS] Mesh Normal 一致性 Loss
+    mesh_normal_loss = torch.tensor(0.0, device=device)
+    mesh_normal_active = False
+    if args.lambda_mesh_normal > 0 and mesh_regularizer.should_apply(iteration):
+        # 使用渲染的深度计算 mesh normal loss
+        gaussian_depth = render_pkg['depth']  # (H, W)
+        mesh_reg_result = mesh_regularizer(
+            model=model,
+            camera=camera,
+            gaussian_depth=gaussian_depth,
+            iteration=iteration,
+            gt_mask=gt_mask,  # 传入GT alpha mask，排除背景散乱法线
+        )
+        mesh_normal_loss = mesh_reg_result['loss']
+        mesh_normal_active = mesh_reg_result['active']
+
     loss = (1-args.lambda_ssim)*l1_loss + \
            args.lambda_ssim*ssim_loss + \
            reg + \
            args.lambda_dist * dl_loss + \
            args.lambda_sh * render_pkg['sh_reg'] + \
            args.lambda_eikonal * eik_loss + \
-           args.lambda_curvature * curv_loss
+           args.lambda_curvature * curv_loss + \
+           mesh_normal_loss  # [MESH-NORMAL-LOSS] 已经乘过权重
 
     loss.backward()
 
@@ -387,45 +421,83 @@ for iteration in progress_bar:
 
     disp_ind = max(len(psnrs)-2, 0)
     avg_psnr = sum(psnrs[disp_ind]) / max(len(psnrs[disp_ind]), 1)
-    progress_bar.set_postfix({
+    postfix_dict = {
         "PSNR": repr(f"{psnr:>5.2f}"),
         "Mean": repr(f"{avg_psnr:>5.2f}"),
         "#V": len(model),
         "#T": model.indices.shape[0],
         "Eik": repr(f"{eik_loss.item():.3f}"),
         "Curv": repr(f"{curv_loss.item():.1e}"),
-    })
+    }
+    # [MESH-NORMAL-LOSS] 显示 mesh normal loss（仅当激活时）
+    if mesh_normal_active:
+        postfix_dict["MeshN"] = repr(f"{mesh_normal_loss.item():.3f}")
+    progress_bar.set_postfix(postfix_dict)
 
     # 每k次迭代保存渲染图
     if args.save_render_interval > 0 and iteration % args.save_render_interval == 0:
         with torch.no_grad():
             render_pkg = render(sample_camera, model, min_t=min_t, tile_size=args.tile_size)
-            # 保存 RGB 渲染图
-            save_image = render_pkg['render']
-            save_image = save_image.permute(1, 2, 0)
-            save_image = (save_image.detach().cpu().numpy() * 255).clip(min=0, max=255).astype(np.uint8)
+
+            # 1. RGB 渲染图
+            rgb_img = render_pkg['render'].permute(1, 2, 0)
+            rgb_img = (rgb_img.detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+
+            # 2. 深度图（归一化可视化）
+            depth_map = render_pkg['depth']  # (H, W)
+            depth_np = depth_map.detach().cpu().numpy()
+            # 排除无效深度（0或极大值）进行归一化
+            valid_mask = (depth_np > 0) & (depth_np < 1e6)
+            if valid_mask.any():
+                d_min, d_max = depth_np[valid_mask].min(), depth_np[valid_mask].max()
+                depth_norm = (depth_np - d_min) / (d_max - d_min + 1e-8)
+            else:
+                depth_norm = np.zeros_like(depth_np)
+            depth_norm = np.where(valid_mask, depth_norm, 0)
+            # 使用 turbo colormap
+            depth_vis = (plt.cm.turbo(depth_norm)[:, :, :3] * 255).astype(np.uint8)
+
+            # 3. Gaussian 法线图（从渲染的 normal 输出）
+            gauss_normal = render_pkg['normal'].permute(1, 2, 0)  # (H, W, 3)
+            gauss_normal_vis = ((gauss_normal.detach().cpu().numpy() + 1) / 2 * 255).clip(0, 255).astype(np.uint8)
+
+            # 4. Mesh 法线图（如果 mesh regularizer 激活）
+            mesh_normal_vis = np.zeros_like(rgb_img)
+            if args.lambda_mesh_normal > 0 and mesh_regularizer.should_apply(iteration):
+                # 获取 sample_camera 的 gt_mask（如果有）
+                sample_gt_mask = getattr(sample_camera, 'gt_alpha_mask', None)
+                if sample_gt_mask is not None:
+                    sample_gt_mask = sample_gt_mask.cuda()
+                mesh_reg_vis = mesh_regularizer(
+                    model=model,
+                    camera=sample_camera,
+                    gaussian_depth=render_pkg['depth'],
+                    iteration=iteration,
+                    gt_mask=sample_gt_mask,
+                )
+                if mesh_reg_vis['active'] and mesh_reg_vis['mesh_normal'] is not None:
+                    mesh_normal = mesh_reg_vis['mesh_normal']  # (H, W, 3)
+                    mesh_normal_vis = ((mesh_normal.detach().cpu().numpy() + 1) / 2 * 255).clip(0, 255).astype(np.uint8)
+
+            # 整合成 2x2 网格图
+            H, W = rgb_img.shape[:2]
+            combined = np.zeros((H * 2, W * 2, 3), dtype=np.uint8)
+            combined[:H, :W] = rgb_img                    # 左上: RGB
+            combined[:H, W:] = depth_vis                  # 右上: Depth
+            combined[H:, :W] = gauss_normal_vis           # 左下: Gaussian Normal
+            combined[H:, W:] = mesh_normal_vis            # 右下: Mesh Normal
+
+            # 添加标签
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale, thickness = 0.6, 2
+            cv2.putText(combined, 'RGB', (10, 25), font, font_scale, (255, 255, 255), thickness)
+            cv2.putText(combined, 'Depth', (W + 10, 25), font, font_scale, (255, 255, 255), thickness)
+            cv2.putText(combined, 'Gauss Normal', (10, H + 25), font, font_scale, (255, 255, 255), thickness)
+            cv2.putText(combined, 'Mesh Normal', (W + 10, H + 25), font, font_scale, (255, 255, 255), thickness)
+
+            # 保存整合图
             save_path = render_save_dir / f"iter_{iteration:06d}.png"
-            imageio.imwrite(str(save_path), save_image)
-
-            # [NORMAL-OUTPUT] 保存 normal 图（将 [-1, 1] 映射到 [0, 255]）
-            normal_map = render_pkg['normal']
-            normal_map = normal_map.permute(1, 2, 0)
-            normal_vis = ((normal_map.detach().cpu().numpy() + 1) / 2 * 255).clip(0, 255).astype(np.uint8)
-            normal_path = render_save_dir / f"normal_{iteration:06d}.png"
-            imageio.imwrite(str(normal_path), normal_vis)
-
-            # [DEPTH-OUTPUT] 保存深度图（使用 viz_tensordepth 可视化）
-            depth_map = render_pkg['depth']
-            alpha_map = render_pkg['alpha']
-            depth_vis = viz_tensordepth(depth_map, alpha_map)
-            depth_path = render_save_dir / f"depth_{iteration:06d}.png"
-            imageio.imwrite(str(depth_path), depth_vis)
-
-            # [DEPTH-MED] 保存中位深度图（使用 viz_tensordepth 可视化）
-            depth_med_map = render_pkg['depth_med']
-            depth_med_vis = viz_tensordepth(depth_med_map, alpha_map)
-            depth_med_path = render_save_dir / f"depth_med_{iteration:06d}.png"
-            imageio.imwrite(str(depth_med_path), depth_med_vis)
+            imageio.imwrite(str(save_path), combined)
 
 avged_psnrs = [sum(v)/len(v) for v in psnrs if len(v) == len(train_cameras)]
 video_writer.release()
