@@ -30,10 +30,10 @@ args = Args()
 args.tile_size = 4
 args.image_folder = "images"
 args.dataset_path = Path("/home/jk/data/dataset/DTU/scan37")
-args.output_path = Path("output/DTU/scan37/")
+args.output_path = Path("/data/jk/project/radmesh/output/sdf/DTU/scan37_all")
 args.eval = True
 args.use_ply = False
-args.contrib_threshold = 0.1
+args.contrib_threshold = 0.45
 args.mu_val = -0.11
 args.factor = 0.1
 args.iterations = 25
@@ -60,8 +60,9 @@ train_cameras, test_cameras, scene_info = loader.load_dataset(
 
 # --- 2. Initial setup for smoothing ---
 current_vertices = model.vertices.clone()
-density = model.density.detach()
-v_densities = density.detach().reshape(-1).cpu()
+# [SDF-MODIFICATION] density 和 v_densities 未被使用，注释掉
+# density = model.density.detach()
+# v_densities = density.detach().reshape(-1).cpu()
 indices_cpu = model.indices.cpu()
 
 cameras = train_cameras

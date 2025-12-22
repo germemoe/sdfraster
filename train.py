@@ -15,6 +15,17 @@ import random
 import time
 from tqdm import tqdm
 import numpy as np
+import torch.nn.functional as F
+
+# [SEED] 设置随机种子，保证可复现性
+SEED = 72
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+# torch.backends.cudnn.deterministic = True
+# torch.backends.cudnn.benchmark = False
+
 from utils import cam_util
 from utils.train_util import *
 from utils.model_util import eikonal_loss, curvature_loss
@@ -61,6 +72,9 @@ from torch.optim.lr_scheduler import ExponentialLR, LinearLR, ChainedScheduler
 import gc
 from utils.densification import collect_render_stats, apply_densification, determine_cull_mask
 from utils.mesh_regularization import MeshRegularizer
+from utils.tetmesh import marching_tetrahedra
+from utils.mesh import Meshes, save_mesh_as_ply
+from utils.geometry_utils import depth_to_normal, compute_normal_consistency_loss, fix_normal_map
 import mediapy
 from icecream import ic
 
@@ -154,9 +168,17 @@ args.gradient_eps = 1e-3          # 数值梯度步长
 
 # [MESH-NORMAL-LOSS] Mesh 法线一致性 Loss 设置（参考 MILo）
 args.lambda_mesh_normal = 0.0   # mesh normal loss 权重
+args.lambda_mesh_depth = 0.0     # mesh depth loss 权重
+args.lambda_mesh_occupancy = 0.0 # surface occupancy loss 权重
+args.mesh_depth_scale = 0.1      # depth loss 的 scale 参数 (如果为None则使用scene_scaling)
+args.mesh_depth_ratio = 0.5      # MILo: median深度的混合比例 (0.0=仅期望深度, 1.0=仅中位深度)
 args.mesh_normal_start = 10001     # 开始使用 mesh normal loss 的迭代
 args.mesh_normal_stop = 18000     # 停止使用 mesh normal loss 的迭代
 args.mesh_sdf_threshold = 0.0     # mesh 提取的 SDF 阈值
+
+# [DEPTH-NORMAL-LOSS] 深度推导法线与渲染法线一致性 Loss（参考 MILo）
+args.lambda_normal_depth = 0.0      # 渲染的normal vs 期望深度推导的normal
+args.lambda_normal_depth_med = 0.0  # 渲染的normal vs 中位深度推导的normal
 
 # Clone Settings
 args.num_samples = 200
@@ -190,6 +212,7 @@ args.ablate_downweighing = False
 
 # 渲染图保存设置
 args.save_render_interval = 500  # 每k次迭代保存渲染图，0表示不保存
+args.save_mesh_interval = 1000   # 每k次迭代用MT提取mesh并保存，0表示不保存
 
 
 args = Args.from_namespace(args.get_parser().parse_args())
@@ -217,11 +240,15 @@ min_t = args.min_t
 
 tet_optim = TetOptimizer(model, **args.as_dict())
 
-# [MESH-NORMAL-LOSS] 创建 Mesh 正则化器
+# [MESH-LOSS] 创建 Mesh 正则化器
 mesh_regularizer = MeshRegularizer(
     start_iter=args.mesh_normal_start,
     stop_iter=args.mesh_normal_stop,
     normal_weight=args.lambda_mesh_normal,
+    depth_weight=args.lambda_mesh_depth,
+    occupancy_weight=args.lambda_mesh_occupancy,
+    depth_scale=args.mesh_depth_scale,
+    depth_ratio=args.mesh_depth_ratio,  # MILo: 期望/中位深度混合比例
     sdf_threshold=args.mesh_sdf_threshold,
     use_opengl=True,
 )
@@ -264,6 +291,11 @@ video_writer = cv2.VideoWriter(str(args.output_path / "training.mp4"), cv2.Video
 render_save_dir = args.output_path / "renders"
 if args.save_render_interval > 0:
     render_save_dir.mkdir(exist_ok=True, parents=True)
+
+# 创建mesh保存目录
+mesh_save_dir = args.output_path / "meshes"
+if args.save_mesh_interval > 0:
+    mesh_save_dir.mkdir(exist_ok=True, parents=True)
 
 progress_bar = tqdm(range(args.iterations))
 torch.cuda.empty_cache()
@@ -328,21 +360,57 @@ for iteration in progress_bar:
         if args.lambda_curvature > 0 and hessian_diag is not None:
             curv_loss = curvature_loss(hessian_diag)
 
-    # [MESH-NORMAL-LOSS] Mesh Normal 一致性 Loss
-    mesh_normal_loss = torch.tensor(0.0, device=device)
-    mesh_normal_active = False
-    if args.lambda_mesh_normal > 0 and mesh_regularizer.should_apply(iteration):
-        # 使用渲染的深度计算 mesh normal loss
+    # [MESH-LOSS] Mesh 正则化 Loss (normal + depth + occupancy)
+    mesh_loss = torch.tensor(0.0, device=device)
+    mesh_loss_active = False
+    mesh_has_any_weight = (args.lambda_mesh_normal > 0 or
+                           args.lambda_mesh_depth > 0 or
+                           args.lambda_mesh_occupancy > 0)
+    if mesh_has_any_weight and mesh_regularizer.should_apply(iteration):
+        # 使用渲染的深度计算 mesh loss (MILo风格：支持期望/中位深度混合)
         gaussian_depth = render_pkg['depth']  # (H, W)
+        gaussian_depth_med = render_pkg['depth_med']  # (H, W) 中位深度
         mesh_reg_result = mesh_regularizer(
             model=model,
             camera=camera,
             gaussian_depth=gaussian_depth,
+            gaussian_depth_med=gaussian_depth_med,  # MILo: 中位深度用于混合
+            scene_scaling=model.scene_scaling,      # MILo: 使用scene_scaling作为depth scale
             iteration=iteration,
             gt_mask=gt_mask,  # 传入GT alpha mask，排除背景散乱法线
         )
-        mesh_normal_loss = mesh_reg_result['loss']
-        mesh_normal_active = mesh_reg_result['active']
+        mesh_loss = mesh_reg_result['loss']
+        mesh_loss_active = mesh_reg_result['active']
+
+    # [DEPTH-NORMAL-LOSS] 深度推导法线与渲染法线一致性 Loss
+    normal_depth_loss = torch.tensor(0.0, device=device)
+    normal_depth_med_loss = torch.tensor(0.0, device=device)
+    if args.lambda_normal_depth > 0 or args.lambda_normal_depth_med > 0:
+        rendered_normal = render_pkg['normal']  # (3, H, W)
+        # 构建mask：只在有效区域计算（alpha > 0.5 且 gt_mask）
+        alpha_mask = render_pkg['alpha'] > 0.5  # (H, W)
+        if gt_mask is not None:
+            if gt_mask.dim() == 3:
+                gt_mask_2d = gt_mask.squeeze(0) > 0.5
+            else:
+                gt_mask_2d = gt_mask > 0.5
+            valid_mask = alpha_mask & gt_mask_2d
+        else:
+            valid_mask = alpha_mask
+
+        if args.lambda_normal_depth > 0:
+            # 从期望深度推导法线
+            depth_normal = depth_to_normal(camera, render_pkg['depth'])  # (3, H, W)
+            normal_depth_loss = compute_normal_consistency_loss(
+                rendered_normal, depth_normal, valid_mask
+            )
+
+        if args.lambda_normal_depth_med > 0:
+            # 从中位深度推导法线
+            depth_med_normal = depth_to_normal(camera, render_pkg['depth_med'])  # (3, H, W)
+            normal_depth_med_loss = compute_normal_consistency_loss(
+                rendered_normal, depth_med_normal, valid_mask
+            )
 
     loss = (1-args.lambda_ssim)*l1_loss + \
            args.lambda_ssim*ssim_loss + \
@@ -351,7 +419,9 @@ for iteration in progress_bar:
            args.lambda_sh * render_pkg['sh_reg'] + \
            args.lambda_eikonal * eik_loss + \
            args.lambda_curvature * curv_loss + \
-           mesh_normal_loss  # [MESH-NORMAL-LOSS] 已经乘过权重
+           mesh_loss + \
+           args.lambda_normal_depth * normal_depth_loss + \
+           args.lambda_normal_depth_med * normal_depth_med_loss
 
     loss.backward()
 
@@ -429,9 +499,14 @@ for iteration in progress_bar:
         "Eik": repr(f"{eik_loss.item():.3f}"),
         "Curv": repr(f"{curv_loss.item():.1e}"),
     }
-    # [MESH-NORMAL-LOSS] 显示 mesh normal loss（仅当激活时）
-    if mesh_normal_active:
-        postfix_dict["MeshN"] = repr(f"{mesh_normal_loss.item():.3f}")
+    # [MESH-LOSS] 显示 mesh loss（仅当激活时）
+    if mesh_loss_active:
+        postfix_dict["Mesh"] = repr(f"{mesh_loss.item():.3f}")
+    # [DEPTH-NORMAL-LOSS] 显示 depth normal loss（仅当激活时）
+    if args.lambda_normal_depth > 0:
+        postfix_dict["ND"] = repr(f"{normal_depth_loss.item():.3f}")
+    if args.lambda_normal_depth_med > 0:
+        postfix_dict["NDm"] = repr(f"{normal_depth_med_loss.item():.3f}")
     progress_bar.set_postfix(postfix_dict)
 
     # 每k次迭代保存渲染图
@@ -443,10 +518,9 @@ for iteration in progress_bar:
             rgb_img = render_pkg['render'].permute(1, 2, 0)
             rgb_img = (rgb_img.detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
 
-            # 2. 深度图（归一化可视化）
+            # 2. 期望深度图（归一化可视化）
             depth_map = render_pkg['depth']  # (H, W)
             depth_np = depth_map.detach().cpu().numpy()
-            # 排除无效深度（0或极大值）进行归一化
             valid_mask = (depth_np > 0) & (depth_np < 1e6)
             if valid_mask.any():
                 d_min, d_max = depth_np[valid_mask].min(), depth_np[valid_mask].max()
@@ -454,17 +528,61 @@ for iteration in progress_bar:
             else:
                 depth_norm = np.zeros_like(depth_np)
             depth_norm = np.where(valid_mask, depth_norm, 0)
-            # 使用 turbo colormap
             depth_vis = (plt.cm.turbo(depth_norm)[:, :, :3] * 255).astype(np.uint8)
 
-            # 3. Gaussian 法线图（从渲染的 normal 输出）
-            gauss_normal = render_pkg['normal'].permute(1, 2, 0)  # (H, W, 3)
-            gauss_normal_vis = ((gauss_normal.detach().cpu().numpy() + 1) / 2 * 255).clip(0, 255).astype(np.uint8)
+            # 3. 中位深度图（归一化可视化）
+            depth_med_map = render_pkg['depth_med']  # (H, W)
+            depth_med_np = depth_med_map.detach().cpu().numpy()
+            valid_mask_med = (depth_med_np > 0) & (depth_med_np < 1e6)
+            if valid_mask_med.any():
+                d_min_med, d_max_med = depth_med_np[valid_mask_med].min(), depth_med_np[valid_mask_med].max()
+                depth_med_norm = (depth_med_np - d_min_med) / (d_max_med - d_min_med + 1e-8)
+            else:
+                depth_med_norm = np.zeros_like(depth_med_np)
+            depth_med_norm = np.where(valid_mask_med, depth_med_norm, 0)
+            depth_med_vis = (plt.cm.turbo(depth_med_norm)[:, :, :3] * 255).astype(np.uint8)
 
-            # 4. Mesh 法线图（如果 mesh regularizer 激活）
-            mesh_normal_vis = np.zeros_like(rgb_img)
-            if args.lambda_mesh_normal > 0 and mesh_regularizer.should_apply(iteration):
-                # 获取 sample_camera 的 gt_mask（如果有）
+            # 4. Gaussian 法线图（从渲染的 normal 输出）
+            # MILo 可视化惯例: (1 - normal) / 2，而非 (normal + 1) / 2
+            gauss_normal = render_pkg['normal'].permute(1, 2, 0)  # (H, W, 3)
+            # [NORMAL-NORMALIZE] Alpha blending 后的法线需要归一化
+            gauss_normal = F.normalize(gauss_normal, dim=-1)
+            gauss_normal_vis = ((1 - gauss_normal.detach().cpu().numpy()) / 2 * 255).clip(0, 255).astype(np.uint8)
+
+            # 5. 深度转法线图（期望深度）
+            depth_normal = depth_to_normal(sample_camera, render_pkg['depth'])  # (3, H, W)
+            depth_normal_vis = ((1 - depth_normal.permute(1, 2, 0).detach().cpu().numpy()) / 2 * 255).clip(0, 255).astype(np.uint8)
+
+            # 6. 深度转法线图（中位深度）
+            depth_med_normal = depth_to_normal(sample_camera, render_pkg['depth_med'])  # (3, H, W)
+            depth_med_normal_vis = ((1 - depth_med_normal.permute(1, 2, 0).detach().cpu().numpy()) / 2 * 255).clip(0, 255).astype(np.uint8)
+
+            # 整合成 2x3 网格图: RGB, Depth, DepthMed | Normal, DepthNormal, DepthMedNormal
+            H, W = rgb_img.shape[:2]
+            combined1 = np.zeros((H * 2, W * 3, 3), dtype=np.uint8)
+            combined1[:H, :W] = rgb_img                        # 左上: RGB
+            combined1[:H, W:2*W] = depth_vis                   # 中上: Depth
+            combined1[:H, 2*W:] = depth_med_vis                # 右上: Depth Median
+            combined1[H:, :W] = gauss_normal_vis               # 左下: Gaussian Normal
+            combined1[H:, W:2*W] = depth_normal_vis            # 中下: Depth->Normal
+            combined1[H:, 2*W:] = depth_med_normal_vis         # 右下: DepthMed->Normal
+
+            # 添加标签
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale, thickness = 0.6, 2
+            cv2.putText(combined1, 'RGB', (10, 25), font, font_scale, (255, 255, 255), thickness)
+            cv2.putText(combined1, 'Depth', (W + 10, 25), font, font_scale, (255, 255, 255), thickness)
+            cv2.putText(combined1, 'Depth Med', (2*W + 10, 25), font, font_scale, (255, 255, 255), thickness)
+            cv2.putText(combined1, 'Normal', (10, H + 25), font, font_scale, (255, 255, 255), thickness)
+            cv2.putText(combined1, 'Depth->N', (W + 10, H + 25), font, font_scale, (255, 255, 255), thickness)
+            cv2.putText(combined1, 'DepthMed->N', (2*W + 10, H + 25), font, font_scale, (255, 255, 255), thickness)
+
+            # 保存渲染图
+            save_path = render_save_dir / f"iter_{iteration:06d}.png"
+            imageio.imwrite(str(save_path), combined1)
+
+            # 5. Mesh 法线图和深度图（如果 mesh regularizer 激活）
+            if mesh_has_any_weight and mesh_regularizer.should_apply(iteration):
                 sample_gt_mask = getattr(sample_camera, 'gt_alpha_mask', None)
                 if sample_gt_mask is not None:
                     sample_gt_mask = sample_gt_mask.cuda()
@@ -472,32 +590,58 @@ for iteration in progress_bar:
                     model=model,
                     camera=sample_camera,
                     gaussian_depth=render_pkg['depth'],
+                    gaussian_depth_med=render_pkg['depth_med'],  # MILo: 中位深度
+                    scene_scaling=model.scene_scaling,           # MILo: scene_scaling
                     iteration=iteration,
                     gt_mask=sample_gt_mask,
                 )
                 if mesh_reg_vis['active'] and mesh_reg_vis['mesh_normal'] is not None:
+                    # Mesh 法线图 (MILo 可视化惯例: fix_normal_map + (1 - normal) / 2)
                     mesh_normal = mesh_reg_vis['mesh_normal']  # (H, W, 3)
-                    mesh_normal_vis = ((mesh_normal.detach().cpu().numpy() + 1) / 2 * 255).clip(0, 255).astype(np.uint8)
+                    # 使用 fix_normal_map 确保法线指向相机
+                    mesh_normal_fixed = fix_normal_map(sample_camera, mesh_normal, normal_in_view_space=True)
+                    mesh_normal_vis = ((1 - mesh_normal_fixed.detach().cpu().numpy()) / 2 * 255).clip(0, 255).astype(np.uint8)
 
-            # 整合成 2x2 网格图
-            H, W = rgb_img.shape[:2]
-            combined = np.zeros((H * 2, W * 2, 3), dtype=np.uint8)
-            combined[:H, :W] = rgb_img                    # 左上: RGB
-            combined[:H, W:] = depth_vis                  # 右上: Depth
-            combined[H:, :W] = gauss_normal_vis           # 左下: Gaussian Normal
-            combined[H:, W:] = mesh_normal_vis            # 右下: Mesh Normal
+                    # Mesh 深度图
+                    mesh_depth = mesh_reg_vis['mesh_depth']  # (H, W)
+                    mesh_depth_np = mesh_depth.detach().cpu().numpy()
+                    valid_mask_mesh = (mesh_depth_np > 0) & (mesh_depth_np < 1e6)
+                    if valid_mask_mesh.any():
+                        md_min, md_max = mesh_depth_np[valid_mask_mesh].min(), mesh_depth_np[valid_mask_mesh].max()
+                        mesh_depth_norm = (mesh_depth_np - md_min) / (md_max - md_min + 1e-8)
+                    else:
+                        mesh_depth_norm = np.zeros_like(mesh_depth_np)
+                    mesh_depth_norm = np.where(valid_mask_mesh, mesh_depth_norm, 0)
+                    mesh_depth_vis = (plt.cm.turbo(mesh_depth_norm)[:, :, :3] * 255).astype(np.uint8)
 
-            # 添加标签
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale, thickness = 0.6, 2
-            cv2.putText(combined, 'RGB', (10, 25), font, font_scale, (255, 255, 255), thickness)
-            cv2.putText(combined, 'Depth', (W + 10, 25), font, font_scale, (255, 255, 255), thickness)
-            cv2.putText(combined, 'Gauss Normal', (10, H + 25), font, font_scale, (255, 255, 255), thickness)
-            cv2.putText(combined, 'Mesh Normal', (W + 10, H + 25), font, font_scale, (255, 255, 255), thickness)
+                    # 整合成 1x2 网格图: Mesh Normal, Mesh Depth
+                    combined2 = np.zeros((H, W * 2, 3), dtype=np.uint8)
+                    combined2[:, :W] = mesh_normal_vis      # 左: Mesh Normal
+                    combined2[:, W:] = mesh_depth_vis       # 右: Mesh Depth
 
-            # 保存整合图
-            save_path = render_save_dir / f"iter_{iteration:06d}.png"
-            imageio.imwrite(str(save_path), combined)
+                    # 添加标签
+                    cv2.putText(combined2, 'Mesh Normal', (10, 25), font, font_scale, (255, 255, 255), thickness)
+                    cv2.putText(combined2, 'Mesh Depth', (W + 10, 25), font, font_scale, (255, 255, 255), thickness)
+
+                    # 保存mesh渲染图
+                    mesh_render_path = render_save_dir / f"mesh_{iteration:06d}.png"
+                    imageio.imwrite(str(mesh_render_path), combined2)
+
+    # 每k次迭代用MT提取mesh并保存
+    if args.save_mesh_interval > 0 and iteration % args.save_mesh_interval == 0:
+        with torch.no_grad():
+            # 获取顶点SDF
+            vert_sdf = model.query_vert_sdf()  # (N_verts,)
+            # 使用Marching Tetrahedra提取mesh
+            mesh_verts, mesh_faces = marching_tetrahedra(
+                model.vertices, model.indices, vert_sdf
+            )
+            if mesh_faces.shape[0] > 0:
+                # 创建Meshes对象并保存
+                mesh = Meshes(mesh_verts, mesh_faces)
+                mesh_path = mesh_save_dir / f"mesh_{iteration:06d}.ply"
+                save_mesh_as_ply(str(mesh_path), mesh)
+                print(f"[Mesh] Saved mesh at iter {iteration}: {mesh_verts.shape[0]} verts, {mesh_faces.shape[0]} faces")
 
 avged_psnrs = [sum(v)/len(v) for v in psnrs if len(v) == len(train_cameras)]
 video_writer.release()

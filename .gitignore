@@ -23,6 +23,7 @@ env/
 
 # Project-specific cache
 .slangtorch_cache/
+.slangtorch_cache*/
 
 # Build artifacts
 dtet/CMake/

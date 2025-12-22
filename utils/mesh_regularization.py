@@ -1,13 +1,15 @@
-"""Mesh regularization module for normal consistency loss.
+"""Mesh regularization module for normal/depth consistency and occupancy loss.
 
 Based on MILo's mesh regularization approach.
-Computes normal consistency loss between:
-- Normals from Gaussian-rendered depth (via finite differences)
-- Normals from mesh extracted via Marching Tetrahedra
+Computes:
+- Normal consistency loss between mesh and Gaussian normals
+- Depth consistency loss between mesh and Gaussian depths
+- Surface occupancy loss (SDF at surface points should be ~0)
 
 Reference: MILo project regularization/regularizer/mesh.py
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -17,11 +19,63 @@ from utils.mesh import Meshes, MeshRasterizer, MeshRenderer, transform_points_wo
 from utils.geometry_utils import depth_to_normal, transform_normal_world_to_view
 
 
+def depth_to_points_world(depth_map, camera):
+    """Convert depth map to 3D points in world space.
+
+    Args:
+        depth_map: (H, W) depth values
+        camera: Camera object
+
+    Returns:
+        points: (N, 3) 3D points in world space (only valid depth pixels)
+        valid_mask: (H, W) boolean mask of valid pixels
+    """
+    device = depth_map.device
+    H, W = depth_map.shape
+
+    # Valid depth mask
+    valid_mask = depth_map > 0
+
+    # Compute focal lengths from FOV
+    fx = W / (2 * math.tan(camera.fovx / 2.))
+    fy = H / (2 * math.tan(camera.fovy / 2.))
+    cx, cy = W / 2., H / 2.
+
+    # Create pixel grid
+    grid_y, grid_x = torch.meshgrid(
+        torch.arange(H, device=device, dtype=torch.float32),
+        torch.arange(W, device=device, dtype=torch.float32),
+        indexing='ij'
+    )
+
+    # Pixel coordinates (centered)
+    x = (grid_x + 0.5 - cx) / fx
+    y = (grid_y + 0.5 - cy) / fy
+
+    # 3D points in view space (depth is along z-axis)
+    z = depth_map
+    points_view = torch.stack([x * z, y * z, z], dim=-1)  # (H, W, 3)
+
+    # Transform to world space
+    # world_view_transform: world -> view, so we need inverse
+    view_to_world = torch.inverse(camera.world_view_transform.to(device))  # (4, 4)
+    R = view_to_world[:3, :3]
+    t = view_to_world[:3, 3]
+
+    points_world = points_view @ R.T + t  # (H, W, 3)
+
+    # Extract valid points
+    valid_points = points_world[valid_mask]  # (N, 3)
+
+    return valid_points, valid_mask
+
+
 class MeshRegularizer(nn.Module):
-    """Mesh regularization for normal consistency.
+    """Mesh regularization for normal/depth consistency and surface occupancy.
 
     Extracts triangle mesh from tetrahedral model using Marching Tetrahedra,
-    renders the mesh normals, and computes consistency loss with Gaussian normals.
+    renders the mesh normals/depth, and computes consistency losses with Gaussian rendering.
+    Also computes surface occupancy loss to ensure SDF is near 0 at surface points.
     """
 
     def __init__(
@@ -29,6 +83,10 @@ class MeshRegularizer(nn.Module):
         start_iter: int = 8001,
         stop_iter: int = 18000,
         normal_weight: float = 0.05,
+        depth_weight: float = 0.0,
+        occupancy_weight: float = 0.0,
+        depth_scale: float = 0.1,
+        depth_ratio: float = 0.5,  # MILo: ratio of median depth (not expected!)
         sdf_threshold: float = 0.0,
         use_opengl: bool = True,
     ):
@@ -38,6 +96,13 @@ class MeshRegularizer(nn.Module):
             start_iter: Iteration to start mesh regularization
             stop_iter: Iteration to stop mesh regularization
             normal_weight: Weight for normal consistency loss
+            depth_weight: Weight for depth consistency loss
+            occupancy_weight: Weight for surface occupancy loss
+            depth_scale: Scale factor for depth loss (controls sensitivity)
+                         If None, will use model.scene_scaling in forward()
+            depth_ratio: Ratio for median depth in mixing (MILo convention)
+                         Final depth = (1 - depth_ratio) * expected + depth_ratio * median
+                         Set to 0.0 to use only expected depth
             sdf_threshold: SDF threshold for mesh extraction (default 0.0 = surface)
             use_opengl: Use OpenGL context for rasterization (vs CUDA)
         """
@@ -45,6 +110,10 @@ class MeshRegularizer(nn.Module):
         self.start_iter = start_iter
         self.stop_iter = stop_iter
         self.normal_weight = normal_weight
+        self.depth_weight = depth_weight
+        self.occupancy_weight = occupancy_weight
+        self.depth_scale = depth_scale
+        self.depth_ratio = depth_ratio
         self.sdf_threshold = sdf_threshold
         self.use_opengl = use_opengl
 
@@ -85,7 +154,8 @@ class MeshRegularizer(nn.Module):
             threshold = self.sdf_threshold
 
         # Get vertices and tetrahedra indices
-        vertices = model.vertices.detach()  # (N_verts, 3)
+        # MILo: 不做 detach，让梯度流回到 SDF 参数
+        vertices = model.vertices  # (N_verts, 3)
 
         # 只使用活跃的四面体（排除 empty_indices）
         tets = model.indices  # (N_tets, 4)
@@ -95,7 +165,8 @@ class MeshRegularizer(nn.Module):
             pass  # model.indices 应该已经是正确的
 
         # Query SDF values at all vertices
-        vert_sdf = model.query_vert_sdf().detach()  # (N_verts,)
+        # MILo: 不做 detach，让梯度流回到 SDF 参数
+        vert_sdf = model.query_vert_sdf()  # (N_verts,)
 
         # Shift SDF by threshold
         sdf_shifted = vert_sdf - threshold
@@ -146,7 +217,7 @@ class MeshRegularizer(nn.Module):
             camera
         )
 
-        return normals_view, valid_mask
+        return normals_view, valid_mask, mesh_depth
 
     def compute_gaussian_normal(self, depth_map, camera):
         """Compute normal from Gaussian-rendered depth map.
@@ -166,11 +237,14 @@ class MeshRegularizer(nn.Module):
         gaussian_normal: torch.Tensor,
         mask: torch.Tensor = None
     ) -> torch.Tensor:
-        """Compute normal consistency loss.
+        """Compute normal consistency loss (MILo mesh_normal_loss style).
 
         Loss = 1 - |dot(n_mesh, n_gaussian)|
 
-        Using absolute value makes the loss invariant to normal direction flips.
+        MILo uses abs() for mesh_normal_loss because:
+        - Delaunay triangulation may not update frequently
+        - Mesh could self-intersect and have flipped normals
+        - We only care about plane alignment, not normal direction
 
         Args:
             mesh_normal: (H, W, 3) mesh normals in view space
@@ -191,7 +265,7 @@ class MeshRegularizer(nn.Module):
         # Compute dot product
         dot_product = (mesh_normal * gaussian_normal).sum(dim=-1)  # (H, W)
 
-        # Loss: 1 - |cos(angle)|
+        # Loss: 1 - |cos(angle)| (MILo mesh_normal_loss uses abs)
         loss = 1.0 - dot_product.abs()
 
         if mask is not None:
@@ -203,35 +277,182 @@ class MeshRegularizer(nn.Module):
 
         return loss
 
+    def compute_depth_loss(
+        self,
+        mesh_depth: torch.Tensor,
+        gaussian_depth: torch.Tensor,
+        gaussian_depth_med: torch.Tensor = None,
+        mask: torch.Tensor = None,
+        scale: float = None,
+        depth_ratio: float = None
+    ) -> torch.Tensor:
+        """Compute depth consistency loss (MILo-style).
+
+        Loss = log(1 + |mesh_depth - mixed_gaussian_depth| / scale)
+
+        Uses log to suppress large outliers (similar to Huber loss).
+        Supports mixing expected and median depth like MILo.
+
+        Args:
+            mesh_depth: (H, W) mesh depth map
+            gaussian_depth: (H, W) expected Gaussian depth map
+            gaussian_depth_med: (H, W) median Gaussian depth map (optional)
+            mask: Optional (H, W) boolean mask for valid pixels
+            scale: Scale factor (uses self.depth_scale if None, or scene_scaling)
+            depth_ratio: Ratio for median depth in mixing (MILo convention)
+                         Final = (1 - depth_ratio) * expected + depth_ratio * median
+
+        Returns:
+            loss: Scalar depth consistency loss
+        """
+        if scale is None:
+            scale = self.depth_scale
+        if depth_ratio is None:
+            depth_ratio = self.depth_ratio
+
+        # Mix expected and median depth (MILo style)
+        # MILo: gaussians_depth = (1 - depth_ratio) * expected + depth_ratio * median
+        if gaussian_depth_med is not None and depth_ratio > 0.0:
+            mixed_depth = (1.0 - depth_ratio) * gaussian_depth + depth_ratio * gaussian_depth_med
+        else:
+            mixed_depth = gaussian_depth
+
+        # Compute absolute difference
+        diff = torch.abs(mesh_depth - mixed_depth)
+
+        # Log loss to suppress outliers
+        loss = torch.log(1.0 + diff / scale)
+
+        if mask is not None:
+            loss = loss * mask.float()
+            loss = loss.sum() / (mask.float().sum() + 1e-8)
+        else:
+            loss = loss.mean()
+
+        return loss
+
+    def compute_occupancy_loss(
+        self,
+        model,
+        gaussian_depth: torch.Tensor,
+        camera,
+        mask: torch.Tensor = None,
+        max_points: int = 10000
+    ) -> torch.Tensor:
+        """Compute surface occupancy loss.
+
+        Surface points (from depth map back-projection) should have SDF ≈ 0.
+        Loss = mean(|SDF(surface_points)|^2)
+
+        Args:
+            model: TetModel with query_sdf method
+            gaussian_depth: (H, W) Gaussian depth map
+            camera: Camera object
+            mask: Optional (H, W) boolean mask for valid pixels
+            max_points: Maximum number of points to sample (for efficiency)
+
+        Returns:
+            loss: Scalar surface occupancy loss
+        """
+        # Get 3D surface points from depth map
+        surface_points, valid_mask = depth_to_points_world(gaussian_depth, camera)
+
+        if surface_points.shape[0] == 0:
+            return torch.tensor(0.0, device=gaussian_depth.device)
+
+        # Apply additional mask if provided
+        if mask is not None:
+            # Flatten and combine masks
+            flat_valid = valid_mask.flatten()
+            if mask.dim() == 3:
+                mask = mask.squeeze(0)
+            flat_mask = (mask > 0.5).flatten()
+            combined_flat = flat_valid & flat_mask
+
+            # Re-extract points with combined mask
+            H, W = gaussian_depth.shape
+            grid_y, grid_x = torch.meshgrid(
+                torch.arange(H, device=gaussian_depth.device, dtype=torch.float32),
+                torch.arange(W, device=gaussian_depth.device, dtype=torch.float32),
+                indexing='ij'
+            )
+
+            # Recompute all points and filter by combined mask
+            fx = W / (2 * math.tan(camera.fovx / 2.))
+            fy = H / (2 * math.tan(camera.fovy / 2.))
+            cx, cy = W / 2., H / 2.
+
+            x = (grid_x + 0.5 - cx) / fx
+            y = (grid_y + 0.5 - cy) / fy
+            z = gaussian_depth
+            points_view = torch.stack([x * z, y * z, z], dim=-1)
+
+            view_to_world = torch.inverse(camera.world_view_transform.to(gaussian_depth.device))
+            R = view_to_world[:3, :3]
+            t = view_to_world[:3, 3]
+            points_world = points_view @ R.T + t
+
+            # Filter by combined mask
+            combined_mask_2d = combined_flat.reshape(H, W)
+            surface_points = points_world[combined_mask_2d]
+
+        if surface_points.shape[0] == 0:
+            return torch.tensor(0.0, device=gaussian_depth.device)
+
+        # Subsample if too many points (for efficiency)
+        if surface_points.shape[0] > max_points:
+            indices = torch.randperm(surface_points.shape[0], device=surface_points.device)[:max_points]
+            surface_points = surface_points[indices]
+
+        # Query SDF at surface points
+        surface_points = surface_points.detach().requires_grad_(False)
+        sdf_values = model.query_sdf(surface_points)  # (N,)
+
+        # Surface occupancy loss: SDF should be ~0 at surface
+        loss = (sdf_values ** 2).mean()
+
+        return loss
+
     def forward(
         self,
         model,
         camera,
         gaussian_depth: torch.Tensor,
+        gaussian_depth_med: torch.Tensor = None,  # MILo: median depth for mixing
+        scene_scaling: float = None,  # MILo: use scene_scaling as depth loss scale
         iteration: int = None,
         gt_mask: torch.Tensor = None,  # GT alpha mask，排除背景散乱法线
     ) -> dict:
-        """Compute mesh regularization loss.
+        """Compute mesh regularization losses.
 
         Args:
-            model: TetModel with vertices, indices, query_vert_sdf
+            model: TetModel with vertices, indices, query_vert_sdf, query_sdf
             camera: Camera object for rendering
-            gaussian_depth: (H, W) depth from Gaussian rendering
+            gaussian_depth: (H, W) expected depth from Gaussian rendering
+            gaussian_depth_med: (H, W) median depth from Gaussian rendering (MILo style)
+            scene_scaling: Scene scaling factor, used as depth loss scale if provided
             iteration: Current training iteration (for scheduling)
             gt_mask: (H, W) or (1, H, W) GT alpha mask，背景为0前景为1
 
         Returns:
             dict with:
-                - 'loss': Weighted normal consistency loss (0 if not active)
-                - 'normal_loss_raw': Unweighted loss (for logging)
+                - 'loss': Total weighted loss (0 if not active)
+                - 'normal_loss_raw': Unweighted normal loss
+                - 'depth_loss_raw': Unweighted depth loss
+                - 'occupancy_loss_raw': Unweighted occupancy loss
                 - 'mesh_normal': (H, W, 3) mesh normal map
+                - 'mesh_depth': (H, W) mesh depth map
                 - 'gaussian_normal': (3, H, W) Gaussian normal map
                 - 'active': Whether regularization was applied
         """
+        device = gaussian_depth.device
         result = {
-            'loss': torch.tensor(0.0, device=gaussian_depth.device),
-            'normal_loss_raw': torch.tensor(0.0, device=gaussian_depth.device),
+            'loss': torch.tensor(0.0, device=device),
+            'normal_loss_raw': torch.tensor(0.0, device=device),
+            'depth_loss_raw': torch.tensor(0.0, device=device),
+            'occupancy_loss_raw': torch.tensor(0.0, device=device),
             'mesh_normal': None,
+            'mesh_depth': None,
             'gaussian_normal': None,
             'active': False,
         }
@@ -246,8 +467,8 @@ class MeshRegularizer(nn.Module):
             print("[MeshRegularizer] Warning: No mesh extracted")
             return result
 
-        # Render mesh normals
-        mesh_normal, rasterization_mask = self.render_mesh_normal(mesh, camera)
+        # Render mesh normals and depth
+        mesh_normal, rasterization_mask, mesh_depth = self.render_mesh_normal(mesh, camera)
 
         # Compute Gaussian normals from depth
         gaussian_normal = self.compute_gaussian_normal(gaussian_depth, camera)
@@ -258,21 +479,51 @@ class MeshRegularizer(nn.Module):
         # 1. Mesh rasterization mask (mesh渲染到的位置)
         combined_mask = rasterization_mask
 
-        # 2. GT alpha mask (排除背景散乱法线)
+        # 2. Gaussian depth valid mask
+        gaussian_valid_mask = gaussian_depth > 0
+        combined_mask = combined_mask & gaussian_valid_mask
+
+        # 3. GT alpha mask (排除背景散乱法线)
+        gt_mask_2d = None
         if gt_mask is not None:
             if gt_mask.dim() == 3:
                 gt_mask = gt_mask.squeeze(0)
+            gt_mask_2d = gt_mask
             gt_mask_bool = gt_mask > 0.5
             combined_mask = combined_mask & gt_mask_bool
 
-        # Compute normal consistency loss
-        normal_loss = self.compute_normal_consistency_loss(
-            mesh_normal, gaussian_normal, combined_mask
-        )
+        total_loss = torch.tensor(0.0, device=device)
 
-        result['loss'] = self.normal_weight * normal_loss
-        result['normal_loss_raw'] = normal_loss
+        # 1. Normal consistency loss
+        if self.normal_weight > 0:
+            normal_loss = self.compute_normal_consistency_loss(
+                mesh_normal, gaussian_normal, combined_mask
+            )
+            result['normal_loss_raw'] = normal_loss
+            total_loss = total_loss + self.normal_weight * normal_loss
+
+        # 2. Depth consistency loss (MILo style: with depth mixing and scene_scaling)
+        if self.depth_weight > 0:
+            # Use scene_scaling as scale if provided, otherwise use self.depth_scale
+            depth_scale = scene_scaling if scene_scaling is not None else self.depth_scale
+            depth_loss = self.compute_depth_loss(
+                mesh_depth, gaussian_depth, gaussian_depth_med,
+                mask=combined_mask, scale=depth_scale
+            )
+            result['depth_loss_raw'] = depth_loss
+            total_loss = total_loss + self.depth_weight * depth_loss
+
+        # 3. Surface occupancy loss
+        if self.occupancy_weight > 0:
+            occupancy_loss = self.compute_occupancy_loss(
+                model, gaussian_depth, camera, gt_mask_2d
+            )
+            result['occupancy_loss_raw'] = occupancy_loss
+            total_loss = total_loss + self.occupancy_weight * occupancy_loss
+
+        result['loss'] = total_loss
         result['mesh_normal'] = mesh_normal
+        result['mesh_depth'] = mesh_depth
         result['gaussian_normal'] = gaussian_normal
         result['active'] = True
 

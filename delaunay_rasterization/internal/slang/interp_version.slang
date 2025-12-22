@@ -184,9 +184,11 @@ inline CtrlPt integrate_tetra_segment(
     float3 sdf_grad = compute_tet_sdf_gradient(
         g.tet.verts[0], g.tet.verts[1], g.tet.verts[2], g.tet.verts[3],
         g.vert_sdf);
-    // 归一化得到法向量（指向 SDF 增大方向，即表面外侧）
+    // 归一化得到法向量
     float grad_len = length(sdf_grad);
-    float3 normal = (grad_len > 1e-8f) ? (sdf_grad / grad_len) : float3(0.0f, 0.0f, 1.0f);
+    float3 normal = (grad_len > 1e-8f)
+        ? sdf_grad / grad_len
+        : float3(0.0f, 0.0f, 1.0f);
 
     float4 rgba = { seg_rgb.x, seg_rgb.y, seg_rgb.z, tau };
     return { rgba, {enter, exit}, rho_hat, normal };
