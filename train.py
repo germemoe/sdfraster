@@ -180,6 +180,12 @@ args.mesh_sdf_threshold = 0.0     # mesh 提取的 SDF 阈值
 args.lambda_normal_depth = 0.0      # 渲染的normal vs 期望深度推导的normal
 args.lambda_normal_depth_med = 0.0  # 渲染的normal vs 中位深度推导的normal
 
+# [MASK-LOSS] Mask Loss 和 Transmittance Concentration Loss（参考 SVRaster）
+args.lambda_mask = 0.0              # mask loss 权重：约束 T 与 GT mask 对齐
+args.mask_from = 0                  # 开始使用 mask loss 的迭代
+args.mask_until = 20000             # 停止使用 mask loss 的迭代
+args.lambda_T_concen = 0.0          # transmittance concentration loss：鼓励 T 二值化到 0 或 1
+
 # Clone Settings
 args.num_samples = 200
 args.k_samples = 1
@@ -386,7 +392,16 @@ for iteration in progress_bar:
     normal_depth_loss = torch.tensor(0.0, device=device)
     normal_depth_med_loss = torch.tensor(0.0, device=device)
     if args.lambda_normal_depth > 0 or args.lambda_normal_depth_med > 0:
-        rendered_normal = render_pkg['normal']  # (3, H, W)
+        rendered_normal = render_pkg['normal']  # (3, H, W) 世界坐标系
+
+        # [COORD-FIX] 将渲染法线从世界空间变换到相机空间（仿 MILo）
+        # depth_to_normal 计算的法线在相机空间，需要统一坐标系
+        # n_view = n_world @ R，其中 R 是 world_view_transform 的旋转部分
+        R = camera.world_view_transform[:3, :3].to(device)  # (3, 3)
+        rendered_normal_view = rendered_normal.permute(1, 2, 0) @ R  # (H, W, 3)
+        rendered_normal_view = F.normalize(rendered_normal_view, dim=-1)  # 归一化
+        rendered_normal_view = rendered_normal_view.permute(2, 0, 1)  # (3, H, W)
+
         # 构建mask：只在有效区域计算（alpha > 0.5 且 gt_mask）
         alpha_mask = render_pkg['alpha'] > 0.5  # (H, W)
         if gt_mask is not None:
@@ -399,18 +414,36 @@ for iteration in progress_bar:
             valid_mask = alpha_mask
 
         if args.lambda_normal_depth > 0:
-            # 从期望深度推导法线
+            # 从期望深度推导法线（相机空间）
             depth_normal = depth_to_normal(camera, render_pkg['depth'])  # (3, H, W)
             normal_depth_loss = compute_normal_consistency_loss(
-                rendered_normal, depth_normal, valid_mask
+                rendered_normal_view, depth_normal, valid_mask
             )
 
         if args.lambda_normal_depth_med > 0:
-            # 从中位深度推导法线
+            # 从中位深度推导法线（相机空间）
             depth_med_normal = depth_to_normal(camera, render_pkg['depth_med'])  # (3, H, W)
             normal_depth_med_loss = compute_normal_consistency_loss(
-                rendered_normal, depth_med_normal, valid_mask
+                rendered_normal_view, depth_med_normal, valid_mask
             )
+
+    # [MASK-LOSS] Mask Loss: 约束 transmittance 与 GT mask 对齐
+    mask_loss = torch.tensor(0.0, device=device)
+    if args.lambda_mask > 0 and iteration >= args.mask_from and iteration <= args.mask_until:
+        if gt_mask is not None and gt_mask.numel() > 0:
+            # T = 1 - alpha，alpha 是累积不透明度
+            T = 1.0 - render_pkg['alpha']  # (H, W)
+            # GT mask: 物体=1, 背景=0 → 目标 T: 物体=0, 背景=1
+            gt_mask_2d = gt_mask.squeeze() if gt_mask.dim() == 3 else gt_mask
+            gt_T = 1.0 - gt_mask_2d  # (H, W)
+            mask_loss = F.mse_loss(T, gt_T)
+
+    # [T-CONCEN-LOSS] Transmittance Concentration Loss: 鼓励 T 二值化到 0 或 1
+    T_concen_loss = torch.tensor(0.0, device=device)
+    if args.lambda_T_concen > 0:
+        T = 1.0 - render_pkg['alpha']  # (H, W)
+        # prob_concen_loss: T² * (1-T)²，当 T=0 或 T=1 时为 0，T=0.5 时最大
+        T_concen_loss = (T.square() * (1.0 - T).square()).mean()
 
     loss = (1-args.lambda_ssim)*l1_loss + \
            args.lambda_ssim*ssim_loss + \
@@ -421,7 +454,9 @@ for iteration in progress_bar:
            args.lambda_curvature * curv_loss + \
            mesh_loss + \
            args.lambda_normal_depth * normal_depth_loss + \
-           args.lambda_normal_depth_med * normal_depth_med_loss
+           args.lambda_normal_depth_med * normal_depth_med_loss + \
+           args.lambda_mask * mask_loss + \
+           args.lambda_T_concen * T_concen_loss
 
     loss.backward()
 
@@ -543,11 +578,13 @@ for iteration in progress_bar:
             depth_med_vis = (plt.cm.turbo(depth_med_norm)[:, :, :3] * 255).astype(np.uint8)
 
             # 4. Gaussian 法线图（从渲染的 normal 输出）
+            # [COORD-FIX] 转换到相机空间后可视化，与深度法线一致
             # MILo 可视化惯例: (1 - normal) / 2，而非 (normal + 1) / 2
-            gauss_normal = render_pkg['normal'].permute(1, 2, 0)  # (H, W, 3)
-            # [NORMAL-NORMALIZE] Alpha blending 后的法线需要归一化
-            gauss_normal = F.normalize(gauss_normal, dim=-1)
-            gauss_normal_vis = ((1 - gauss_normal.detach().cpu().numpy()) / 2 * 255).clip(0, 255).astype(np.uint8)
+            gauss_normal = render_pkg['normal'].permute(1, 2, 0)  # (H, W, 3) 世界空间
+            R_vis = sample_camera.world_view_transform[:3, :3].to(gauss_normal.device)
+            gauss_normal_view = gauss_normal @ R_vis  # 转换到相机空间
+            gauss_normal_view = F.normalize(gauss_normal_view, dim=-1)
+            gauss_normal_vis = ((1 - gauss_normal_view.detach().cpu().numpy()) / 2 * 255).clip(0, 255).astype(np.uint8)
 
             # 5. 深度转法线图（期望深度）
             depth_normal = depth_to_normal(sample_camera, render_pkg['depth'])  # (3, H, W)
