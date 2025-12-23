@@ -162,6 +162,10 @@ args.lambda_sh = 0.0
 # [SDF-MODIFICATION] Eikonal 和 Curvature Loss 设置（参考 Neuralangelo）
 args.lambda_eikonal = 0.0 #0.1       # Eikonal loss 权重
 args.lambda_curvature = 0.0 #5e-4   # Curvature loss 权重
+args.eikonal_start = 5001            # 开始使用 eikonal loss 的迭代
+args.eikonal_end = 30000          # 停止使用 eikonal loss 的迭代
+args.curvature_start = 5001         # 开始使用 curvature loss 的迭代
+args.curvature_end = 30000        # 停止使用 curvature loss 的迭代
 args.gradient_mode = "numerical"  # "analytical" 或 "numerical"
 args.gradient_taps = 4            # 数值梯度采样点数：4 或 6
 args.gradient_eps = 1e-3          # 数值梯度步长
@@ -362,7 +366,10 @@ for iteration in progress_bar:
     # [SDF-MODIFICATION] Eikonal 和 Curvature Loss
     eik_loss = torch.tensor(0.0, device=device)
     curv_loss = torch.tensor(0.0, device=device)
-    if args.lambda_eikonal > 0 or args.lambda_curvature > 0:
+    # 检查迭代范围
+    eikonal_active = args.lambda_eikonal > 0 and args.eikonal_start <= iteration < args.eikonal_end
+    curvature_active = args.lambda_curvature > 0 and args.curvature_start <= iteration < args.curvature_end
+    if eikonal_active or curvature_active:
         # 只在活跃顶点（属于未被裁剪四面体的顶点）上计算 SDF 梯度
         _, gradients, hessian_diag = model.compute_sdf_gradients(
             points=model.active_vertices,
@@ -370,9 +377,9 @@ for iteration in progress_bar:
             taps=args.gradient_taps,
             eps=args.gradient_eps
         )
-        if args.lambda_eikonal > 0:
+        if eikonal_active:
             eik_loss = eikonal_loss(gradients)
-        if args.lambda_curvature > 0 and hessian_diag is not None:
+        if curvature_active and hessian_diag is not None:
             curv_loss = curvature_loss(hessian_diag)
 
     # [MESH-LOSS] Mesh 正则化 Loss (normal + depth + occupancy)
@@ -465,11 +472,11 @@ for iteration in progress_bar:
            reg + \
            args.lambda_dist * dl_loss + \
            args.lambda_sh * render_pkg['sh_reg'] + \
-           args.lambda_eikonal * eik_loss + \
-           args.lambda_curvature * curv_loss + \
+           (args.lambda_eikonal * eik_loss if eikonal_active else 0.0) + \
+           (args.lambda_curvature * curv_loss if curvature_active else 0.0) + \
            mesh_loss + \
-           args.lambda_normal_depth * normal_depth_loss + \
-           args.lambda_normal_depth_med * normal_depth_med_loss + \
+           (args.lambda_normal_depth * normal_depth_loss if normal_depth_active and args.lambda_normal_depth > 0 else 0.0) + \
+           (args.lambda_normal_depth_med * normal_depth_med_loss if normal_depth_active and args.lambda_normal_depth_med > 0 else 0.0) + \
            args.lambda_mask * mask_loss + \
            args.lambda_T_concen * T_concen_loss
 

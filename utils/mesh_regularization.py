@@ -472,7 +472,7 @@ class MeshRegularizer(nn.Module):
         mesh_normal, rasterization_mask, mesh_depth = self.render_mesh_normal(mesh, camera)
 
         # Compute Gaussian normals from depth
-        gaussian_normal = self.compute_gaussian_normal(gaussian_depth_med, camera)
+        gaussian_normal = self.compute_gaussian_normal(gaussian_depth, camera)
 
         # Build combined mask
         H, W = gaussian_depth.shape
