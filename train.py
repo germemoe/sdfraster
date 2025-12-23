@@ -172,14 +172,14 @@ args.lambda_mesh_depth = 0.0     # mesh depth loss 权重
 args.lambda_mesh_occupancy = 0.0 # surface occupancy loss 权重
 args.mesh_depth_scale = None     # depth loss 的 scale 参数 (None则使用spatial_lr_scale)
 args.mesh_depth_ratio = 1.0      # MILo: median深度的混合比例 (0.0=仅期望深度, 1.0=仅中位深度)
-args.mesh_normal_start = 8001     # 开始使用 mesh normal loss 的迭代
+args.mesh_normal_start = 5001     # 开始使用 mesh normal loss 的迭代
 args.mesh_normal_stop = 18000     # 停止使用 mesh normal loss 的迭代
 args.mesh_sdf_threshold = 0.0     # mesh 提取的 SDF 阈值
 
 # [DEPTH-NORMAL-LOSS] 深度推导法线与渲染法线一致性 Loss（参考 MILo）
 args.lambda_normal_depth = 0.0      # 渲染的normal vs 期望深度推导的normal
 args.lambda_normal_depth_med = 0.0  # 渲染的normal vs 中位深度推导的normal
-args.normal_depth_start = 8001         # 开始使用 normal-depth loss 的迭代
+args.normal_depth_start = 5001         # 开始使用 normal-depth loss 的迭代
 args.normal_depth_end = 30000       # 停止使用 normal-depth loss 的迭代
 
 # [MASK-LOSS] Mask Loss 和 Transmittance Concentration Loss（参考 SVRaster）

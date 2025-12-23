@@ -232,7 +232,9 @@ class FrozenTetModel(BaseModel):
             sh       = self.sh
 
         # [DENSITY-RELATED] 返回密度作为第二个值
-        return circumcenter, density, rgb, grd, sh
+        # [SH-FIX] reshape sh 到正确形状 (N, sh_dim, 3)，与 Model.get_cell_values 保持一致
+        sh_dim = (self.max_sh_deg+1)**2 - 1
+        return circumcenter, density, rgb, grd, sh.reshape(-1, sh_dim, 3)
 
     # [DENSITY-RELATED] compute_features 返回密度
     def compute_features(self, offset=False):
