@@ -211,12 +211,14 @@ def transform_normal_world_to_view(normal_world, camera):
     device = normal_world.device
 
     # Get rotation part of world_view_transform (3x3)
+    # world_view_transform[:3,:3] stores R (cam-to-world rotation)
+    # To transform world->view, we need R^T: n_view = n_world @ R^T
     R = camera.world_view_transform[:3, :3].to(device)
 
-    # Transform normals
+    # Transform normals: world -> view
     original_shape = normal_world.shape
     normal_flat = normal_world.reshape(-1, 3)
-    normal_view = normal_flat @ R
+    normal_view = normal_flat @ R.T  # [FIX] Use R.T instead of R
 
     return normal_view.reshape(original_shape)
 

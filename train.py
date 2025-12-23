@@ -410,9 +410,10 @@ for iteration in progress_bar:
 
         # [COORD-FIX] 将渲染法线从世界空间变换到相机空间（仿 MILo）
         # depth_to_normal 计算的法线在相机空间，需要统一坐标系
-        # n_view = n_world @ R，其中 R 是 world_view_transform 的旋转部分
-        R = camera.world_view_transform[:3, :3].to(device)  # (3, 3)
-        rendered_normal_view = rendered_normal.permute(1, 2, 0) @ R  # (H, W, 3)
+        # world_view_transform[:3,:3] 存储的是相机旋转矩阵 R (cam-to-world)
+        # 法线从 world 变换到 view: n_view = n_world @ R^T
+        R = camera.world_view_transform[:3, :3].to(device)  # (3, 3) cam-to-world rotation
+        rendered_normal_view = rendered_normal.permute(1, 2, 0) @ R.T  # (H, W, 3) world-to-view
         rendered_normal_view = F.normalize(rendered_normal_view, dim=-1)  # 归一化
         rendered_normal_view = rendered_normal_view.permute(2, 0, 1)  # (3, H, W)
 
