@@ -18,7 +18,7 @@ import numpy as np
 import torch.nn.functional as F
 
 # [SEED] 设置随机种子，保证可复现性
-SEED = 72
+SEED = 52
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
@@ -160,8 +160,8 @@ args.lambda_dist = 0.0
 args.lambda_sh = 0.0
 
 # [SDF-MODIFICATION] Eikonal 和 Curvature Loss 设置（参考 Neuralangelo）
-args.lambda_eikonal = 0.1       # Eikonal loss 权重
-args.lambda_curvature = 5e-4   # Curvature loss 权重
+args.lambda_eikonal = 0.0 #0.1       # Eikonal loss 权重
+args.lambda_curvature = 0.0 #5e-4   # Curvature loss 权重
 args.gradient_mode = "numerical"  # "analytical" 或 "numerical"
 args.gradient_taps = 4            # 数值梯度采样点数：4 或 6
 args.gradient_eps = 1e-3          # 数值梯度步长
@@ -170,15 +170,17 @@ args.gradient_eps = 1e-3          # 数值梯度步长
 args.lambda_mesh_normal = 0.0   # mesh normal loss 权重
 args.lambda_mesh_depth = 0.0     # mesh depth loss 权重
 args.lambda_mesh_occupancy = 0.0 # surface occupancy loss 权重
-args.mesh_depth_scale = 0.1      # depth loss 的 scale 参数 (如果为None则使用scene_scaling)
-args.mesh_depth_ratio = 0.5      # MILo: median深度的混合比例 (0.0=仅期望深度, 1.0=仅中位深度)
-args.mesh_normal_start = 10001     # 开始使用 mesh normal loss 的迭代
+args.mesh_depth_scale = None     # depth loss 的 scale 参数 (None则使用spatial_lr_scale)
+args.mesh_depth_ratio = 1.0      # MILo: median深度的混合比例 (0.0=仅期望深度, 1.0=仅中位深度)
+args.mesh_normal_start = 8001     # 开始使用 mesh normal loss 的迭代
 args.mesh_normal_stop = 18000     # 停止使用 mesh normal loss 的迭代
 args.mesh_sdf_threshold = 0.0     # mesh 提取的 SDF 阈值
 
 # [DEPTH-NORMAL-LOSS] 深度推导法线与渲染法线一致性 Loss（参考 MILo）
 args.lambda_normal_depth = 0.0      # 渲染的normal vs 期望深度推导的normal
 args.lambda_normal_depth_med = 0.0  # 渲染的normal vs 中位深度推导的normal
+args.normal_depth_start = 8001         # 开始使用 normal-depth loss 的迭代
+args.normal_depth_end = 30000       # 停止使用 normal-depth loss 的迭代
 
 # [MASK-LOSS] Mask Loss 和 Transmittance Concentration Loss（参考 SVRaster）
 args.lambda_mask = 0.0              # mask loss 权重：约束 T 与 GT mask 对齐
@@ -227,6 +229,13 @@ args.output_path.mkdir(exist_ok=True, parents=True)
 
 train_cameras, test_cameras, scene_info = loader.load_dataset(
     args.dataset_path, args.image_folder, data_device=args.data_device, eval=args.eval, resolution=args.resolution)
+
+# [MILo] 计算 spatial_lr_scale（MILo 风格：相机阵列半径 × 1.1）
+cam_centers = torch.stack([c.camera_center.reshape(3) for c in train_cameras], dim=0)
+avg_cam_center = cam_centers.mean(dim=0, keepdim=True)
+cam_dists = torch.norm(cam_centers - avg_cam_center, dim=1)
+spatial_lr_scale = float(cam_dists.max() * 1.1)
+print(f"[MILo] spatial_lr_scale: {spatial_lr_scale:.4f}")
 
 np.savetxt(str(args.output_path / "transform.txt"), scene_info.transform)
 
@@ -381,7 +390,7 @@ for iteration in progress_bar:
             camera=camera,
             gaussian_depth=gaussian_depth,
             gaussian_depth_med=gaussian_depth_med,  # MILo: 中位深度用于混合
-            scene_scaling=model.scene_scaling,      # MILo: 使用scene_scaling作为depth scale
+            spatial_lr_scale=spatial_lr_scale,      # MILo: 使用spatial_lr_scale作为depth scale
             iteration=iteration,
             gt_mask=gt_mask,  # 传入GT alpha mask，排除背景散乱法线
         )
@@ -391,7 +400,12 @@ for iteration in progress_bar:
     # [DEPTH-NORMAL-LOSS] 深度推导法线与渲染法线一致性 Loss
     normal_depth_loss = torch.tensor(0.0, device=device)
     normal_depth_med_loss = torch.tensor(0.0, device=device)
-    if args.lambda_normal_depth > 0 or args.lambda_normal_depth_med > 0:
+    normal_depth_active = (
+        (args.lambda_normal_depth > 0 or args.lambda_normal_depth_med > 0)
+        and iteration >= args.normal_depth_start
+        and iteration < args.normal_depth_end
+    )
+    if normal_depth_active:
         rendered_normal = render_pkg['normal']  # (3, H, W) 世界坐标系
 
         # [COORD-FIX] 将渲染法线从世界空间变换到相机空间（仿 MILo）
@@ -628,7 +642,7 @@ for iteration in progress_bar:
                     camera=sample_camera,
                     gaussian_depth=render_pkg['depth'],
                     gaussian_depth_med=render_pkg['depth_med'],  # MILo: 中位深度
-                    scene_scaling=model.scene_scaling,           # MILo: scene_scaling
+                    spatial_lr_scale=spatial_lr_scale,           # MILo: spatial_lr_scale
                     iteration=iteration,
                     gt_mask=sample_gt_mask,
                 )

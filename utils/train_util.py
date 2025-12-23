@@ -1,5 +1,6 @@
 import math
 import torch
+import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 from data.camera import Camera
@@ -72,10 +73,14 @@ def render(camera: Camera, model, cell_values=None, tile_size=16, min_t=0.1,
     total_density = (distortion_img[:, :, 2]**2).clip(min=1e-6)
     distortion_loss = (((distortion_img[:, :, 0] - distortion_img[:, :, 1]) + distortion_img[:, :, 4]) / total_density).clip(min=0)
 
+    # [NORMAL-NORMALIZE] 对渲染的 normal 做归一化（仿 MILo gaussian_renderer/gof.py:100-101）
+    rendered_normal = normal_img.permute(2,0,1)  # (3, H, W)
+    rendered_normal = F.normalize(rendered_normal, p=2, dim=0)  # 沿通道维度归一化
+
     render_pkg = {
         'render': image_rgb.permute(2,0,1)[:3, ...] * camera.gt_alpha_mask.to(device),
         'alpha': alpha,
-        'normal': normal_img.permute(2,0,1),  # [NORMAL-OUTPUT] (3, H, W)
+        'normal': rendered_normal,  # [NORMAL-OUTPUT] (3, H, W) 已归一化
         'depth': depth_img,  # [DEPTH-OUTPUT] (H, W) 期望深度
         'depth_med': depth_med_img,  # [DEPTH-MED] (H, W) 中位深度
         'distortion_loss': distortion_loss.mean(),

@@ -247,8 +247,8 @@ class MeshRegularizer(nn.Module):
         - We only care about plane alignment, not normal direction
 
         Args:
-            mesh_normal: (H, W, 3) mesh normals in view space
-            gaussian_normal: (3, H, W) or (H, W, 3) Gaussian normals in view space
+            mesh_normal: (H, W, 3) mesh normals in view space (already normalized from face_normals)
+            gaussian_normal: (3, H, W) or (H, W, 3) Gaussian normals in view space (already normalized from render)
             mask: Optional (H, W) boolean mask for valid pixels
 
         Returns:
@@ -258,9 +258,10 @@ class MeshRegularizer(nn.Module):
         if gaussian_normal.shape[0] == 3:
             gaussian_normal = gaussian_normal.permute(1, 2, 0)
 
-        # Normalize both normals
-        mesh_normal = F.normalize(mesh_normal, dim=-1)
-        gaussian_normal = F.normalize(gaussian_normal, dim=-1)
+        # MILo 风格：不在 loss 计算时做 normalize
+        # mesh_normal 已在 face_normals 属性中归一化
+        # gaussian_normal 已在 render 函数中归一化
+        # 直接计算点积
 
         # Compute dot product
         dot_product = (mesh_normal * gaussian_normal).sum(dim=-1)  # (H, W)
@@ -419,7 +420,7 @@ class MeshRegularizer(nn.Module):
         camera,
         gaussian_depth: torch.Tensor,
         gaussian_depth_med: torch.Tensor = None,  # MILo: median depth for mixing
-        scene_scaling: float = None,  # MILo: use scene_scaling as depth loss scale
+        spatial_lr_scale: float = None,  # MILo: spatial_lr_scale for depth loss
         iteration: int = None,
         gt_mask: torch.Tensor = None,  # GT alpha mask，排除背景散乱法线
     ) -> dict:
@@ -430,7 +431,7 @@ class MeshRegularizer(nn.Module):
             camera: Camera object for rendering
             gaussian_depth: (H, W) expected depth from Gaussian rendering
             gaussian_depth_med: (H, W) median depth from Gaussian rendering (MILo style)
-            scene_scaling: Scene scaling factor, used as depth loss scale if provided
+            spatial_lr_scale: MILo-style spatial scale for depth loss (camera radius * 1.1)
             iteration: Current training iteration (for scheduling)
             gt_mask: (H, W) or (1, H, W) GT alpha mask，背景为0前景为1
 
@@ -502,10 +503,10 @@ class MeshRegularizer(nn.Module):
             result['normal_loss_raw'] = normal_loss
             total_loss = total_loss + self.normal_weight * normal_loss
 
-        # 2. Depth consistency loss (MILo style: with depth mixing and scene_scaling)
+        # 2. Depth consistency loss (MILo style: with depth mixing and spatial_lr_scale)
         if self.depth_weight > 0:
-            # Use scene_scaling as scale if provided, otherwise use self.depth_scale
-            depth_scale = scene_scaling if scene_scaling is not None else self.depth_scale
+            # Use spatial_lr_scale if provided, otherwise use self.depth_scale
+            depth_scale = spatial_lr_scale if spatial_lr_scale is not None else self.depth_scale
             depth_loss = self.compute_depth_loss(
                 mesh_depth, gaussian_depth, gaussian_depth_med,
                 mask=combined_mask, scale=depth_scale
