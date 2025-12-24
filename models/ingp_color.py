@@ -121,7 +121,7 @@ class iNGPDW(nn.Module):
                  sdf_bias=0.5,  # [SDF-MODIFICATION] SDF初始偏移，控制初始球体半径
                  sdf_inside_out=False,  # [SDF-MODIFICATION] 是否反转SDF内外
                  # [SDF-MODIFICATION] NeuS s_var 参数 (参考 Neuralangelo)
-                 s_var_init=3.0,  # 初始值 (存储的是 log(inv_s)，较大=较模糊表面)
+                 s_var_init=1.4,  # 初始值 (存储的是 log(inv_s)，1.4 对应 inv_s≈4.05，适合扫描数据)
                  s_var_anneal_end=0.1,  # schedule 模式的结束进度
                  s_var_learn=True,  # True: 可学习; False: 按 schedule 衰减
                  ablate_downweighing=False,
@@ -478,6 +478,8 @@ class Model(BaseModel):
     @staticmethod
     def init_from_pcd(point_cloud, cameras, device, max_sh_deg,
                       voxel_size=0.00, **kwargs):
+        sdf_sphere_radius_scale = kwargs.pop('sdf_sphere_radius_scale', 1.2)
+        init_num = kwargs.pop('init_num', 0)  # 初始点云最小数量
         torch.manual_seed(2)
 
         ccenters = torch.stack([c.camera_center.reshape(3) for c in cameras], dim=0).to(device)
@@ -504,9 +506,56 @@ class Model(BaseModel):
         vertices = torch.as_tensor(np.asarray(o3d_pcd.points)).float()
         vertices = vertices + torch.randn(*vertices.shape) * 1e-3
 
-        # add sphere
-        pcd_scaling = torch.linalg.norm(vertices - center.cpu().reshape(1, 3), dim=1, ord=2).max()
-        new_radius = pcd_scaling.cpu().item()
+        # 如果点云数量不足 init_num，通过扰动扩充
+        if init_num > 0 and vertices.shape[0] < init_num:
+            original_num = vertices.shape[0]
+            # 计算需要扩充的倍数
+            repeat_times = int(np.ceil(init_num / original_num))
+            # 复制点云并添加小扰动
+            vertices_list = [vertices]
+            for i in range(repeat_times - 1):
+                perturbed = vertices + torch.randn_like(vertices) * 1e-2
+                vertices_list.append(perturbed)
+            vertices = torch.cat(vertices_list, dim=0)
+            # 截取到 init_num
+            vertices = vertices[:init_num]
+            print(f"[Init] Expanded point cloud from {original_num} to {vertices.shape[0]} points")
+
+        # [SDF-MODIFICATION] 参考 svraster 的点云边界计算方式
+        # 使用点云中位数作为中心，基于密度启发式计算半径（排除离群点）
+        pcd_center = vertices.median(dim=0).values  # 点云中位数作为中心
+        pcd_dists = torch.linalg.norm(vertices - pcd_center, dim=1, ord=2)  # 到点云中心的距离
+
+        # 基于密度启发式找半径（参考 svraster 的 main_scene_bound_pcd_heuristic）
+        pcd_dists_sorted, _ = pcd_dists.sort()
+        pcd_density_rate = 0.1  # 密度阈值比例
+        # 计算密度: N(r) / V(r)，其中 V(r) ∝ r^3
+        valid_mask = pcd_dists_sorted > 0
+        density = torch.zeros_like(pcd_dists_sorted)
+        density[valid_mask] = (1 + torch.arange(len(pcd_dists_sorted), device=vertices.device).float()[valid_mask]) / ((2 * pcd_dists_sorted[valid_mask]) ** 3 + 1e-6)
+
+        # 至少覆盖 5% 的点
+        begin_idx = round(len(density) * 0.05)
+        # 找密度最大的位置
+        max_idx = begin_idx + density[begin_idx:].argmax().item()
+        # 找密度下降到最大值 * pcd_density_rate 的位置
+        target_density = pcd_density_rate * density[max_idx]
+        below_target = density[max_idx:] < target_density
+        if below_target.any():
+            target_idx = max_idx + torch.where(below_target)[0][0].item()
+        else:
+            target_idx = len(density) - 1
+
+        pcd_radius = pcd_dists_sorted[target_idx]
+        new_radius = pcd_radius.cpu().item()
+
+        # 计算 sdf_bias（网络输入空间中的球体半径）
+        # 坐标变换流程: world → normalized(÷scaling) → contracted → x=(cv/2+1)/2
+        sdf_bias = (pcd_radius * sdf_sphere_radius_scale / scaling / 2).item()
+        print(f"[SDF Init] Point cloud center: {pcd_center}, "
+              f"pcd_radius (density-based): {pcd_radius:.4f}, "
+              f"scene_scaling: {scaling:.4f}, "
+              f"sdf_bias (network space): {sdf_bias:.4f}")
 
         # vertices = sample_uniform_in_sphere(10000, 3, base_radius=0, radius=new_radius, device='cpu') + center.reshape(1, 3).cpu()
 
@@ -521,6 +570,9 @@ class Model(BaseModel):
         # within_sphere = sample_uniform_in_sphere(10000, 3, base_radius=new_radius, radius=new_radius, device='cpu') + center.reshape(1, 3).cpu()
         # vertices = torch.cat([vertices, within_sphere], dim=0)
 
+        # 外部球面点（保持原始逻辑）：以相机中心为圆心，半径为点云到相机中心的最大距离
+        pcd_scaling = torch.linalg.norm(vertices - center.cpu().reshape(1, 3), dim=1, ord=2).max()
+        new_radius = pcd_scaling.cpu().item()
         num_ext = 1000
         ext_vertices = fibonacci_spiral_on_sphere(num_ext, new_radius, device='cpu') + center.reshape(1, 3).cpu()
         num_ext = ext_vertices.shape[0]
@@ -536,7 +588,7 @@ class Model(BaseModel):
         # ext_vertices = torch.empty((0, 3))
 
         model = Model(vertices.cuda(), ext_vertices, center, scaling,
-                      max_sh_deg=max_sh_deg, **kwargs)
+                      max_sh_deg=max_sh_deg, sdf_bias=sdf_bias, **kwargs)
         return model
 
     @staticmethod
@@ -925,7 +977,8 @@ class TetOptimizer:
             {"params": model.backbone.encoding.parameters(), "lr": encoding_lr, "name": "encoding"},
         ], ignore_param_list=["encoding", "network"], betas=[0.9, 0.999], eps=1e-15)
 
-        self.net_optim = optim.CustomAdam([
+        # [SDF-MODIFICATION] 构建优化器参数组（根据 s_var_learn 决定是否包含 s_var）
+        net_param_groups = [
             # [SDF-MODIFICATION] sdf_net 优化器配置 (通过density_net别名访问)
             # [DENSITY-RELATED] 保留name="density"以兼容现有代码
             {"params": model.backbone.sdf_net.parameters(),   "lr": network_lr,  "name": "sdf"},
@@ -933,7 +986,12 @@ class TetOptimizer:
             # {"params": model.backbone.density_color_net.parameters(),     "lr": network_lr,    "name": "color"},
             {"params": model.backbone.gradient_net.parameters(),  "lr": network_lr, "name": "gradient"},
             {"params": model.backbone.sh_net.parameters(),        "lr": network_lr,       "name": "sh"},
-        ], ignore_param_list=[], betas=[0.9, 0.999], eps=1e-15)
+        ]
+        # [SDF-MODIFICATION] 如果 s_var 是可学习参数，添加到优化器
+        if model.backbone.s_var_learn:
+            net_param_groups.append({"params": [model.backbone.s_var], "lr": network_lr, "name": "s_var"})
+
+        self.net_optim = optim.CustomAdam(net_param_groups, ignore_param_list=[], betas=[0.9, 0.999], eps=1e-15)
         self.vert_lr_multi = float(model.scene_scaling.cpu())
         self.vertex_optim = optim.CustomAdam([
             {"params": [model.contracted_vertices], "lr": self.vert_lr_multi*vertices_lr, "name": "contracted_vertices"},

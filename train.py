@@ -110,7 +110,7 @@ args.image_folder = "images_2"
 args.eval = False
 args.dataset_path = Path("/optane/nerf_datasets/360/bonsai")
 args.output_path = Path("output/test/")
-args.iterations = 30000
+args.iterations = 18000
 args.ckpt = ""
 args.resolution = 1
 args.render_train = False
@@ -162,13 +162,14 @@ args.lambda_sh = 0.0
 # [SDF-MODIFICATION] Eikonal 和 Curvature Loss 设置（参考 Neuralangelo）
 args.lambda_eikonal = 0.0 #0.1       # Eikonal loss 权重
 args.lambda_curvature = 0.0 #5e-4   # Curvature loss 权重
-args.eikonal_start = 5001            # 开始使用 eikonal loss 的迭代
+args.eikonal_start = 0            # 开始使用 eikonal loss 的迭代
 args.eikonal_end = 30000          # 停止使用 eikonal loss 的迭代
-args.curvature_start = 5001         # 开始使用 curvature loss 的迭代
+args.curvature_start = 0         # 开始使用 curvature loss 的迭代
 args.curvature_end = 30000        # 停止使用 curvature loss 的迭代
 args.gradient_mode = "numerical"  # "analytical" 或 "numerical"
 args.gradient_taps = 4            # 数值梯度采样点数：4 或 6
 args.gradient_eps = 1e-3          # 数值梯度步长
+args.num_eikonal_samples = 200000  # Eikonal loss 采样点数（选择 |SDF| 最小的点）
 
 # [MESH-NORMAL-LOSS] Mesh 法线一致性 Loss 设置（参考 MILo）
 args.lambda_mesh_normal = 0.0   # mesh normal loss 权重
@@ -206,6 +207,13 @@ args.total_thresh = 2.0
 args.clone_min_contrib = 0.003
 args.split_min_contrib = 0.01
 
+# [SDF-DENSIFY] SDF 导向的分裂策略
+args.sdf_densify_enabled = False    # 是否启用 SDF 导向的分裂
+args.sdf_densify_threshold = 0.02     # |SDF| < 此值认为接近表面
+args.sdf_densify_radius_thresh = 0.05 # 外接圆半径 > 此值认为需要细分
+args.sdf_densify_start = 5000         # 开始使用 SDF 分裂的迭代数
+args.sdf_densify_weight = 0.3         # SDF 分裂在总预算中的权重 (0.3 = 30%)
+
 args.lambda_ssim = 0.2
 args.min_t = 0.4
 args.sample_cam = 8
@@ -217,6 +225,8 @@ args.alpha_threshold = 0.1
 args.contrib_threshold = 0.0
 args.threshold_start = 4500
 args.voxel_size = 0.01
+args.sdf_sphere_radius_scale = 1.2  # SDF球形初始化：点云半径 × scale / scene_scaling
+args.init_num = 100000  # 初始点云最小数量，不足则通过扰动扩充
 
 args.ablate_gradient = False
 args.ablate_circumsphere = True
@@ -370,9 +380,26 @@ for iteration in progress_bar:
     eikonal_active = args.lambda_eikonal > 0 and args.eikonal_start <= iteration < args.eikonal_end
     curvature_active = args.lambda_curvature > 0 and args.curvature_start <= iteration < args.curvature_end
     if eikonal_active or curvature_active:
-        # 只在活跃顶点（属于未被裁剪四面体的顶点）上计算 SDF 梯度
+        # 获取活跃顶点
+        active_verts = model.active_vertices  # (N, 3)
+
+        # 采样策略：选择 |SDF| 最小的点（离表面最近）
+        num_samples = min(args.num_eikonal_samples, active_verts.shape[0])
+        if num_samples < active_verts.shape[0]:
+            with torch.no_grad():
+                active_sdf = model.query_vert_sdf(active_verts)  # (N,)
+                # 使用 quantile 比 topk 更快：O(n) vs O(n log k)
+                keep_ratio = num_samples / active_verts.shape[0]
+                sdf_abs = active_sdf.abs()
+                threshold = sdf_abs.quantile(keep_ratio)
+                mask = sdf_abs <= threshold
+            sampled_points = active_verts[mask]
+        else:
+            sampled_points = active_verts
+
+        # 在采样点上计算 SDF 梯度
         _, gradients, hessian_diag = model.compute_sdf_gradients(
-            points=model.active_vertices,
+            points=sampled_points,
             mode=args.gradient_mode,
             taps=args.gradient_taps,
             eps=args.gradient_eps
@@ -548,11 +575,16 @@ for iteration in progress_bar:
 
     disp_ind = max(len(psnrs)-2, 0)
     avg_psnr = sum(psnrs[disp_ind]) / max(len(psnrs[disp_ind]), 1)
+
+    # 获取 inv_s 的值（NeuS 的 SDF->density 锐度参数）
+    inv_s_value = model.backbone.inv_s.item() if hasattr(model.backbone, 'inv_s') else 0.0
+
     postfix_dict = {
         "PSNR": repr(f"{psnr:>5.2f}"),
         "Mean": repr(f"{avg_psnr:>5.2f}"),
         "#V": len(model),
         "#T": model.indices.shape[0],
+        "inv_s": repr(f"{inv_s_value:.1f}"),  # 添加 inv_s 输出
         "Eik": repr(f"{eik_loss.item():.3f}"),
         "Curv": repr(f"{curv_loss.item():.1e}"),
     }
@@ -701,6 +733,57 @@ for iteration in progress_bar:
                 mesh_path = mesh_save_dir / f"mesh_{iteration:06d}.ply"
                 save_mesh_as_ply(str(mesh_path), mesh)
                 print(f"[Mesh] Saved mesh at iter {iteration}: {mesh_verts.shape[0]} verts, {mesh_faces.shape[0]} faces")
+
+                # 渲染mesh的深度和法线并保存
+                from utils.mesh_extraction import render_mesh
+                try:
+                    render_output = render_mesh(
+                        mesh, sample_camera,
+                        return_depth=True,
+                        return_normals=True,
+                        use_opengl=True
+                    )
+
+                    # 1. Mesh深度图
+                    mesh_depth = render_output['depth']  # (H, W)
+                    mesh_depth_np = mesh_depth.detach().cpu().numpy()
+                    valid_mask_mesh = (mesh_depth_np > 0) & (mesh_depth_np < 1e6)
+                    if valid_mask_mesh.any():
+                        md_min, md_max = mesh_depth_np[valid_mask_mesh].min(), mesh_depth_np[valid_mask_mesh].max()
+                        mesh_depth_norm = (mesh_depth_np - md_min) / (md_max - md_min + 1e-8)
+                    else:
+                        mesh_depth_norm = np.zeros_like(mesh_depth_np)
+                    mesh_depth_norm = np.where(valid_mask_mesh, mesh_depth_norm, 0)
+                    mesh_depth_vis = (plt.cm.turbo(mesh_depth_norm)[:, :, :3] * 255).astype(np.uint8)
+
+                    # 2. Mesh法线图
+                    mesh_normal = render_output['normals']  # (H, W, 3) 相机空间
+                    mesh_normal_vis = ((1 - mesh_normal.detach().cpu().numpy()) / 2 * 255).clip(0, 255).astype(np.uint8)
+
+                    # 3. 深度转法线图
+                    mesh_depth_normal = depth_to_normal(sample_camera, mesh_depth)  # (3, H, W)
+                    mesh_depth_normal_vis = ((1 - mesh_depth_normal.permute(1, 2, 0).detach().cpu().numpy()) / 2 * 255).clip(0, 255).astype(np.uint8)
+
+                    # 整合成 1x3 网格图: Mesh Normal | Mesh Depth | Mesh Depth->Normal
+                    H, W = mesh_normal_vis.shape[:2]
+                    combined_mesh = np.zeros((H, W * 3, 3), dtype=np.uint8)
+                    combined_mesh[:, :W] = mesh_normal_vis           # 左: Mesh Normal
+                    combined_mesh[:, W:2*W] = mesh_depth_vis         # 中: Mesh Depth
+                    combined_mesh[:, 2*W:] = mesh_depth_normal_vis   # 右: Mesh Depth->Normal
+
+                    # 添加标签
+                    font = cv2.FONT_HERSHEY_SIMPLEX
+                    font_scale, thickness = 0.6, 2
+                    cv2.putText(combined_mesh, 'Mesh Normal', (10, 25), font, font_scale, (255, 255, 255), thickness)
+                    cv2.putText(combined_mesh, 'Mesh Depth', (W + 10, 25), font, font_scale, (255, 255, 255), thickness)
+                    cv2.putText(combined_mesh, 'Mesh D->N', (2*W + 10, 25), font, font_scale, (255, 255, 255), thickness)
+
+                    # 保存mesh渲染图
+                    mesh_render_path = mesh_save_dir / f"mesh_render_{iteration:06d}.png"
+                    imageio.imwrite(str(mesh_render_path), combined_mesh)
+                    print(f"[Mesh] Saved mesh renders at iter {iteration}")
+                except Exception as e:
+                    print(f"[Mesh] Failed to render mesh at iter {iteration}: {e}")
 
 avged_psnrs = [sum(v)/len(v) for v in psnrs if len(v) == len(train_cameras)]
 video_writer.release()

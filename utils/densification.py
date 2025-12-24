@@ -322,14 +322,71 @@ def apply_densification(
 
     within_mask = (within_var > args.within_thresh)
     total_mask = (total_var > args.total_thresh)
-    clone_mask = within_mask | total_mask
+    error_driven_mask = within_mask | total_mask
+
+    # [SDF-DENSIFY] 基于 SDF 的分裂策略：接近表面且尺寸过大的四面体
+    sdf_driven_mask = torch.zeros_like(error_driven_mask, dtype=torch.bool)
+    sdf_split_count = 0
+
+    if (hasattr(args, 'sdf_densify_enabled') and args.sdf_densify_enabled
+        and iteration >= getattr(args, 'sdf_densify_start', 5000)):
+        # 计算每个四面体的外接圆半径
+        tet_vertices = model.vertices[model.indices]  # (N_tets, 4, 3)
+        from utils.topo_utils import calculate_circumcenters_torch
+        _, circumradii = calculate_circumcenters_torch(tet_vertices.double())  # (N_tets,)
+        circumradii = circumradii.float().squeeze(-1) if circumradii.dim() > 1 else circumradii.float()
+
+        # 获取每个四面体的顶点 SDF
+        vert_sdf = model.query_vert_sdf()  # (N_verts,)
+        tet_sdf = vert_sdf[model.indices]  # (N_tets, 4)
+
+        # 判断是否接近表面：四面体中至少有一个顶点接近表面
+        min_abs_sdf = tet_sdf.abs().min(dim=1).values  # (N_tets,)
+
+        # SDF 分裂条件：接近表面 且 尺寸过大
+        sdf_threshold = getattr(args, 'sdf_densify_threshold', 0.02)
+        radius_threshold = getattr(args, 'sdf_densify_radius_thresh', 0.05)
+        sdf_driven_mask = (min_abs_sdf < sdf_threshold) & (circumradii > radius_threshold)
+
+        # 排除已经被误差驱动分裂选中的（避免重复）
+        sdf_driven_mask = sdf_driven_mask & (~error_driven_mask)
+
+        sdf_split_count = sdf_driven_mask.sum().item()
+
+    # 合并两种分裂策略
+    clone_mask = error_driven_mask | sdf_driven_mask
+
+    # 如果候选数量超过预算，分配预算：优先误差驱动，剩余给SDF驱动
     if clone_mask.sum() > target_addition:
-        true_indices = clone_mask.nonzero().squeeze(-1)
-        perm = torch.randperm(true_indices.size(0))
-        selected_indices = true_indices[perm[:target_addition]]
-        
-        clone_mask = torch.zeros_like(clone_mask, dtype=torch.bool)
-        clone_mask[selected_indices] = True
+        sdf_weight = getattr(args, 'sdf_densify_weight', 0.3)
+        target_error = int(target_addition * (1 - sdf_weight))
+        target_sdf = target_addition - target_error
+
+        # 误差驱动分裂
+        if error_driven_mask.sum() > target_error:
+            true_indices = error_driven_mask.nonzero().squeeze(-1)
+            perm = torch.randperm(true_indices.size(0))
+            selected_indices = true_indices[perm[:target_error]]
+            error_driven_mask_selected = torch.zeros_like(error_driven_mask, dtype=torch.bool)
+            error_driven_mask_selected[selected_indices] = True
+        else:
+            error_driven_mask_selected = error_driven_mask
+            target_sdf += (target_error - error_driven_mask.sum().item())  # 未用完的配额给SDF
+
+        # SDF 驱动分裂
+        if sdf_driven_mask.sum() > target_sdf:
+            true_indices = sdf_driven_mask.nonzero().squeeze(-1)
+            perm = torch.randperm(true_indices.size(0))
+            selected_indices = true_indices[perm[:target_sdf]]
+            sdf_driven_mask_selected = torch.zeros_like(sdf_driven_mask, dtype=torch.bool)
+            sdf_driven_mask_selected[selected_indices] = True
+        else:
+            sdf_driven_mask_selected = sdf_driven_mask
+
+        clone_mask = error_driven_mask_selected | sdf_driven_mask_selected
+    else:
+        # 候选数量不足预算，全部分裂
+        pass
 
     clone_indices = model.indices[clone_mask]
     split_point, bad = get_approx_ray_intersections(stats.within_var_rays)
@@ -354,7 +411,11 @@ def apply_densification(
     gc.collect()
     torch.cuda.empty_cache()
 
+    # 统计实际分裂数量
+    error_split_count = (clone_mask & error_driven_mask).sum().item()
+    sdf_split_count_actual = (clone_mask & sdf_driven_mask).sum().item()
+
     print(
-        f"#Grow: {total_mask.sum():4d} #Split: {within_mask.sum():4d} | "
-        f"Total Avg: {total_var.mean():.4f} Within Avg: {within_var.mean():.4f} "
+        f"#Grow: {total_mask.sum():4d} #Split: {within_mask.sum():4d} #SDF: {sdf_split_count_actual:4d} | "
+        f"Total Avg: {total_var.mean():.4f} Within Avg: {within_var.mean():.4f}"
     )

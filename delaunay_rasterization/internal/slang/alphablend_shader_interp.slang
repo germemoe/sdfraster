@@ -196,42 +196,40 @@ float3 undo_normal_state(float3 curr_normal, float3 ctrl_normal, float4 ctrl_rgb
     return curr_normal - ctrl_normal * alpha * T;
 }
 
-// [DEPTH-OUTPUT] Expected depth: depth += T * alpha * z_mid
-// [T-TO-Z] 使用 ray.d.z 将射线参数 t 转换为真正的 z 深度
+// [DEPTH-OUTPUT] Expected depth: depth += T * alpha * t_mid
+// [T-TO-Z-SVRASTER] 在 t 空间累加，最后写入时才乘 ray.d.z（仿 svraster）
 [Differentiable]
-float update_depth_state(float prev_depth, float4 ctrl_rgba, float2 ctrl_dist, float T, float ray_d_z) {
+float update_depth_state(float prev_depth, float4 ctrl_rgba, float2 ctrl_dist, float T) {
     float alpha = 1.0f - safe_exp(-ctrl_rgba.a);
     float t_mid = (ctrl_dist.x + ctrl_dist.y) * 0.5f;
-    float z_mid = t_mid * ray_d_z;  // [T-TO-Z] t → z 转换
-    return prev_depth + T * alpha * z_mid;
+    return prev_depth + T * alpha * t_mid;  // 累加 t 空间深度
 }
 
-float undo_depth_state(float curr_depth, float4 ctrl_rgba, float2 ctrl_dist, float T, float ray_d_z) {
+float undo_depth_state(float curr_depth, float4 ctrl_rgba, float2 ctrl_dist, float T) {
     float alpha = 1.0f - safe_exp(-ctrl_rgba.a);
     float t_mid = (ctrl_dist.x + ctrl_dist.y) * 0.5f;
-    float z_mid = t_mid * ray_d_z;  // [T-TO-Z] t → z 转换
-    return curr_depth - T * alpha * z_mid;
+    return curr_depth - T * alpha * t_mid;  // 回退 t 空间深度
 }
 
 [Differentiable]
-AlphaOut update_alpha_out(AlphaOut prev, CtrlPt ctrl, float ray_d_z) {
+AlphaOut update_alpha_out(AlphaOut prev, CtrlPt ctrl) {
     float T = safe_exp(prev.rgba.a);
     return {
         update_pixel_state(prev.rgba, ctrl.rgba),
         update_distortion_state(prev.distortion_state, T, ctrl.density, ctrl.dist),
         update_normal_state(prev.normal_state, ctrl.normal, ctrl.rgba, T),  // [NORMAL-OUTPUT]
-        update_depth_state(prev.depth_state, ctrl.rgba, ctrl.dist, T, ray_d_z)  // [DEPTH-OUTPUT] [T-TO-Z]
+        update_depth_state(prev.depth_state, ctrl.rgba, ctrl.dist, T)  // [DEPTH-OUTPUT] [T-TO-Z-SVRASTER]
     };
 }
 
-AlphaOut undo_alpha_out(AlphaOut curr, CtrlPt ctrl, float ray_d_z) {
+AlphaOut undo_alpha_out(AlphaOut curr, CtrlPt ctrl) {
     float4 pix_state = undo_pixel_state(curr.rgba, ctrl.rgba);
     float T = safe_exp(pix_state.a);
     return {
         pix_state,
         undo_distortion_state(curr.distortion_state, T, ctrl.density, ctrl.dist),
         undo_normal_state(curr.normal_state, ctrl.normal, ctrl.rgba, T),  // [NORMAL-OUTPUT]
-        undo_depth_state(curr.depth_state, ctrl.rgba, ctrl.dist, T, ray_d_z)  // [DEPTH-OUTPUT] [T-TO-Z]
+        undo_depth_state(curr.depth_state, ctrl.rgba, ctrl.dist, T)  // [DEPTH-OUTPUT] [T-TO-Z-SVRASTER]
     };
 }
 
@@ -273,7 +271,7 @@ AlphaOut alpha_blend(TensorView<int32_t> sorted_gauss_idx,
     //bool print = thread_rank == 0;
     bool print = false;
 
-    Ray ray = get_ray(cam, center_pix_coord);
+    Ray ray = no_diff get_ray(cam, center_pix_coord);  // no_diff: 此调用不需要梯度
     int exit_face;
     // if (print) {
     //     printf("ray_o: %f, %f, %f, ray_d: %f, %f, %f\n", ray.o.x, ray.o.y, ray.o.z, ray.d.x, ray.d.y, ray.d.z);
@@ -308,7 +306,7 @@ AlphaOut alpha_blend(TensorView<int32_t> sorted_gauss_idx,
                 // [SDF-MODIFICATION] 使用 read_inv_s 读取 inv_s
                 float inv_s = read_inv_s(inv_s_tensor);
                 if (evaluate_tetra_interp(g, ray.o, ray.d, cam.min_t, inv_s, tetra_ctrl) && tetra_ctrl.rgba.a > 0) {
-                    AlphaOut new_ao = update_alpha_out(ao, tetra_ctrl, ray.d.z);  // [T-TO-Z] 传递 ray.d.z
+                    AlphaOut new_ao = update_alpha_out(ao, tetra_ctrl);  // [T-TO-Z-SVRASTER] 去掉 ray.d.z
 
                     // [DEPTH-MED] 追踪中位深度：当 T 从 >0.5 变为 <=0.5 时记录
                     if (!found_med) {
@@ -316,7 +314,7 @@ AlphaOut alpha_blend(TensorView<int32_t> sorted_gauss_idx,
                         float new_T_med = T_med * (1.0f - alpha_seg);
                         if (T_med > 0.5f && new_T_med <= 0.5f) {
                             float t_mid = (tetra_ctrl.dist.x + tetra_ctrl.dist.y) * 0.5f;
-                            depth_med = t_mid * ray.d.z;  // [T-TO-Z] 中位深度也转换为 z 深度
+                            depth_med = t_mid;  // [T-TO-Z-SVRASTER] 保持 t 空间，最后才转换
                             found_med = true;
                         }
                         T_med = new_T_med;
@@ -336,8 +334,9 @@ AlphaOut alpha_blend(TensorView<int32_t> sorted_gauss_idx,
 
     if (is_inside) {
         n_contributors[uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 0)] = local_n_contrib;
-        // [DEPTH-MED] 写入中位深度
-        depth_med_img[uint2(uint32_t(pix_coord.y), uint32_t(pix_coord.x))] = depth_med;
+        // [DEPTH-MED] [T-TO-Z-SVRASTER] 写入中位深度时才除 ||d||，仿 svraster
+        float rd_norm_inv = 1.0f / length(ray.d);
+        depth_med_img[uint2(uint32_t(pix_coord.y), uint32_t(pix_coord.x))] = depth_med * rd_norm_inv;
     }
 
     return ao;
@@ -398,7 +397,7 @@ void bwd_alpha_blend(TensorView<int32_t> sorted_gauss_idx,
     }
     AlphaOut ao = {current_pixel_state, curr_distortion_state, curr_normal_state, curr_depth_state};
 
-    Ray ray = get_ray(cam, center_pix_coord);
+    Ray ray = get_ray(cam, center_pix_coord);  // 普通函数，不需要 no_diff
     int exit_face;
 
     DifferentialPair<float2> dp_center_pix_coord = diffPair(center_pix_coord);
@@ -430,7 +429,7 @@ void bwd_alpha_blend(TensorView<int32_t> sorted_gauss_idx,
 
                 CtrlPt tetra_ctrl;
                 if (evaluate_tetra_interp(g, ray.o, ray.d, cam.min_t, inv_s, tetra_ctrl) && tetra_ctrl.rgba.a > 0) {
-                    ao = undo_alpha_out(ao, tetra_ctrl, ray.d.z);  // [T-TO-Z] 传递 ray.d.z
+                    ao = undo_alpha_out(ao, tetra_ctrl);  // [T-TO-Z-SVRASTER] 去掉 ray.d.z
 
                     // Back-prop automatically through blending and gaussian evaluation.
                     DifferentialPair<SplatTetrahedra_interp> dp_g = diffPair(g);
@@ -440,10 +439,8 @@ void bwd_alpha_blend(TensorView<int32_t> sorted_gauss_idx,
                     DifferentialPair<AlphaOut> dp_ao = diffPair(ao);
                     // [SDF-MODIFICATION] 创建 inv_s 的 DifferentialPair
                     DifferentialPair<float> dp_inv_s = diffPair(inv_s, 0.0f);
-                    // [T-TO-Z] ray.d.z 不需要梯度（相机参数）
-                    DifferentialPair<float> dp_ray_d_z = diffPair(ray.d.z, 0.0f);
 
-                    bwd_diff(update_alpha_out)(dp_ao, dp_tetra_ctrl, dp_ray_d_z, d_ao);  // [T-TO-Z]
+                    bwd_diff(update_alpha_out)(dp_ao, dp_tetra_ctrl, d_ao);  // [T-TO-Z-SVRASTER] 去掉 ray.d.z
                     d_ao = dp_ao.getDifferential();
                     float midpt = tetra_ctrl.dist.x;
                     // [NORMAL-OUTPUT] 添加 normal 梯度回传
@@ -527,6 +524,11 @@ void splat_tiled(TensorView<int32_t> sorted_gauss_idx,
         tile_idx_start,
         tile_idx_end);
 
+    // [T-TO-Z-SVRASTER] 获取 ray 用于深度 t→z 转换
+    float2 center_pix_coord = {pix_coord.x+rjx, pix_coord.y+rjy};
+    Ray ray = no_diff get_ray(cam, center_pix_coord);  // no_diff: 此调用不需要梯度
+    float rd_norm_inv = 1.0f / length(ray.d);  // 仿 svraster: z = t / ||d||
+
     if (is_inside) {
       output_img.storeOnce(uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 0), pixel_states.rgba.r);
       output_img.storeOnce(uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 1), pixel_states.rgba.g);
@@ -541,8 +543,8 @@ void splat_tiled(TensorView<int32_t> sorted_gauss_idx,
       normal_img.storeOnce(uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 0), pixel_states.normal_state.x);
       normal_img.storeOnce(uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 1), pixel_states.normal_state.y);
       normal_img.storeOnce(uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 2), pixel_states.normal_state.z);
-      // [DEPTH-OUTPUT] 写入深度输出
-      depth_img.storeOnce(uint2(uint32_t(pix_coord.y), uint32_t(pix_coord.x)), pixel_states.depth_state);
+      // [DEPTH-OUTPUT] [T-TO-Z-SVRASTER] 写入深度时才除 ||d||，仿 svraster
+      depth_img.storeOnce(uint2(uint32_t(pix_coord.y), uint32_t(pix_coord.x)), pixel_states.depth_state * rd_norm_inv);
     }
 }
 
@@ -579,7 +581,7 @@ void kern_calc_tet_err(TensorView<int32_t> sorted_gauss_idx,
     const int shared_memory_rounds = ((tile_idx_end - tile_idx_start) + block_size - 1) / block_size;
     uint32_t thread_rank = cudaThreadIdx().y * cudaBlockDim().x + cudaThreadIdx().x;
 
-    Ray ray = get_ray(cam, center_pix_coord);
+    Ray ray = get_ray(cam, center_pix_coord);  // 普通函数，不需要 no_diff
     int exit_face;
 
     float max_split_alpha = 0.f;
@@ -607,7 +609,7 @@ void kern_calc_tet_err(TensorView<int32_t> sorted_gauss_idx,
                 uint32_t g_idx = collected_idx[j];
                 CtrlPt tetra_ctrl;
                 if (evaluate_tetra_interp(g, ray.o, ray.d, cam.min_t, inv_s, tetra_ctrl) && tetra_ctrl.rgba.a > 0) {
-                    AlphaOut new_ao = update_alpha_out(ao, tetra_ctrl, ray.d.z);  // [T-TO-Z]
+                    AlphaOut new_ao = update_alpha_out(ao, tetra_ctrl);  // [T-TO-Z-SVRASTER] 去掉 ray.d.z
 
                     float trans = exp(ao.rgba.a);
                     float T = trans * tetra_ctrl.rgba.a;
