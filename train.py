@@ -167,8 +167,8 @@ args.eikonal_end = 30000          # 停止使用 eikonal loss 的迭代
 args.curvature_start = 0         # 开始使用 curvature loss 的迭代
 args.curvature_end = 30000        # 停止使用 curvature loss 的迭代
 args.gradient_mode = "numerical"  # "analytical" 或 "numerical"
-args.gradient_taps = 4            # 数值梯度采样点数：4 或 6
-args.gradient_eps = 1e-3          # 数值梯度步长
+args.gradient_taps = 6            # 数值梯度采样点数：4 或 6
+args.gradient_eps = None          # 数值梯度步长，None=自动计算 (scene_scaling/resolution，参考Neuralangelo)
 args.num_eikonal_samples = 200000  # Eikonal loss 采样点数（仅在 band_threshold=None 时使用）
 args.eikonal_band_threshold = None # SDF band 阈值：仅计算 |SDF| < threshold 的顶点的 loss
                                    # 设为 None 则使用 quantile-based 采样（num_eikonal_samples）
@@ -190,7 +190,7 @@ args.normal_depth_start = 5001         # 开始使用 normal-depth loss 的迭�
 args.normal_depth_end = 30000       # 停止使用 normal-depth loss 的迭代
 
 # [MASK-LOSS] Mask Loss 和 Transmittance Concentration Loss（参考 SVRaster）
-args.lambda_mask = 0.0            # mask loss 权重：约束 T 与 GT mask 对齐
+args.lambda_mask = 0.1           # mask loss 权重：约束 T 与 GT mask 对齐
 args.mask_from = 0                  # 开始使用 mask loss 的迭代
 args.mask_until = 20000             # 停止使用 mask loss 的迭代
 args.lambda_T_concen = 0.0          # transmittance concentration loss：鼓励 T 二值化到 0 或 1
@@ -264,12 +264,20 @@ with (args.output_path / "config.json").open("w") as f:
     json.dump(args.as_dict(), f, cls=CustomEncoder)
 
 device = torch.device('cuda')
-if len(args.ckpt) > 0: 
+if len(args.ckpt) > 0:
     model = Model.load_ckpt(Path(args.ckpt), device)
 else:
     model = Model.init_from_pcd(scene_info.point_cloud, train_cameras, device,
                                 current_sh_deg = args.max_sh_deg if args.sh_interval <= 0 else 0,
                                 **args.as_dict())
+
+# [GEOMETRIC-INIT] 验证几何初始化是否成功
+# 在训练开始前检查 Eikonal loss 和 SDF 分布
+init_mesh_path = args.output_path / "init_mesh.ply"
+init_result = model.verify_geometric_init(save_mesh_path=init_mesh_path)
+if not init_result['is_success']:
+    print("[WARNING] Geometric initialization may have issues. Consider checking sdf_bias parameter.")
+
 min_t = args.min_t
 
 tet_optim = TetOptimizer(model, **args.as_dict())
@@ -386,8 +394,8 @@ for iteration in progress_bar:
     eikonal_active = args.lambda_eikonal > 0 and args.eikonal_start <= iteration < args.eikonal_end
     curvature_active = args.lambda_curvature > 0 and args.curvature_start <= iteration < args.curvature_end
     if eikonal_active or curvature_active:
-        # 获取活跃顶点
-        active_verts = model.active_vertices  # (N, 3)
+        # 获取活跃的内部顶点（排除 ext_vertices）
+        active_verts = model.active_internal_vertices  # (N, 3) 不包含 ext_vertices
 
         # 采样策略：基于 band threshold 或 quantile
         with torch.no_grad():
@@ -748,17 +756,25 @@ for iteration in progress_bar:
                 model.vertices, model.indices, vert_sdf
             )
             if mesh_faces.shape[0] > 0:
-                # 创建Meshes对象并保存
-                mesh = Meshes(mesh_verts, mesh_faces)
+                # [COORD-FIX] 将 mesh 顶点从训练坐标系变换回原始世界坐标系
+                inv_transform = np.linalg.inv(scene_info.transform)
+                verts_np = mesh_verts.cpu().numpy()
+                verts_hom = np.hstack([verts_np, np.ones((verts_np.shape[0], 1))])
+                verts_world = (inv_transform @ verts_hom.T).T[:, :3]
+                mesh_verts_world = torch.from_numpy(verts_world).float().to(mesh_verts.device)
+
+                # 保存世界坐标系的 mesh
+                mesh_world = Meshes(mesh_verts_world, mesh_faces)
                 mesh_path = mesh_save_dir / f"mesh_{iteration:06d}.ply"
-                save_mesh_as_ply(str(mesh_path), mesh)
+                save_mesh_as_ply(str(mesh_path), mesh_world)
                 print(f"[Mesh] Saved mesh at iter {iteration}: {mesh_verts.shape[0]} verts, {mesh_faces.shape[0]} faces")
 
-                # 渲染mesh的深度和法线并保存
+                # 渲染使用训练坐标系的 mesh（因为相机在训练坐标系）
+                mesh_train = Meshes(mesh_verts, mesh_faces)
                 from utils.mesh_extraction import render_mesh
                 try:
                     render_output = render_mesh(
-                        mesh, sample_camera,
+                        mesh_train, sample_camera,
                         return_depth=True,
                         return_normals=True,
                         use_opengl=True
@@ -860,10 +876,19 @@ with torch.no_grad():
         model.vertices, model.indices, vert_sdf
     )
     if final_mesh_faces.shape[0] > 0:
-        final_mesh = Meshes(final_mesh_verts, final_mesh_faces)
+        # [COORD-FIX] 将 mesh 顶点从训练坐标系变换回原始世界坐标系
+        # 训练时做了 PCA 变换: 原始坐标 → pca_transform → 训练坐标
+        # 现在需要逆变换: 训练坐标 → inv(pca_transform) → 原始坐标
+        inv_transform = np.linalg.inv(scene_info.transform)
+        verts_np = final_mesh_verts.cpu().numpy()
+        verts_hom = np.hstack([verts_np, np.ones((verts_np.shape[0], 1))])
+        verts_world = (inv_transform @ verts_hom.T).T[:, :3]
+        final_mesh_verts_world = torch.from_numpy(verts_world).float().to(final_mesh_verts.device)
+
+        final_mesh = Meshes(final_mesh_verts_world, final_mesh_faces)
         final_mesh_path = args.output_path / "final_mesh.ply"
         save_mesh_as_ply(str(final_mesh_path), final_mesh)
-        print(f"[Mesh] Saved final mesh: {final_mesh_verts.shape[0]} verts, {final_mesh_faces.shape[0]} faces")
+        print(f"[Mesh] Saved final mesh: {final_mesh_verts.shape[0]} verts, {final_mesh_faces.shape[0]} faces (transformed to world coords)")
 
         # [DTU-EVAL] DTU 评估（参考 svraster）
         if args.eval_dtu:
@@ -884,6 +909,7 @@ with torch.no_grad():
                     '--output_dir', eval_outdir,
                     '--mask_dir', dataset_root,
                     '--DTU', dataset_root,
+                    # 默认不做 scale_mat 变换（mesh 已在世界坐标系）
                 ]
                 print('[EVAL-DTU] mesh eval cmd:', ' '.join(cmd))
                 subprocess.run(cmd, check=False)
