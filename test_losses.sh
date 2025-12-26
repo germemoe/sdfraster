@@ -8,7 +8,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 DATASET_PATH="/home/jk/data/dataset/DTU/scan37"
 IMAGE_FOLDER="images"
-OUTPUT_BASE="output/sdf/DTU/test"
+OUTPUT_BASE="output/sdf/DTU/newnew"
 
 # 基础命令
 BASE_CMD="uv run train.py --dataset_path ${DATASET_PATH} --image_folder ${IMAGE_FOLDER}"
@@ -17,19 +17,19 @@ echo "=========================================="
 echo "开始 Loss 测试实验（并行）"
 echo "=========================================="
 
-# 1. Eikonal Loss (GPU 0)
-echo "[1/8] Eikonal Loss (GPU 0)"
-CUDA_VISIBLE_DEVICES=0 $BASE_CMD --output_path ${OUTPUT_BASE}/eikonal \
-    --lambda_eikonal 0.1 &
+# # 1. Eikonal Loss (GPU 0)
+# echo "[1/8] Eikonal Loss (GPU 0)"
+# CUDA_VISIBLE_DEVICES=0 $BASE_CMD --output_path ${OUTPUT_BASE}/eikonal \
+#     --lambda_eikonal 0.1 &
 
 # # 2. Curvature Loss (GPU 1)
 # echo "[2/8] Curvature Loss (GPU 1)"
 # CUDA_VISIBLE_DEVICES=1 $BASE_CMD --output_path ${OUTPUT_BASE}/curvature \
-#     --lambda_curvature 5e-4 &
+#     --lambda_curvature 5e-6 &
 
 # 3. Mesh Normal Loss (GPU 2)
 echo "[3/8] Mesh Normal Loss (GPU 2)"
-CUDA_VISIBLE_DEVICES=2 $BASE_CMD --output_path ${OUTPUT_BASE}/mesh_normal \
+CUDA_VISIBLE_DEVICES=1 $BASE_CMD --output_path ${OUTPUT_BASE}/mesh_normaldexp \
     --lambda_mesh_normal 0.05 \
     --mesh_normal_start 5000 &
 
@@ -37,28 +37,28 @@ CUDA_VISIBLE_DEVICES=2 $BASE_CMD --output_path ${OUTPUT_BASE}/mesh_normal \
 echo "[4/8] Mesh Depth Loss (GPU 3)"
 CUDA_VISIBLE_DEVICES=3 $BASE_CMD --output_path ${OUTPUT_BASE}/mesh_depth \
     --lambda_mesh_depth 0.1 \
-    --mesh_normal_start 5000 &
+    --mesh_normal_start 5000 
 
 # 5. Normal-Depth Consistency Loss (GPU 4)
 echo "[5/8] Normal-Depth Consistency Loss (GPU 4)"
-CUDA_VISIBLE_DEVICES=4 $BASE_CMD --output_path ${OUTPUT_BASE}/normal_depth \
+CUDA_VISIBLE_DEVICES=1 $BASE_CMD --output_path ${OUTPUT_BASE}/normal_depth \
     --lambda_normal_depth 0.05 &
 
-# # 6. Normal-Depth Median Consistency Loss (GPU 5)
-# echo "[6/8] Normal-Depth Median Consistency Loss (GPU 5)"
-# CUDA_VISIBLE_DEVICES=5 $BASE_CMD --output_path ${OUTPUT_BASE}/normal_depth_med \
-#     --lambda_normal_depth_med 0.05 &
+# 6. Normal-Depth Median Consistency Loss (GPU 5)
+echo "[6/8] Normal-Depth Median Consistency Loss (GPU 5)"
+CUDA_VISIBLE_DEVICES=3 $BASE_CMD --output_path ${OUTPUT_BASE}/normal_depth_med \
+    --lambda_normal_depth_med 0.05 
 
 # 7. Mask Loss (GPU 6)
 echo "[7/8] Mask Loss (GPU 6)"
-CUDA_VISIBLE_DEVICES=6 $BASE_CMD --output_path ${OUTPUT_BASE}/mask \
+CUDA_VISIBLE_DEVICES=1 $BASE_CMD --output_path ${OUTPUT_BASE}/mask \
     --lambda_mask 0.1 \
     --mask_from 0 \
     --mask_until 20000 &
 
 # 8. T Concentration Loss (GPU 7)
 echo "[8/8] T Concentration Loss (GPU 7)"
-CUDA_VISIBLE_DEVICES=7 $BASE_CMD --output_path ${OUTPUT_BASE}/T_concen \
+CUDA_VISIBLE_DEVICES=3 $BASE_CMD --output_path ${OUTPUT_BASE}/T_concen \
     --lambda_T_concen 0.01 &
 
 echo ""

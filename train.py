@@ -169,7 +169,9 @@ args.curvature_end = 30000        # 停止使用 curvature loss 的迭代
 args.gradient_mode = "numerical"  # "analytical" 或 "numerical"
 args.gradient_taps = 4            # 数值梯度采样点数：4 或 6
 args.gradient_eps = 1e-3          # 数值梯度步长
-args.num_eikonal_samples = 200000  # Eikonal loss 采样点数（选择 |SDF| 最小的点）
+args.num_eikonal_samples = 200000  # Eikonal loss 采样点数（仅在 band_threshold=None 时使用）
+args.eikonal_band_threshold = None # SDF band 阈值：仅计算 |SDF| < threshold 的顶点的 loss
+                                   # 设为 None 则使用 quantile-based 采样（num_eikonal_samples）
 
 # [MESH-NORMAL-LOSS] Mesh 法线一致性 Loss 设置（参考 MILo）
 args.lambda_mesh_normal = 0.0   # mesh normal loss 权重
@@ -188,7 +190,7 @@ args.normal_depth_start = 5001         # 开始使用 normal-depth loss 的迭�
 args.normal_depth_end = 30000       # 停止使用 normal-depth loss 的迭代
 
 # [MASK-LOSS] Mask Loss 和 Transmittance Concentration Loss（参考 SVRaster）
-args.lambda_mask = 0.0              # mask loss 权重：约束 T 与 GT mask 对齐
+args.lambda_mask = 0.0            # mask loss 权重：约束 T 与 GT mask 对齐
 args.mask_from = 0                  # 开始使用 mask loss 的迭代
 args.mask_until = 20000             # 停止使用 mask loss 的迭代
 args.lambda_T_concen = 0.0          # transmittance concentration loss：鼓励 T 二值化到 0 或 1
@@ -226,7 +228,7 @@ args.contrib_threshold = 0.0
 args.threshold_start = 4500
 args.voxel_size = 0.01
 args.sdf_sphere_radius_scale = 1.2  # SDF球形初始化：点云半径 × scale / scene_scaling
-args.init_num = 100000  # 初始点云最小数量，不足则通过扰动扩充
+args.init_num = 0  # 初始点云最小数量，不足则通过扰动扩充
 
 args.ablate_gradient = False
 args.ablate_circumsphere = True
@@ -235,6 +237,9 @@ args.ablate_downweighing = False
 # 渲染图保存设置
 args.save_render_interval = 500  # 每k次迭代保存渲染图，0表示不保存
 args.save_mesh_interval = 1000   # 每k次迭代用MT提取mesh并保存，0表示不保存
+
+# [MESH-EVAL] DTU Mesh 评估设置（参考 svraster）
+args.eval_dtu = True            # 是否进行 DTU 评估
 
 
 args = Args.from_namespace(args.get_parser().parse_args())
@@ -376,6 +381,7 @@ for iteration in progress_bar:
     # [SDF-MODIFICATION] Eikonal 和 Curvature Loss
     eik_loss = torch.tensor(0.0, device=device)
     curv_loss = torch.tensor(0.0, device=device)
+    eik_num_samples = 0  # 追踪 band 内的采样点数
     # 检查迭代范围
     eikonal_active = args.lambda_eikonal > 0 and args.eikonal_start <= iteration < args.eikonal_end
     curvature_active = args.lambda_curvature > 0 and args.curvature_start <= iteration < args.curvature_end
@@ -383,31 +389,40 @@ for iteration in progress_bar:
         # 获取活跃顶点
         active_verts = model.active_vertices  # (N, 3)
 
-        # 采样策略：选择 |SDF| 最小的点（离表面最近）
-        num_samples = min(args.num_eikonal_samples, active_verts.shape[0])
-        if num_samples < active_verts.shape[0]:
-            with torch.no_grad():
-                active_sdf = model.query_vert_sdf(active_verts)  # (N,)
-                # 使用 quantile 比 topk 更快：O(n) vs O(n log k)
-                keep_ratio = num_samples / active_verts.shape[0]
-                sdf_abs = active_sdf.abs()
-                threshold = sdf_abs.quantile(keep_ratio)
-                mask = sdf_abs <= threshold
-            sampled_points = active_verts[mask]
-        else:
-            sampled_points = active_verts
+        # 采样策略：基于 band threshold 或 quantile
+        with torch.no_grad():
+            active_sdf = model.query_vert_sdf(active_verts)  # (N,)
+            sdf_abs = active_sdf.abs()
 
-        # 在采样点上计算 SDF 梯度
-        _, gradients, hessian_diag = model.compute_sdf_gradients(
-            points=sampled_points,
-            mode=args.gradient_mode,
-            taps=args.gradient_taps,
-            eps=args.gradient_eps
-        )
-        if eikonal_active:
-            eik_loss = eikonal_loss(gradients)
-        if curvature_active and hessian_diag is not None:
-            curv_loss = curvature_loss(hessian_diag)
+            if args.eikonal_band_threshold is not None:
+                # [BAND-THRESHOLD] 使用固定阈值：只计算 |SDF| < threshold 的顶点
+                mask = sdf_abs < args.eikonal_band_threshold
+            else:
+                # [QUANTILE-SAMPLING] 回退到 quantile-based 采样
+                num_samples = min(args.num_eikonal_samples, active_verts.shape[0])
+                if num_samples < active_verts.shape[0]:
+                    keep_ratio = num_samples / active_verts.shape[0]
+                    threshold = sdf_abs.quantile(keep_ratio)
+                    mask = sdf_abs <= threshold
+                else:
+                    mask = torch.ones(active_verts.shape[0], dtype=torch.bool, device=device)
+
+        sampled_points = active_verts[mask]
+        eik_num_samples = sampled_points.shape[0]
+
+        # 如果 band 内没有点，跳过 loss 计算
+        if sampled_points.shape[0] > 0:
+            # 在采样点上计算 SDF 梯度
+            _, gradients, hessian_diag = model.compute_sdf_gradients(
+                points=sampled_points,
+                mode=args.gradient_mode,
+                taps=args.gradient_taps,
+                eps=args.gradient_eps
+            )
+            if eikonal_active:
+                eik_loss = eikonal_loss(gradients)
+            if curvature_active and hessian_diag is not None:
+                curv_loss = curvature_loss(hessian_diag)
 
     # [MESH-LOSS] Mesh 正则化 Loss (normal + depth + occupancy)
     mesh_loss = torch.tensor(0.0, device=device)
@@ -444,10 +459,10 @@ for iteration in progress_bar:
 
         # [COORD-FIX] 将渲染法线从世界空间变换到相机空间（仿 MILo）
         # depth_to_normal 计算的法线在相机空间，需要统一坐标系
-        # world_view_transform[:3,:3] 存储的是相机旋转矩阵 R (cam-to-world)
-        # 法线从 world 变换到 view: n_view = n_world @ R^T
-        R = camera.world_view_transform[:3, :3].to(device)  # (3, 3) cam-to-world rotation
-        rendered_normal_view = rendered_normal.permute(1, 2, 0) @ R.T  # (H, W, 3) world-to-view
+        # world_view_transform 定义时做了 .transpose(0,1)，直接用即可（同 MILo）
+        # 法线从 world 变换到 view: n_view = n_world @ R
+        R = camera.world_view_transform[:3, :3].to(device)  # (3, 3) world-to-view rotation
+        rendered_normal_view = rendered_normal.permute(1, 2, 0) @ R  # (H, W, 3) world-to-view
         rendered_normal_view = F.normalize(rendered_normal_view, dim=-1)  # 归一化
         rendered_normal_view = rendered_normal_view.permute(2, 0, 1)  # (3, H, W)
 
@@ -588,6 +603,9 @@ for iteration in progress_bar:
         "Eik": repr(f"{eik_loss.item():.3f}"),
         "Curv": repr(f"{curv_loss.item():.1e}"),
     }
+    # [BAND-THRESHOLD] 显示 band 内采样点数（仅当 eikonal/curvature 激活时）
+    if (eikonal_active or curvature_active) and eik_num_samples > 0:
+        postfix_dict["#Eik"] = eik_num_samples
     # [MESH-LOSS] 显示 mesh loss（仅当激活时）
     if mesh_loss_active:
         postfix_dict["Mesh"] = repr(f"{mesh_loss.item():.3f}")
@@ -636,9 +654,11 @@ for iteration in progress_bar:
             # MILo 可视化惯例: (1 - normal) / 2，而非 (normal + 1) / 2
             gauss_normal = render_pkg['normal'].permute(1, 2, 0)  # (H, W, 3) 世界空间
             R_vis = sample_camera.world_view_transform[:3, :3].to(gauss_normal.device)
-            gauss_normal_view = gauss_normal @ R_vis  # 转换到相机空间
+            gauss_normal_view = gauss_normal @ R_vis  # 转换到相机空间（同 MILo，不带 .T）
             gauss_normal_view = F.normalize(gauss_normal_view, dim=-1)
-            gauss_normal_vis = ((1 - gauss_normal_view.detach().cpu().numpy()) / 2 * 255).clip(0, 255).astype(np.uint8)
+            # [FIX] 使用 fix_normal_map 确保法线指向相机（与 mesh normal 可视化对齐）
+            gauss_normal_fixed = fix_normal_map(sample_camera, gauss_normal_view, normal_in_view_space=True)
+            gauss_normal_vis = ((1 - gauss_normal_fixed.detach().cpu().numpy()) / 2 * 255).clip(0, 255).astype(np.uint8)
 
             # 5. 深度转法线图（期望深度）
             depth_normal = depth_to_normal(sample_camera, render_pkg['depth'])  # (3, H, W)
@@ -744,8 +764,10 @@ for iteration in progress_bar:
                         use_opengl=True
                     )
 
-                    # 1. Mesh深度图
-                    mesh_depth = render_output['depth']  # (H, W)
+                    # 1. Mesh深度图 - 处理可能的额外维度 (1, H, W, 1) -> (H, W)
+                    mesh_depth = render_output['depth'].squeeze()  # squeeze 去掉所有多余维度
+                    if mesh_depth.dim() == 3:  # 如果还是 (H, W, 1)
+                        mesh_depth = mesh_depth[..., 0]
                     mesh_depth_np = mesh_depth.detach().cpu().numpy()
                     valid_mask_mesh = (mesh_depth_np > 0) & (mesh_depth_np < 1e6)
                     if valid_mask_mesh.any():
@@ -756,12 +778,20 @@ for iteration in progress_bar:
                     mesh_depth_norm = np.where(valid_mask_mesh, mesh_depth_norm, 0)
                     mesh_depth_vis = (plt.cm.turbo(mesh_depth_norm)[:, :, :3] * 255).astype(np.uint8)
 
-                    # 2. Mesh法线图
-                    mesh_normal = render_output['normals']  # (H, W, 3) 相机空间
-                    mesh_normal_vis = ((1 - mesh_normal.detach().cpu().numpy()) / 2 * 255).clip(0, 255).astype(np.uint8)
+                    # 2. Mesh法线图 - 处理可能的额外维度 (1, H, W, 3) -> (H, W, 3)
+                    mesh_normal = render_output['normals'].squeeze()  # squeeze 去掉 batch 维度
+                    if mesh_normal.dim() == 4:  # 如果是 (1, H, W, 3)
+                        mesh_normal = mesh_normal[0]
+                    # [COORD-FIX] 变换到相机空间（与 mesh_regularizer 保持一致）
+                    from utils.geometry_utils import transform_normal_world_to_view
+                    mesh_normal_view = transform_normal_world_to_view(mesh_normal, sample_camera)
+                    # 使用 fix_normal_map 确保法线指向相机
+                    mesh_normal_fixed = fix_normal_map(sample_camera, mesh_normal_view, normal_in_view_space=True)
+                    mesh_normal_vis = ((1 - mesh_normal_fixed.detach().cpu().numpy()) / 2 * 255).clip(0, 255).astype(np.uint8)
 
                     # 3. 深度转法线图
-                    mesh_depth_normal = depth_to_normal(sample_camera, mesh_depth)  # (3, H, W)
+                    mesh_depth_2d = mesh_depth if mesh_depth.dim() == 2 else mesh_depth.squeeze()
+                    mesh_depth_normal = depth_to_normal(sample_camera, mesh_depth_2d)  # (3, H, W)
                     mesh_depth_normal_vis = ((1 - mesh_depth_normal.permute(1, 2, 0).detach().cpu().numpy()) / 2 * 255).clip(0, 255).astype(np.uint8)
 
                     # 整合成 1x3 网格图: Mesh Normal | Mesh Depth | Mesh Depth->Normal
@@ -820,3 +850,45 @@ sd = model.state_dict()
 sd['indices'] = model.indices
 sd['empty_indices'] = model.empty_indices
 torch.save(sd, args.output_path / "ckpt.pth")
+
+# [MESH-EVAL] 提取最终 mesh 并保存（参考 svraster）
+import subprocess
+with torch.no_grad():
+    # 提取最终 mesh
+    vert_sdf = model.query_vert_sdf()
+    final_mesh_verts, final_mesh_faces = marching_tetrahedra(
+        model.vertices, model.indices, vert_sdf
+    )
+    if final_mesh_faces.shape[0] > 0:
+        final_mesh = Meshes(final_mesh_verts, final_mesh_faces)
+        final_mesh_path = args.output_path / "final_mesh.ply"
+        save_mesh_as_ply(str(final_mesh_path), final_mesh)
+        print(f"[Mesh] Saved final mesh: {final_mesh_verts.shape[0]} verts, {final_mesh_faces.shape[0]} faces")
+
+        # [DTU-EVAL] DTU 评估（参考 svraster）
+        if args.eval_dtu:
+            try:
+                script_path = os.path.join(os.path.dirname(__file__), 'eval_dtu_vanilla', 'evaluate_single_scene.py')
+                src_path = os.path.normpath(str(args.dataset_path))
+                scan_folder = os.path.basename(src_path)
+                # 从文件夹名提取 scan_id（例如 scan37 -> 37）
+                scan_digits = ''.join([c for c in scan_folder if c.isdigit()])
+                scan_id = scan_digits if scan_digits else '37'
+                dataset_root = os.path.dirname(src_path)
+                eval_outdir = os.path.join(str(args.output_path), 'eval_dtu_vanilla')
+                os.makedirs(eval_outdir, exist_ok=True)
+                cmd = [
+                    sys.executable, script_path,
+                    '--input_mesh', str(final_mesh_path),
+                    '--scan_id', str(scan_id),
+                    '--output_dir', eval_outdir,
+                    '--mask_dir', dataset_root,
+                    '--DTU', dataset_root,
+                ]
+                print('[EVAL-DTU] mesh eval cmd:', ' '.join(cmd))
+                subprocess.run(cmd, check=False)
+            except Exception as e:
+                print(f"[EVAL-DTU] eval failed: {e}")
+    else:
+        print("[Mesh] No faces extracted, skipping mesh evaluation")
+
