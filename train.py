@@ -121,18 +121,25 @@ args.sh_interval = 0
 args.sh_step = 1
 
 # iNGP Settings
-args.use_tccn = False
+args.use_tcnn = True  # True: 使用 tiny-cuda-nn (更快), False: 使用 PyTorch 实现
+args.use_contraction = False  # True: 使用 Mip-NeRF 360 空间收缩, False: 仅线性归一化 (推荐关闭以正确计算 eikonal)
 args.encoding_lr = 3e-3
 args.final_encoding_lr = 3e-4
 args.network_lr = 1e-3
 args.final_network_lr = 1e-4
 args.hidden_dim = 64
-args.scale_multi = 0.35 # chosen such that 96% of the distribution is within the sphere 
+args.scale_multi = 0.35 # chosen such that 96% of the distribution is within the sphere
 args.log2_hashmap_size = 23
 args.per_level_scale = 2
 args.L = 8
 args.hashmap_dim = 8
 args.base_resolution = 64
+
+# Coarse-to-Fine 策略 (参考 Neuralangelo)
+args.coarse2fine_enabled = True  # 是否启用 coarse2fine
+args.coarse2fine_init_level = 4   # 初始激活的 hash grid 层数
+args.coarse2fine_step = 3000      # 每隔多少 iteration 增加一层
+
 args.density_offset = -4
 args.lambda_weight_decay = 1
 args.percent_alpha = 0.0 # preconditioning
@@ -348,6 +355,10 @@ for iteration in progress_bar:
     do_sh_up = not args.sh_interval == 0 and iteration % args.sh_interval == 0 and iteration > 0
     do_sh_step = iteration % args.sh_step == 0
 
+    # Coarse-to-Fine: 更新激活的 hash grid 层数
+    if args.coarse2fine_enabled:
+        model.backbone.set_active_levels(iteration)
+
     if do_delaunay or do_freeze:
         st = time.time()
         tet_optim.update_triangulation(
@@ -390,6 +401,8 @@ for iteration in progress_bar:
     eik_loss = torch.tensor(0.0, device=device)
     curv_loss = torch.tensor(0.0, device=device)
     eik_num_samples = 0  # 追踪 band 内的采样点数
+    curv_weight_decay = 1.0  # curvature 权重衰减因子
+
     # 检查迭代范围
     eikonal_active = args.lambda_eikonal > 0 and args.eikonal_start <= iteration < args.eikonal_end
     curvature_active = args.lambda_curvature > 0 and args.curvature_start <= iteration < args.curvature_end
@@ -420,17 +433,27 @@ for iteration in progress_bar:
 
         # 如果 band 内没有点，跳过 loss 计算
         if sampled_points.shape[0] > 0:
+            # [Coarse2Fine] 使用当前激活层的 eps (参考 Neuralangelo)
+            if args.coarse2fine_enabled and args.gradient_eps is None:
+                # eps = 1/resolution * scene_scaling (转换到世界坐标)
+                eps = model.backbone.get_normal_epsilon() * float(model.scene_scaling)
+            else:
+                eps = args.gradient_eps
+
             # 在采样点上计算 SDF 梯度
             _, gradients, hessian_diag = model.compute_sdf_gradients(
                 points=sampled_points,
                 mode=args.gradient_mode,
                 taps=args.gradient_taps,
-                eps=args.gradient_eps
+                eps=eps
             )
             if eikonal_active:
                 eik_loss = eikonal_loss(gradients)
             if curvature_active and hessian_diag is not None:
                 curv_loss = curvature_loss(hessian_diag)
+                # [Coarse2Fine] curvature 权重衰减 (参考 Neuralangelo)
+                if args.coarse2fine_enabled:
+                    curv_weight_decay = model.backbone.get_curvature_weight_decay()
 
     # [MESH-LOSS] Mesh 正则化 Loss (normal + depth + occupancy)
     mesh_loss = torch.tensor(0.0, device=device)
@@ -523,7 +546,7 @@ for iteration in progress_bar:
            args.lambda_dist * dl_loss + \
            args.lambda_sh * render_pkg['sh_reg'] + \
            (args.lambda_eikonal * eik_loss if eikonal_active else 0.0) + \
-           (args.lambda_curvature * curv_loss if curvature_active else 0.0) + \
+           (args.lambda_curvature * curv_weight_decay * curv_loss if curvature_active else 0.0) + \
            mesh_loss + \
            (args.lambda_normal_depth * normal_depth_loss if normal_depth_active and args.lambda_normal_depth > 0 else 0.0) + \
            (args.lambda_normal_depth_med * normal_depth_med_loss if normal_depth_active and args.lambda_normal_depth_med > 0 else 0.0) + \
@@ -611,6 +634,9 @@ for iteration in progress_bar:
         "Eik": repr(f"{eik_loss.item():.3f}"),
         "Curv": repr(f"{curv_loss.item():.1e}"),
     }
+    # Coarse-to-Fine: 显示当前激活层数
+    if args.coarse2fine_enabled:
+        postfix_dict["C2F"] = f"{model.backbone.active_levels}/{model.backbone.L}"
     # [BAND-THRESHOLD] 显示 band 内采样点数（仅当 eikonal/curvature 激活时）
     if (eikonal_active or curvature_active) and eik_num_samples > 0:
         postfix_dict["#Eik"] = eik_num_samples

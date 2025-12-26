@@ -147,6 +147,10 @@ class iNGPDW(nn.Module):
                  k_samples=1,
                  trunc_sigma=1,
                  use_tcnn=False,
+                 # Coarse-to-Fine 参数 (参考 Neuralangelo)
+                 coarse2fine_enabled=False,
+                 coarse2fine_init_level=4,
+                 coarse2fine_step=5000,
                  **kwargs):
         super().__init__()
         self.scale_multi = scale_multi
@@ -160,6 +164,18 @@ class iNGPDW(nn.Module):
         self.ablate_downweighing = ablate_downweighing
         self.k_samples = k_samples
         self.trunc_sigma = trunc_sigma
+
+        # Coarse-to-Fine 参数 (参考 Neuralangelo)
+        self.coarse2fine_enabled = coarse2fine_enabled
+        self.coarse2fine_init_level = min(coarse2fine_init_level, L)
+        self.coarse2fine_step = coarse2fine_step
+        self.active_levels = self.coarse2fine_init_level if coarse2fine_enabled else L
+
+        # 计算每一层的分辨率 (用于 eps 计算)
+        self.resolutions = []
+        for lv in range(L):
+            res = int(np.floor(base_resolution * (per_level_scale ** lv))) + 1
+            self.resolutions.append(res)
 
         # [SDF-MODIFICATION] NeuS s_var 参数初始化 (参考 Neuralangelo)
         # s_var 存储的是 log(inv_s)，使用时 inv_s = exp(s_var)
@@ -214,12 +230,47 @@ class iNGPDW(nn.Module):
             network.apply(lambda m: init_linear(m, gain))
             return network
 
+        def mk_sdf_net(input_dim, out_bias, inside_out=False):
+            """创建 SDF 网络 (对齐 Neuralangelo MLPforNeuralSDF)
+
+            使用 Softplus(β=100) 激活函数，与 Neuralangelo 配置一致。
+            注意：几何初始化在 Softplus 下不如 ReLU 精确，但训练会逐渐收敛。
+
+            结构：1 隐藏层
+            - 第一层：weight ~ N(0, sqrt(2/k_out)), bias=0, weight[:, 3:]=0
+            - 输出层：weight ~ N(sqrt(π/k_in), 0.0001), bias=-out_bias
+            """
+            network = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.Softplus(beta=100),  # 对齐 Neuralangelo
+                nn.Linear(hidden_dim, 1)
+            )
+
+            # Neuralangelo 风格几何初始化
+            with torch.no_grad():
+                linear_layers = [m for m in network if isinstance(m, nn.Linear)]
+
+                # 第一层：先全部初始化，再把 hash 部分置零
+                nn.init.constant_(linear_layers[0].bias, 0.0)
+                nn.init.normal_(linear_layers[0].weight, 0.0, np.sqrt(2 / hidden_dim))
+                if input_dim > 3:
+                    nn.init.constant_(linear_layers[0].weight[:, 3:], 0.0)
+
+                # 输出层：球体 SDF 初始化
+                nn.init.normal_(linear_layers[-1].weight, mean=np.sqrt(np.pi / hidden_dim), std=0.0001)
+                nn.init.constant_(linear_layers[-1].bias, -out_bias)
+                if inside_out:
+                    linear_layers[-1].weight.data *= -1
+                    linear_layers[-1].bias.data *= -1
+
+            return network
+
         self.network = mk_head(1+12+sh_dim)
 
         # [SDF-MODIFICATION] 创建SDF预测网络 (Neuralangelo 风格)
-        # 输入 = [xyz(3维), hash_features(L*dim维)]，使用几何初始化
+        # 输入 = [xyz(3维), hash_features(L*dim维)]，使用 Softplus 和几何初始化
         sdf_input_dim = 3 + self.encoding.n_output_dims  # xyz + hash features
-        self.sdf_net = mk_head(1, input_dim=sdf_input_dim)  # [SDF-MODIFICATION] SDF预测网络头
+        self.sdf_net = mk_sdf_net(sdf_input_dim, sdf_bias, sdf_inside_out)
         self.density_net = self.sdf_net  # [DENSITY-RELATED] 保留别名用于兼容性
         self.color_net     = mk_head(3)
         self.gradient_net  = mk_head(3)
@@ -238,19 +289,17 @@ class iNGPDW(nn.Module):
                     nn.init.uniform_(last.weight.data, a=-eps, b=eps)
                     last.bias.zero_()
 
-            # [SDF-MODIFICATION] SDF网络使用Neuralangelo风格几何初始化
-            # 第一层：xyz部分正常初始化，hash特征部分权重置零（初始时忽略hash特征）
-            sdf_first = self.sdf_net[0]
-            geometric_init_first_layer(sdf_first, xyz_dim=3)
-            # 最后一层：使初始输出近似球体SDF
-            sdf_last = self.sdf_net[-1]
-            geometric_init_sdf_layer(sdf_last, sdf_last.in_features,
-                                    out_bias=sdf_bias, invert=sdf_inside_out)
-
 
     def _encode(self, x: torch.Tensor, cr: torch.Tensor):
         output = self.encoding(x)
         output = output.reshape(-1, self.dim, self.L)
+
+        # Coarse-to-Fine mask: 只激活前 active_levels 层
+        if self.coarse2fine_enabled and self.active_levels < self.L:
+            mask = torch.zeros(self.L, device=x.device)
+            mask[:self.active_levels] = 1.0
+            output = output * mask.reshape(1, 1, -1)
+
         if not self.ablate_downweighing:
             cr = cr.detach() * self.scale_multi
             n = torch.arange(self.L, device=x.device).reshape(1, 1, -1)
@@ -259,6 +308,40 @@ class iNGPDW(nn.Module):
             scaling = approx_erf(erf_x)
             output = output * scaling
         return output
+
+    def set_active_levels(self, iteration):
+        """更新 coarse2fine 的激活层数 (参考 Neuralangelo)"""
+        if not self.coarse2fine_enabled:
+            return
+        # 每 coarse2fine_step 迭代增加一层
+        new_levels = self.coarse2fine_init_level + iteration // self.coarse2fine_step
+        self.active_levels = min(new_levels, self.L)
+
+    def get_normal_epsilon(self):
+        """获取当前的数值梯度步长 (参考 Neuralangelo set_normal_epsilon)
+
+        Neuralangelo: eps = 1 / resolution_of_current_active_level
+        这样 coarse2fine 时，eps 从大到小，与分辨率匹配
+        """
+        if self.coarse2fine_enabled:
+            # 使用当前激活层的分辨率
+            epsilon_res = self.resolutions[self.active_levels - 1]
+        else:
+            # 使用最细分辨率
+            epsilon_res = self.resolutions[-1]
+        return 1.0 / epsilon_res
+
+    def get_curvature_weight_decay(self):
+        """获取 curvature loss 的权重衰减因子 (参考 Neuralangelo)
+
+        Neuralangelo: decay_factor = growth_rate^(anneal_levels - 1)
+        当激活更多层时，curvature 权重降低，允许更多高频细节
+        """
+        if self.coarse2fine_enabled and self.active_levels > 1:
+            decay_factor = self.per_level_scale ** (self.active_levels - 1)
+            return 1.0 / decay_factor
+        else:
+            return 1.0
 
 
     def forward(self, x, cr):
@@ -322,6 +405,7 @@ class Model(BaseModel):
                  density_offset=-1,  # [DENSITY-RELATED] Model类的密度偏移参数 (保留用于兼容性)
                  sdf_bias=0.5,  # [SDF-MODIFICATION] SDF初始偏移参数
                  sdf_inside_out=False,  # [SDF-MODIFICATION] SDF内外反转标志
+                 use_contraction=True,  # [CONTRACTION] 是否使用空间收缩
                  current_sh_deg=2,
                  max_sh_deg=2,
                  ablate_circumsphere=False,
@@ -332,6 +416,7 @@ class Model(BaseModel):
         self.density_offset = density_offset  # [DENSITY-RELATED] 存储密度偏移 (保留用于兼容性)
         self.sdf_bias = sdf_bias  # [SDF-MODIFICATION] 存储SDF偏移参数
         self.sdf_inside_out = sdf_inside_out  # [SDF-MODIFICATION] 存储SDF内外反转标志
+        self.use_contraction = use_contraction  # [CONTRACTION] 存储是否使用空间收缩
         self.max_sh_deg = max_sh_deg
         self.current_sh_deg = current_sh_deg
         self.dir_offset = torch.tensor([
@@ -448,15 +533,31 @@ class Model(BaseModel):
             sampled_cc = circumcenter.reshape(-1, 1, 3) + eps * radius.reshape(-1, 1, 1) * self.backbone.trunc_sigma
             sampled_radius = radius.reshape(-1, 1, 1).expand(-1, self.backbone.k_samples, 1)
             normalized = (sampled_cc.detach() - self.center) / self.scene_scaling
-            cv, cr = contract_mean_std(normalized.reshape(-1, 3), sampled_radius.reshape(-1) / self.scene_scaling)
-            x = (cv/2 + 1)/2
+            # [CONTRACTION] 根据 use_contraction 决定是否使用空间收缩
+            if self.use_contraction:
+                cv, cr = contract_mean_std(normalized.reshape(-1, 3), sampled_radius.reshape(-1) / self.scene_scaling)
+                x = (cv/2 + 1)/2
+            else:
+                # 不使用收缩：直接线性归一化到 [0, 1]
+                x = (normalized.reshape(-1, 3) + 1) / 2
+                cr = sampled_radius.reshape(-1) / self.scene_scaling
         else:
             normalized = (circumcenter.detach() - self.center) / self.scene_scaling
-            cv, cr = contract_mean_std(normalized, radius / self.scene_scaling)
-            x = (cv/2 + 1)/2
+            # [CONTRACTION] 根据 use_contraction 决定是否使用空间收缩
+            if self.use_contraction:
+                cv, cr = contract_mean_std(normalized, radius / self.scene_scaling)
+                x = (cv/2 + 1)/2
+            else:
+                # 不使用收缩：直接线性归一化到 [0, 1]
+                x = (normalized + 1) / 2
+                cr = radius / self.scene_scaling
 
         output = checkpoint(self.backbone, x, cr, use_reentrant=True)
-        return circumcenter, *output
+        # output = (sdf_normalized, rgb, grd, sh)
+        # 将归一化空间的 SDF 转换为世界空间，保持和 query_vert_sdf 一致
+        sdf_normalized = output[0]
+        sdf_world = sdf_normalized * self.scene_scaling
+        return circumcenter, sdf_world, *output[1:]
 
     def get_cell_values(self, camera: Camera, mask=None,
                         all_circumcenters=None, radii=None):
@@ -572,12 +673,20 @@ class Model(BaseModel):
         pcd_radius = pcd_dists_sorted[target_idx]
         new_radius = pcd_radius.cpu().item()
 
+        # [CONTRACTION] 获取 use_contraction 参数
+        use_contraction = kwargs.get('use_contraction', True)
+
         # 计算 sdf_bias（网络输入空间中的球体半径）
-        # xyz_input = cv/2，所以 sdf_bias = pcd_radius / scaling / 2
-        sdf_bias = (pcd_radius * sdf_sphere_radius_scale / scaling / 2).item()
+        # 有 contraction: xyz_input = cv/2 ≈ normalized/2，所以 sdf_bias 需要除以 2
+        # 无 contraction: xyz_input = normalized，不需要除以 2
+        if use_contraction:
+            sdf_bias = (pcd_radius * sdf_sphere_radius_scale / scaling / 2).item()
+        else:
+            sdf_bias = (pcd_radius * sdf_sphere_radius_scale / scaling).item()
         print(f"[SDF Init] Scene center (pcd): {center}, "
               f"pcd_radius (density-based): {pcd_radius:.4f}, "
               f"scene_scaling: {scaling:.4f}, "
+              f"use_contraction: {use_contraction}, "
               f"sdf_bias (xyz_input space): {sdf_bias:.4f}")
 
         # vertices = sample_uniform_in_sphere(10000, 3, base_radius=0, radius=new_radius, device='cpu') + center.reshape(1, 3).cpu()
@@ -691,20 +800,29 @@ class Model(BaseModel):
             # 1. 坐标归一化
             normalized = (pts - self.center) / self.scene_scaling
 
-            # 2. 空间收缩
-            cv, _ = contract_mean_std(normalized, torch.zeros(pts.shape[0], device=pts.device))
-            x = (cv / 2 + 1) / 2  # [0, 1] 范围
+            # 2. [CONTRACTION] 根据 use_contraction 决定是否使用空间收缩
+            if self.use_contraction:
+                cv, _ = contract_mean_std(normalized, torch.zeros(pts.shape[0], device=pts.device))
+                x = (cv / 2 + 1) / 2  # [0, 1] 范围
+            else:
+                # 不使用收缩：直接线性归一化到 [0, 1]
+                x = (normalized + 1) / 2
 
             # 3. Hash Grid 编码
             h = self.backbone.encoding(x)
             h = h.reshape(-1, self.backbone.L * self.backbone.dim).float()
 
             # 4. SDF 网络输入 = [xyz_input, hash_features]
-            # xyz_input = x * 2 - 1 = cv/2，范围 [-1, 1]
+            # xyz_input = x * 2 - 1，范围 [-1, 1]
             xyz_input = x * 2 - 1
             sdf_input = torch.cat([xyz_input, h], dim=-1)
-            sdf = self.backbone.sdf_net(sdf_input)
-            sdf_list.append(sdf.reshape(-1))
+            sdf_normalized = self.backbone.sdf_net(sdf_input)
+
+            # 5. 将归一化空间的 SDF 转换为世界空间
+            # sdf_world = sdf_normalized * scene_scaling
+            # 这样梯度 ∇_world(sdf_world) = ∇_xyz(sdf_normalized) 才是正确的
+            sdf_world = sdf_normalized * self.scene_scaling
+            sdf_list.append(sdf_world.reshape(-1))
 
         return torch.cat(sdf_list)
 
@@ -739,7 +857,8 @@ class Model(BaseModel):
             # eps 在归一化 [0,1] 空间为 1/resolution
             # 转换到世界坐标：乘以 scene_scaling
             eps = float(self.scene_scaling) / finest_resolution
-            # 注意：因为有 contraction，实际步长可能略有不同，但这是合理的近似
+            # [CONTRACTION] 注意：如果启用 contraction，实际步长在远离中心处会有偏差
+            # 关闭 contraction 后，这个近似是精确的
 
         if mode == "analytical":
             return self._compute_gradients_analytical(points)
@@ -1041,6 +1160,50 @@ class Model(BaseModel):
         print(f"    mean={sdf_mean:.4f}, std={sdf_std:.4f}")
         print(f"    inside (SDF<0): {num_inside}, outside (SDF>0): {num_outside}")
 
+        # [DIAGNOSTIC] 测试理想球面上的 SDF 值
+        # 如果几何初始化成功，球面上的点 SDF 应该接近 0
+        sdf_bias = self.backbone.sdf_bias
+        # 世界空间的球体半径 = sdf_bias * scene_scaling
+        sphere_radius_world = sdf_bias * float(self.scene_scaling)
+        print(f"\n  Sphere Surface Test (sdf_bias={sdf_bias:.4f}, sphere_radius_world={sphere_radius_world:.4f}):")
+
+        # 在 xyz_input 空间中采样球面点
+        n_sphere_samples = 1000
+        # 均匀采样球面方向
+        phi = torch.rand(n_sphere_samples, device=self.device) * 2 * np.pi
+        cos_theta = torch.rand(n_sphere_samples, device=self.device) * 2 - 1
+        sin_theta = torch.sqrt(1 - cos_theta**2)
+        sphere_dirs = torch.stack([
+            sin_theta * torch.cos(phi),
+            sin_theta * torch.sin(phi),
+            cos_theta
+        ], dim=-1)  # (N, 3) 单位球面方向
+
+        # 转换到世界坐标
+        # 在 xyz_input 空间中，球面半径 = sdf_bias
+        # 无 contraction: xyz_input = normalized, 世界坐标 = normalized * scaling + center
+        # 有 contraction: xyz_input = cv/2, 对于 |cv|<1: cv = normalized, 世界坐标 = cv * scaling + center
+        if self.use_contraction:
+            sphere_xyz_input = sphere_dirs * sdf_bias
+            sphere_cv = sphere_xyz_input * 2  # cv = xyz_input * 2
+            sphere_world = sphere_cv * float(self.scene_scaling) + self.center
+        else:
+            sphere_xyz_input = sphere_dirs * sdf_bias
+            sphere_normalized = sphere_xyz_input  # normalized = xyz_input
+            sphere_world = sphere_normalized * float(self.scene_scaling) + self.center
+
+        # 查询 SDF（现在返回世界空间的 SDF）
+        sphere_sdf = self.query_vert_sdf(sphere_world)
+        print(f"    Sphere SDF: min={sphere_sdf.min().item():.4f}, max={sphere_sdf.max().item():.4f}, "
+              f"mean={sphere_sdf.mean().item():.4f}, std={sphere_sdf.std().item():.4f}")
+        print(f"    (Ideal: mean≈0, std≈0)")
+
+        # 测试中心点和远点
+        center_sdf = self.query_vert_sdf(self.center.reshape(1, 3))
+        # 世界空间的期望中心 SDF = -sdf_bias * scene_scaling
+        expected_center_sdf = -sphere_radius_world
+        print(f"    Center SDF: {center_sdf.item():.4f} (Ideal: {expected_center_sdf:.4f})")
+
         # 计算内部点云的边界（用于 Eikonal 采样和 Marching Cubes）
         verts_normalized = (internal_verts - self.center) / self.scene_scaling
         verts_min = verts_normalized.min(dim=0).values
@@ -1049,21 +1212,33 @@ class Model(BaseModel):
         margin = (verts_max - verts_min) * 0.1
         bounds_min = (verts_min - margin).clamp(min=-1)
         bounds_max = (verts_max + margin).clamp(max=1)
-        print(f"  Internal vertices bounds (normalized): [{bounds_min.tolist()}] to [{bounds_max.tolist()}]")
+        # [FIX] 使用正方形 bounds（取各轴最大范围），避免球形 SDF 被截断成椭球
+        max_range = (bounds_max - bounds_min).max() / 2
+        center_bounds = (bounds_max + bounds_min) / 2
+        bounds_min = (center_bounds - max_range).clamp(min=-1)
+        bounds_max = (center_bounds + max_range).clamp(max=1)
+        print(f"  Internal vertices bounds (normalized, squared): [{bounds_min.tolist()}] to [{bounds_max.tolist()}]")
 
-        # 2. 采样点计算 Eikonal loss（基于内部点云边界）
+        # 2. 采样点计算 Eikonal loss
+        # [FIX] 几何初始化只在球体内部和表面附近有效
+        # 采样范围设为 1.2 倍球体半径（稍微超出表面）
+        sample_radius = sdf_bias * 1.2
         grid_size = int(num_samples ** (1/3))
-        lin_x = torch.linspace(bounds_min[0].item(), bounds_max[0].item(), grid_size, device=self.device)
-        lin_y = torch.linspace(bounds_min[1].item(), bounds_max[1].item(), grid_size, device=self.device)
-        lin_z = torch.linspace(bounds_min[2].item(), bounds_max[2].item(), grid_size, device=self.device)
-        xx, yy, zz = torch.meshgrid(lin_x, lin_y, lin_z, indexing='ij')
+        lin = torch.linspace(-sample_radius, sample_radius, grid_size, device=self.device)
+        xx, yy, zz = torch.meshgrid(lin, lin, lin, indexing='ij')
         sample_points_normalized = torch.stack([xx, yy, zz], dim=-1).reshape(-1, 3)
+
+        # 只保留在采样球内的点
+        sample_dist = sample_points_normalized.norm(dim=-1)
+        sample_mask = sample_dist < sample_radius
+        sample_points_normalized = sample_points_normalized[sample_mask]
+        print(f"  Eikonal sampling: {sample_points_normalized.shape[0]} points within radius {sample_radius:.4f}")
 
         # 转换到世界坐标
         sample_points_world = sample_points_normalized * float(self.scene_scaling) + self.center
 
         # 计算梯度
-        _, gradients, _ = self.compute_sdf_gradients(sample_points_world, mode="numerical", taps=4)
+        _, gradients, _ = self.compute_sdf_gradients(sample_points_world, mode="numerical", taps=6)
         grad_norms = gradients.norm(dim=-1)
         eikonal_loss = ((grad_norms - 1) ** 2).mean().item()
         grad_norm_mean = grad_norms.mean().item()
