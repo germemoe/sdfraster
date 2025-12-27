@@ -186,8 +186,7 @@ class FrozenTetModel(BaseModel):
 
         # Load state dict to ensure all parameters are properly loaded
         model.load_state_dict(ckpt, strict=False)  # [SDF-MODIFICATION] strict=False 兼容旧checkpoint
-        base_min_t = getattr(config, "base_min_t", getattr(config, "min_t", 0.4))
-        model.min_t = model.scene_scaling * base_min_t
+        model.min_t = config.min_t  # [UPSTREAM-SYNC] 5355d69: 直接使用config.min_t
 
         return model
 

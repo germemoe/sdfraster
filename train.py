@@ -28,7 +28,7 @@ torch.cuda.manual_seed_all(SEED)
 
 from utils import cam_util
 from utils.train_util import *
-from utils.model_util import eikonal_loss, curvature_loss
+from utils.model_util import eikonal_loss, curvature_loss, sample_eikonal_points
 # from models.vertex_color import Model, TetOptimizer
 from models.ingp_color import Model, TetOptimizer
 from models.frozen import freeze_model
@@ -136,7 +136,7 @@ args.hashmap_dim = 8
 args.base_resolution = 64
 
 # Coarse-to-Fine 策略 (参考 Neuralangelo)
-args.coarse2fine_enabled = True  # 是否启用 coarse2fine
+args.coarse2fine_enabled = False  # 是否启用 coarse2fine
 args.coarse2fine_init_level = 4   # 初始激活的 hash grid 层数
 args.coarse2fine_step = 3000      # 每隔多少 iteration 增加一层
 
@@ -177,8 +177,10 @@ args.gradient_mode = "numerical"  # "analytical" 或 "numerical"
 args.gradient_taps = 6            # 数值梯度采样点数：4 或 6
 args.gradient_eps = None          # 数值梯度步长，None=自动计算 (scene_scaling/resolution，参考Neuralangelo)
 args.num_eikonal_samples = 200000  # Eikonal loss 采样点数（仅在 band_threshold=None 时使用）
-args.eikonal_band_threshold = None # SDF band 阈值：仅计算 |SDF| < threshold 的顶点的 loss
-                                   # 设为 None 则使用 quantile-based 采样（num_eikonal_samples）
+args.eikonal_band_threshold = 0.2 # SDF band 阈值：仅计算 |SDF| < threshold 的顶点的 loss
+                                   # 设为 None 则计算所有内部顶点
+args.eikonal_tet_sampling = True  # 是否在 SDF 异号四面体内额外采样（参考 Neuralangelo）
+                                   # True: band内顶点 + 四面体内采样; False: 仅 band内顶点
 
 # [MESH-NORMAL-LOSS] Mesh 法线一致性 Loss 设置（参考 MILo）
 args.lambda_mesh_normal = 0.0   # mesh normal loss 权重
@@ -407,31 +409,17 @@ for iteration in progress_bar:
     eikonal_active = args.lambda_eikonal > 0 and args.eikonal_start <= iteration < args.eikonal_end
     curvature_active = args.lambda_curvature > 0 and args.curvature_start <= iteration < args.curvature_end
     if eikonal_active or curvature_active:
-        # 获取活跃的内部顶点（排除 ext_vertices）
-        active_verts = model.active_internal_vertices  # (N, 3) 不包含 ext_vertices
-
-        # 采样策略：基于 band threshold 或 quantile
-        with torch.no_grad():
-            active_sdf = model.query_vert_sdf(active_verts)  # (N,)
-            sdf_abs = active_sdf.abs()
-
-            if args.eikonal_band_threshold is not None:
-                # [BAND-THRESHOLD] 使用固定阈值：只计算 |SDF| < threshold 的顶点
-                mask = sdf_abs < args.eikonal_band_threshold
-            else:
-                # [QUANTILE-SAMPLING] 回退到 quantile-based 采样
-                num_samples = min(args.num_eikonal_samples, active_verts.shape[0])
-                if num_samples < active_verts.shape[0]:
-                    keep_ratio = num_samples / active_verts.shape[0]
-                    threshold = sdf_abs.quantile(keep_ratio)
-                    mask = sdf_abs <= threshold
-                else:
-                    mask = torch.ones(active_verts.shape[0], dtype=torch.bool, device=device)
-
-        sampled_points = active_verts[mask]
+        # [NEW-SAMPLING] 使用新的采样策略：band内顶点 + SDF异号四面体内采样（可选）
+        # 参考 Neuralangelo 的采样策略
+        sampled_points, num_band, num_tet_samples = sample_eikonal_points(
+            model,
+            num_samples=args.num_eikonal_samples,
+            band=args.eikonal_band_threshold,  # None 表示使用所有内部顶点
+            use_tet_sampling=args.eikonal_tet_sampling  # False 则仅使用 band 内顶点
+        )
         eik_num_samples = sampled_points.shape[0]
 
-        # 如果 band 内没有点，跳过 loss 计算
+        # 如果采样点为空，跳过 loss 计算
         if sampled_points.shape[0] > 0:
             # [Coarse2Fine] 使用当前激活层的 eps (参考 Neuralangelo)
             if args.coarse2fine_enabled and args.gradient_eps is None:

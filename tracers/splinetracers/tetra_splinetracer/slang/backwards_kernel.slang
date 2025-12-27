@@ -221,7 +221,7 @@ void backwards_kernel(
     int start_tet_id = start_tet_ids[ray_ind];
     bool is_start = false;
 
-    /*
+    // [UPSTREAM-SYNC] 5355d69: 取消注释backward主循环
     for (int i = num_iters - 1; i-- > -1;)
     {
         uint old_tri_ind;
@@ -298,5 +298,4 @@ void backwards_kernel(
 
         deriv_state = diffPair(old_dual_state, old_deriv_state.d);
     }
-    */
 }

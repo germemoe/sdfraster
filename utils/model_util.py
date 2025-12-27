@@ -158,3 +158,97 @@ def curvature_loss(hessian_diag: torch.Tensor, mask: torch.Tensor = None) -> tor
         return (laplacian * mask.float()).sum() / (mask.float().sum() + 1e-8)
     else:
         return laplacian.mean()
+
+
+def sample_eikonal_points(model, num_samples: int = 50000, band: float = 0.1, use_tet_sampling: bool = True):
+    """
+    采样 Eikonal loss 计算点（参考 Neuralangelo 的采样策略）
+
+    策略：
+    1. Band 内顶点：|SDF| < band 的内部顶点（band=None 时使用所有内部顶点）
+    2. SDF 异号四面体内采样：穿过表面的四面体内随机采样（use_tet_sampling=True 时）
+
+    Args:
+        model: Model 实例
+        num_samples: 目标总采样点数（仅在 use_tet_sampling=True 时使用）
+        band: SDF band 阈值（世界坐标），None 表示使用所有内部顶点
+        use_tet_sampling: 是否在 SDF 异号四面体内额外采样
+
+    Returns:
+        all_points: (M, 3) 采样点坐标
+        num_band: band 内顶点数
+        num_tet_samples: 四面体内采样点数
+    """
+    device = model.device
+
+    # 1. 获取所有顶点的 SDF
+    with torch.no_grad():
+        all_verts = model.vertices
+        vert_sdf = model.query_vert_sdf(all_verts)  # (num_verts,)
+
+    # 2. 内部顶点（排除 ext_vertices）
+    num_internal = model.num_int_verts
+    internal_mask = torch.arange(len(vert_sdf), device=device) < num_internal
+
+    if band is not None:
+        # Band 内的内部顶点
+        band_mask = (vert_sdf.abs() < band) & internal_mask
+    else:
+        # 所有内部顶点
+        band_mask = internal_mask
+
+    band_points = all_verts[band_mask]
+    num_band = band_points.shape[0]
+
+    # 3. 如果不使用四面体采样，直接返回 band 内顶点
+    if not use_tet_sampling:
+        return band_points, num_band, 0
+
+    # 4. 找到 SDF 异号的四面体（穿过表面）
+    tet_sdf = vert_sdf[model.indices.long()]  # (num_tets, 4)
+    has_positive = (tet_sdf > 0).any(dim=1)
+    has_negative = (tet_sdf < 0).any(dim=1)
+    crossing_mask = has_positive & has_negative  # 穿过表面的四面体
+    crossing_indices = model.indices[crossing_mask]  # (num_crossing, 4)
+    num_crossing = crossing_indices.shape[0]
+
+    # 5. 在异号四面体内采样，补足到目标数量
+    num_need = max(0, num_samples - num_band)
+
+    if num_need > 0 and num_crossing > 0:
+        # 计算每个四面体采样的点数
+        samples_per_tet = max(1, (num_need + num_crossing - 1) // num_crossing)
+
+        # 使用 Dirichlet(1,1,1,1) 分布在四面体内均匀采样
+        # 重心坐标 (w0, w1, w2, w3)，满足 w0+w1+w2+w3=1, wi>=0
+        alpha = torch.ones(4, device=device)
+        bary = torch.distributions.Dirichlet(alpha).sample((num_crossing, samples_per_tet))  # (num_crossing, samples_per_tet, 4)
+
+        # 四面体顶点坐标
+        tet_verts = all_verts[crossing_indices.long()]  # (num_crossing, 4, 3)
+
+        # 重心坐标插值: point = sum(wi * vi)
+        sampled_points = torch.einsum('nvc,nsv->nsc', tet_verts, bary)  # (num_crossing, samples_per_tet, 3)
+        sampled_points = sampled_points.reshape(-1, 3)
+
+        # 截取到需要的数量
+        if sampled_points.shape[0] > num_need:
+            perm = torch.randperm(sampled_points.shape[0], device=device)[:num_need]
+            sampled_points = sampled_points[perm]
+
+        num_tet_samples = sampled_points.shape[0]
+    else:
+        sampled_points = torch.empty(0, 3, device=device)
+        num_tet_samples = 0
+
+    # 5. 合并所有采样点
+    if num_band > 0 and num_tet_samples > 0:
+        all_points = torch.cat([band_points, sampled_points], dim=0)
+    elif num_band > 0:
+        all_points = band_points
+    elif num_tet_samples > 0:
+        all_points = sampled_points
+    else:
+        all_points = torch.empty(0, 3, device=device)
+
+    return all_points, num_band, num_tet_samples

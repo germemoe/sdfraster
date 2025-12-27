@@ -290,15 +290,28 @@ class iNGPDW(nn.Module):
                     last.bias.zero_()
 
 
+    @torch.no_grad()
+    def _get_c2f_mask(self, h: torch.Tensor):
+        """
+        Coarse-to-Fine mask（和 Neuralangelo 完全对齐）
+
+        Args:
+            h: (N, L * dim) hash 特征
+        Returns:
+            mask: (N, L * dim) mask，前 active_levels * dim 维为 1，其余为 0
+        """
+        mask = torch.zeros_like(h)
+        mask[..., :(self.active_levels * self.dim)] = 1.0
+        return mask
+
     def _encode(self, x: torch.Tensor, cr: torch.Tensor):
         output = self.encoding(x)
-        output = output.reshape(-1, self.dim, self.L)
 
-        # Coarse-to-Fine mask: 只激活前 active_levels 层
+        # Coarse-to-Fine mask（和 Neuralangelo 对齐）
         if self.coarse2fine_enabled and self.active_levels < self.L:
-            mask = torch.zeros(self.L, device=x.device)
-            mask[:self.active_levels] = 1.0
-            output = output * mask.reshape(1, 1, -1)
+            output = output * self._get_c2f_mask(output)
+
+        output = output.reshape(-1, self.dim, self.L)
 
         if not self.ablate_downweighing:
             cr = cr.detach() * self.scale_multi
@@ -344,7 +357,7 @@ class iNGPDW(nn.Module):
             return 1.0
 
 
-    def forward(self, x, cr):
+    def forward(self, x, cr, compute_sdf=True):
         # x: hash grid 输入坐标 (N, 3)，范围 [0, 1]
         # xyz_input = x * 2 - 1 = cv/2，范围 [-1, 1]
         xyz_input = x * 2 - 1
@@ -358,10 +371,13 @@ class iNGPDW(nn.Module):
 
         h = output.reshape(-1, self.L * self.dim).float()
 
-        # [SDF-MODIFICATION] SDF网络前向传播 (Neuralangelo 风格)
-        # 输入 = [xyz(3维), hash_features(L*dim维)]
-        sdf_input = torch.cat([xyz_input, h], dim=-1)  # (N, 3 + L*dim)
-        sdf = self.sdf_net(sdf_input)
+        # [SDF-MODIFICATION] SDF网络前向传播
+        # 渲染时 compute_sdf=False（使用 query_vert_sdf 的顶点 SDF），跳过计算节省开销
+        if compute_sdf:
+            sdf_input = torch.cat([xyz_input, h], dim=-1)  # (N, 3 + L*dim)
+            sdf = self.sdf_net(sdf_input)
+        else:
+            sdf = torch.zeros((h.shape[0], 1), device=h.device, dtype=h.dtype)
 
         rgb = self.color_net(h)
         field_samples = self.gradient_net(h)
@@ -510,7 +526,13 @@ class Model(BaseModel):
             self.vertices, self.indices, self.center, self.scene_scaling)
         return circumcenter
 
-    def compute_batch_features(self, vertices, indices, start, end, circumcenters=None):
+    def compute_batch_features(self, vertices, indices, start, end, circumcenters=None, compute_sdf=True):
+        """
+        计算四面体批次的特征
+
+        Args:
+            compute_sdf: 是否计算 SDF。渲染时设为 False（使用 query_vert_sdf），其他用途设为 True
+        """
         tets = vertices[indices[start:end]]
         if circumcenters is None:
             circumcenter, radius = calculate_circumcenters_torch(tets.double())
@@ -552,11 +574,13 @@ class Model(BaseModel):
                 x = (normalized + 1) / 2
                 cr = radius / self.scene_scaling
 
-        output = checkpoint(self.backbone, x, cr, use_reentrant=True)
-        # output = (sdf_normalized, rgb, grd, sh)
-        # 将归一化空间的 SDF 转换为世界空间，保持和 query_vert_sdf 一致
-        sdf_normalized = output[0]
-        sdf_world = sdf_normalized * self.scene_scaling
+        output = checkpoint(self.backbone, x, cr, compute_sdf, use_reentrant=True)
+        # output = (sdf, rgb, grd, sh)，compute_sdf=False 时 sdf 是 dummy 值
+        sdf_output = output[0]
+        if compute_sdf:
+            sdf_world = sdf_output * self.scene_scaling
+        else:
+            sdf_world = sdf_output  # dummy
         return circumcenter, sdf_world, *output[1:]
 
     def get_cell_values(self, camera: Camera, mask=None,
@@ -570,9 +594,9 @@ class Model(BaseModel):
         start = 0
         for start in range(0, indices.shape[0], self.chunk_size):
             end = min(start + self.chunk_size, indices.shape[0])
-            # [SDF-MODIFICATION] compute_batch_features 返回 sdf
-            circumcenters, sdf, rgb, grd, sh = self.compute_batch_features(
-                vertices, indices, start, end, circumcenters=all_circumcenters)
+            # [SDF-MODIFICATION] compute_sdf=False：渲染使用 query_vert_sdf，跳过 sdf_net 计算
+            circumcenters, sdf_dummy, rgb, grd, sh = self.compute_batch_features(
+                vertices, indices, start, end, circumcenters=all_circumcenters, compute_sdf=False)
             # === [DENSITY-RELATED] 原密度代码 (已注释) ===
             # circumcenters, density, rgb, grd, sh = self.compute_batch_features(...)
             # === [DENSITY-RELATED] 原密度代码结束 ===
@@ -580,10 +604,9 @@ class Model(BaseModel):
                 grd = torch.zeros_like(grd)
             centroids = vertices[indices[start:end]].mean(dim=1)
             shs[start:end] = sh.reshape(-1, sh_dim, 3)
-            # [SDF-MODIFICATION] activate_output 接收 sdf 参数
-            # TODO: activate_output 需要修改以处理SDF而非density
+            # [SDF-MODIFICATION] sdf_dummy 是占位值（渲染不使用 cell_values[0]）
             dvrgbs = activate_output(camera.camera_center.to(self.device),
-                                     sdf, rgb, grd,  # [SDF-MODIFICATION] sdf 替代 density
+                                     sdf_dummy, rgb, grd,
                                      sh.reshape(-1, sh_dim, 3),
                                      indices[start:end],
                                      centroids,
@@ -808,9 +831,11 @@ class Model(BaseModel):
                 # 不使用收缩：直接线性归一化到 [0, 1]
                 x = (normalized + 1) / 2
 
-            # 3. Hash Grid 编码
+            # 3. Hash Grid 编码 + C2F（和 Neuralangelo 对齐）
             h = self.backbone.encoding(x)
-            h = h.reshape(-1, self.backbone.L * self.backbone.dim).float()
+            if self.backbone.coarse2fine_enabled and self.backbone.active_levels < self.backbone.L:
+                h = h * self.backbone._get_c2f_mask(h)
+            h = h.float()
 
             # 4. SDF 网络输入 = [xyz_input, hash_features]
             # xyz_input = x * 2 - 1，范围 [-1, 1]
@@ -1120,6 +1145,78 @@ class Model(BaseModel):
             weight_decay = weight_decay + (param[ind:].reshape(-1, self.nominal_offset_size)**2).mean(dim=1).sum()
             return weight_decay
 
+    def _query_sdf_normalized_space(self, points_normalized):
+        """
+        直接在归一化空间查询 SDF，不乘 scaling（用于调试坐标变换问题）
+
+        Args:
+            points_normalized: (N, 3) 归一化坐标 [-1, 1]
+        Returns:
+            sdf_normalized: (N,) 归一化空间的 SDF（不乘 scaling）
+        """
+        sdf_list = []
+        for start in range(0, points_normalized.shape[0], self.chunk_size):
+            end = min(start + self.chunk_size, points_normalized.shape[0])
+            pts_norm = points_normalized[start:end]
+
+            # 归一化 → hash [0, 1]
+            x = (pts_norm + 1) / 2
+
+            # Hash Grid 编码 + C2F
+            h = self.backbone.encoding(x)
+            if self.backbone.coarse2fine_enabled and self.backbone.active_levels < self.backbone.L:
+                h = h * self.backbone._get_c2f_mask(h)
+            h = h.float()
+
+            # SDF 网络输入
+            xyz_input = x * 2 - 1  # = pts_norm
+            sdf_input = torch.cat([xyz_input, h], dim=-1)
+
+            # SDF 网络输出（不乘 scaling！）
+            sdf_normalized = self.backbone.sdf_net(sdf_input)
+            sdf_list.append(sdf_normalized.reshape(-1))
+
+        return torch.cat(sdf_list)
+
+    def _compute_eikonal_normalized_space(self, points_normalized, eps):
+        """
+        在归一化空间用数值差分计算 Eikonal loss（用于调试坐标变换问题）
+
+        Args:
+            points_normalized: (N, 3) 归一化坐标 [-1, 1]
+            eps: 归一化空间的步长 (通常 = 1/resolution)
+        Returns:
+            sdf: (N,) SDF 值（归一化空间）
+            gradients: (N, 3) 梯度
+            eikonal_loss: scalar
+        """
+        # 中心点 SDF
+        sdf = self._query_sdf_normalized_space(points_normalized)
+
+        # 6 个偏移方向
+        eps_x = torch.tensor([eps, 0., 0.], device=self.device)
+        eps_y = torch.tensor([0., eps, 0.], device=self.device)
+        eps_z = torch.tensor([0., 0., eps], device=self.device)
+
+        # 计算 6 个偏移点的 SDF
+        sdf_x_pos = self._query_sdf_normalized_space(points_normalized + eps_x)
+        sdf_x_neg = self._query_sdf_normalized_space(points_normalized - eps_x)
+        sdf_y_pos = self._query_sdf_normalized_space(points_normalized + eps_y)
+        sdf_y_neg = self._query_sdf_normalized_space(points_normalized - eps_y)
+        sdf_z_pos = self._query_sdf_normalized_space(points_normalized + eps_z)
+        sdf_z_neg = self._query_sdf_normalized_space(points_normalized - eps_z)
+
+        # 中心差分
+        gradient_x = (sdf_x_pos - sdf_x_neg) / (2 * eps)
+        gradient_y = (sdf_y_pos - sdf_y_neg) / (2 * eps)
+        gradient_z = (sdf_z_pos - sdf_z_neg) / (2 * eps)
+        gradients = torch.stack([gradient_x, gradient_y, gradient_z], dim=-1)
+
+        grad_norms = gradients.norm(dim=-1)
+        eikonal_loss = ((grad_norms - 1) ** 2).mean()
+
+        return sdf, gradients, eikonal_loss
+
     @torch.no_grad()
     def verify_geometric_init(self, save_mesh_path=None, num_samples=10000, mc_resolution=128):
         """
@@ -1128,7 +1225,8 @@ class Model(BaseModel):
         检查项：
         1. 初始 SDF 场是否近似球体（中心负，边缘正）
         2. Eikonal loss 是否接近 0（梯度范数接近 1）
-        3. 可选：使用 Marching Cubes 提取并保存初始 mesh
+        3. 归一化空间 vs 世界空间的 Eikonal 对比（调试坐标变换）
+        4. 可选：使用 Marching Cubes 提取并保存初始 mesh
 
         Args:
             save_mesh_path: 如果提供，保存初始 mesh 到此路径
@@ -1244,10 +1342,40 @@ class Model(BaseModel):
         grad_norm_mean = grad_norms.mean().item()
         grad_norm_std = grad_norms.std().item()
 
-        print(f"  Eikonal Statistics (should be ~0 if init successful):")
+        print(f"  Eikonal Statistics [World Space] (should be ~0 if init successful):")
         print(f"    Eikonal loss: {eikonal_loss:.6f}")
         print(f"    Gradient norm: mean={grad_norm_mean:.4f}, std={grad_norm_std:.4f}")
         print(f"    (Ideal: mean=1.0, std=0.0)")
+
+        # 2.5. 对比：归一化空间 Eikonal
+        # 直接在归一化空间计算，不涉及 scaling，用于排查坐标变换问题
+        eps_normalized = 1.0 / self.backbone.resolutions[self.backbone.active_levels - 1]
+        sdf_norm, grad_norm_space, eikonal_norm = self._compute_eikonal_normalized_space(
+            sample_points_normalized, eps_normalized
+        )
+        grad_norm_space_norms = grad_norm_space.norm(dim=-1)
+        grad_norm_space_mean = grad_norm_space_norms.mean().item()
+        grad_norm_space_std = grad_norm_space_norms.std().item()
+
+        print(f"\n  Eikonal Statistics [Normalized Space] (for debugging coord transforms):")
+        print(f"    eps (normalized): {eps_normalized:.6f}")
+        print(f"    Eikonal loss: {eikonal_norm:.6f}")
+        print(f"    Gradient norm: mean={grad_norm_space_mean:.4f}, std={grad_norm_space_std:.4f}")
+
+        # 对比分析
+        print(f"\n  [Comparison: World vs Normalized Space]")
+        eikonal_diff = abs(eikonal_loss - eikonal_norm)
+        grad_diff = abs(grad_norm_mean - grad_norm_space_mean)
+        print(f"    Eikonal diff: {eikonal_diff:.6f}")
+        print(f"    Grad norm diff: {grad_diff:.4f}")
+        if eikonal_diff < 0.01 and grad_diff < 0.05:
+            print(f"    → Coordinate transform is consistent ✓")
+        elif eikonal_norm < eikonal_loss * 0.5:
+            print(f"    → Normalized space is significantly better!")
+            print(f"    → Coordinate transform may have issues")
+        else:
+            print(f"    → Both spaces show similar issues")
+            print(f"    → Problem likely in geometric init itself")
 
         # 3. 判断是否成功
         is_success = eikonal_loss < 0.1 and 0.8 < grad_norm_mean < 1.2
@@ -1313,6 +1441,10 @@ class Model(BaseModel):
             'eikonal_loss': eikonal_loss,
             'grad_norm_mean': grad_norm_mean,
             'grad_norm_std': grad_norm_std,
+            # Normalized space results (for debugging)
+            'eikonal_loss_normalized': eikonal_norm,
+            'grad_norm_mean_normalized': grad_norm_space_mean,
+            'grad_norm_std_normalized': grad_norm_space_std,
             'is_success': is_success,
         }
 
