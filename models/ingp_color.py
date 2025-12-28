@@ -1486,8 +1486,9 @@ class TetOptimizer:
             {"params": model.backbone.sh_net.parameters(),        "lr": network_lr,       "name": "sh"},
         ]
         # [SDF-MODIFICATION] 如果 s_var 是可学习参数，添加到优化器
+        # s_var 学习率放大 10 倍，因为训练迭代数（18K）远少于 Neuralangelo（300K）
         if model.backbone.s_var_learn:
-            net_param_groups.append({"params": [model.backbone.s_var], "lr": network_lr, "name": "s_var"})
+            net_param_groups.append({"params": [model.backbone.s_var], "lr": network_lr * 100, "name": "s_var"})
 
         self.net_optim = optim.CustomAdam(net_param_groups, ignore_param_list=[], betas=[0.9, 0.999], eps=1e-15)
         self.vert_lr_multi = float(model.scene_scaling.cpu())
@@ -1549,7 +1550,11 @@ class TetOptimizer:
         self.iteration = iteration
         self.model.alpha = self.alpha_sched(iteration)
         for param_group in self.net_optim.param_groups:
-            lr = self.net_scheduler_args(iteration)
+            # [SDF-MODIFICATION] s_var 使用 10 倍学习率
+            if param_group.get("name") == "s_var":
+                lr = self.net_scheduler_args(iteration) * 10
+            else:
+                lr = self.net_scheduler_args(iteration)
             param_group['lr'] = lr
         for param_group in self.optim.param_groups:
             if param_group["name"] == "encoding":

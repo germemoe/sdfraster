@@ -174,10 +174,10 @@ args.eikonal_end = 30000          # 停止使用 eikonal loss 的迭代
 args.curvature_start = 0         # 开始使用 curvature loss 的迭代
 args.curvature_end = 30000        # 停止使用 curvature loss 的迭代
 args.gradient_mode = "numerical"  # "analytical" 或 "numerical"
-args.gradient_taps = 6            # 数值梯度采样点数：4 或 6
+args.gradient_taps = 4            # 数值梯度采样点数：4 或 6
 args.gradient_eps = None          # 数值梯度步长，None=自动计算 (scene_scaling/resolution，参考Neuralangelo)
 args.num_eikonal_samples = 200000  # Eikonal loss 采样点数（仅在 band_threshold=None 时使用）
-args.eikonal_band_threshold = 0.2 # SDF band 阈值：仅计算 |SDF| < threshold 的顶点的 loss
+args.eikonal_band_threshold = 0.02 # SDF band 阈值：仅计算 |SDF| < threshold 的顶点的 loss
                                    # 设为 None 则计算所有内部顶点
 args.eikonal_tet_sampling = True  # 是否在 SDF 异号四面体内额外采样（参考 Neuralangelo）
                                    # True: band内顶点 + 四面体内采样; False: 仅 band内顶点
