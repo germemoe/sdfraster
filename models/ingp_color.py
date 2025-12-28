@@ -1552,7 +1552,7 @@ class TetOptimizer:
         for param_group in self.net_optim.param_groups:
             # [SDF-MODIFICATION] s_var 使用 10 倍学习率
             if param_group.get("name") == "s_var":
-                lr = self.net_scheduler_args(iteration) * 10
+                lr = self.net_scheduler_args(iteration) * 100
             else:
                 lr = self.net_scheduler_args(iteration)
             param_group['lr'] = lr
