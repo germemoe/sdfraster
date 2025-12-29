@@ -344,17 +344,59 @@ class iNGPDW(nn.Module):
             epsilon_res = self.resolutions[-1]
         return 1.0 / epsilon_res
 
-    def get_curvature_weight_decay(self):
-        """获取 curvature loss 的权重衰减因子 (参考 Neuralangelo)
+    def get_curvature_weight_decay(
+        self,
+        iteration: int,
+        warmup_end: int = 5000,
+        decay_end: int = 30000,
+        decay_enabled: bool = True
+    ):
+        """获取 curvature loss 的权重因子 (参考 Neuralangelo)
 
-        Neuralangelo: decay_factor = growth_rate^(anneal_levels - 1)
-        当激活更多层时，curvature 权重降低，允许更多高频细节
+        三种模式：
+        1. C2F 开启: Neuralangelo 逻辑（warmup + 基于 anneal_levels 衰减）
+        2. C2F 关闭 + decay_enabled: warmup 后线性衰减到 final_weight
+        3. C2F 关闭 + not decay_enabled: 固定权重 1.0（无 warmup，无 decay）
+
+        最终权重参考 Neuralangelo: 1 / (growth_rate^(L-1))
+
+        Args:
+            iteration: 当前迭代数
+            warmup_end: warmup 结束的迭代数
+            decay_end: 线性衰减结束的迭代数（仅非 C2F 模式）
+            decay_enabled: 是否启用衰减（仅非 C2F 模式）
+
+        Returns:
+            权重因子
         """
-        if self.coarse2fine_enabled and self.active_levels > 1:
-            decay_factor = self.per_level_scale ** (self.active_levels - 1)
-            return 1.0 / decay_factor
-        else:
+        # 最终权重: 参考 Neuralangelo，1 / (growth_rate^(L-1))
+        final_weight = 1.0 / (self.per_level_scale ** (self.L - 1))
+
+        # 模式 1: C2F 开启，使用 Neuralangelo 逻辑
+        if self.coarse2fine_enabled:
+            if iteration <= warmup_end:
+                return iteration / warmup_end
+            else:
+                if self.active_levels > 1:
+                    decay_factor = self.per_level_scale ** (self.active_levels - 1)
+                    return 1.0 / decay_factor
+                else:
+                    return 1.0
+
+        # 模式 3: 不启用衰减，固定权重
+        if not decay_enabled:
             return 1.0
+
+        # 模式 2: 启用衰减，warmup + 线性衰减到 final_weight
+        if iteration <= warmup_end:
+            # Warmup: 0 → 1
+            return iteration / warmup_end
+        elif iteration <= decay_end:
+            # 线性衰减: 1 → final_weight
+            progress = (iteration - warmup_end) / (decay_end - warmup_end)
+            return 1.0 - progress * (1.0 - final_weight)
+        else:
+            return final_weight
 
 
     def forward(self, x, cr, compute_sdf=True):
@@ -481,6 +523,7 @@ class Model(BaseModel):
         self.alpha = 0
         self.ablate_circumsphere = ablate_circumsphere
         self.ablate_gradient = ablate_gradient
+        self._cached_internal_edges = None  # [EDGE-CACHE] 内部边缓存
 
         k_samples = self.backbone.k_samples
         # indices = torch.arange(k_samples, dtype=torch.float32) + 0.5
@@ -520,6 +563,35 @@ class Model(BaseModel):
     @property
     def num_int_verts(self):
         return self.contracted_vertices.shape[0]
+
+    def get_internal_edges(self):
+        """
+        获取内部边（两端都是内部点的边），使用缓存避免重复计算
+
+        Returns:
+            edges: (E, 2) 内部边的顶点索引对
+        """
+        if self._cached_internal_edges is not None:
+            return self._cached_internal_edges
+
+        # 提取所有边
+        from utils.model_util import extract_edges_from_tets
+        edges = extract_edges_from_tets(self.indices)  # (E, 2)
+
+        num_internal = self.num_int_verts
+        num_verts = self.vertices.shape[0]
+
+        # 安全检查：确保索引不越界
+        valid_edges = (edges[:, 0] < num_verts) & (edges[:, 1] < num_verts)
+        if not valid_edges.all():
+            edges = edges[valid_edges]
+
+        # 排除包含外部点的边（只保留两端都是内部点的边）
+        internal_mask = (edges[:, 0] < num_internal) & (edges[:, 1] < num_internal)
+        edges = edges[internal_mask]
+
+        self._cached_internal_edges = edges
+        return edges
 
     def get_circumcenters(self):
         circumcenter =  pre_calc_cell_values(
@@ -1071,6 +1143,8 @@ class Model(BaseModel):
             alpha_threshold: NeuS alpha 阈值，如果四面体最大可能 alpha < threshold，则裁剪
                             设为 0 禁用此裁剪
         """
+        # [EDGE-CACHE] 清除边缓存
+        self._cached_internal_edges = None
         torch.cuda.empty_cache()
         verts = self.vertices
         if high_precision:
@@ -1485,10 +1559,11 @@ class TetOptimizer:
             {"params": model.backbone.gradient_net.parameters(),  "lr": network_lr, "name": "gradient"},
             {"params": model.backbone.sh_net.parameters(),        "lr": network_lr,       "name": "sh"},
         ]
-        # [SDF-MODIFICATION] 如果 s_var 是可学习参数，添加到优化器
-        # s_var 学习率放大 10 倍，因为训练迭代数（18K）远少于 Neuralangelo（300K）
+        # [SDF-MODIFICATION] s_var 学习率倍率（实际 lr 由 update_learning_rate 设置）
+        self.s_var_lr_multiplier = 100
         if model.backbone.s_var_learn:
-            net_param_groups.append({"params": [model.backbone.s_var], "lr": network_lr * 100, "name": "s_var"})
+            # 初始 lr 会被 update_learning_rate 立即覆盖，这里只是占位
+            net_param_groups.append({"params": [model.backbone.s_var], "lr": network_lr, "name": "s_var"})
 
         self.net_optim = optim.CustomAdam(net_param_groups, ignore_param_list=[], betas=[0.9, 0.999], eps=1e-15)
         self.vert_lr_multi = float(model.scene_scaling.cpu())
@@ -1550,9 +1625,9 @@ class TetOptimizer:
         self.iteration = iteration
         self.model.alpha = self.alpha_sched(iteration)
         for param_group in self.net_optim.param_groups:
-            # [SDF-MODIFICATION] s_var 使用 10 倍学习率
+            # [SDF-MODIFICATION] s_var 使用独立的学习率倍率
             if param_group.get("name") == "s_var":
-                lr = self.net_scheduler_args(iteration) * 100
+                lr = self.net_scheduler_args(iteration) * self.s_var_lr_multiplier
             else:
                 lr = self.net_scheduler_args(iteration)
             param_group['lr'] = lr

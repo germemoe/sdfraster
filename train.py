@@ -28,7 +28,7 @@ torch.cuda.manual_seed_all(SEED)
 
 from utils import cam_util
 from utils.train_util import *
-from utils.model_util import eikonal_loss, curvature_loss, sample_eikonal_points
+from utils.model_util import eikonal_loss, curvature_loss, sample_eikonal_points, edge_sdf_loss
 # from models.vertex_color import Model, TetOptimizer
 from models.ingp_color import Model, TetOptimizer
 from models.frozen import freeze_model
@@ -172,15 +172,25 @@ args.lambda_curvature = 0.0 #5e-4   # Curvature loss 权重
 args.eikonal_start = 0            # 开始使用 eikonal loss 的迭代
 args.eikonal_end = 30000          # 停止使用 eikonal loss 的迭代
 args.curvature_start = 0         # 开始使用 curvature loss 的迭代
-args.curvature_end = 30000        # 停止使用 curvature loss 的迭代
+args.curvature_end = 18000        # 停止使用 curvature loss 的迭代
+args.curvature_warmup = 2000      # curvature loss warmup 迭代数（从 curvature_start 开始）
+args.curvature_decay_enabled = True  # 是否启用 curvature 权重衰减（非 C2F 模式下）
 args.gradient_mode = "numerical"  # "analytical" 或 "numerical"
 args.gradient_taps = 4            # 数值梯度采样点数：4 或 6
 args.gradient_eps = None          # 数值梯度步长，None=自动计算 (scene_scaling/resolution，参考Neuralangelo)
-args.num_eikonal_samples = 200000  # Eikonal loss 采样点数（仅在 band_threshold=None 时使用）
-args.eikonal_band_threshold = 0.002 # SDF band 阈值：仅计算 |SDF| < threshold 的顶点的 loss
+args.num_eikonal_samples = 100000  # Eikonal loss 采样点数（仅在 band_threshold=None 时使用）
+args.eikonal_band_threshold = None # SDF band 阈值：仅计算 |SDF| < threshold 的顶点的 loss
                                    # 设为 None 则计算所有内部顶点
-args.eikonal_tet_sampling = True  # 是否在 SDF 异号四面体内额外采样（参考 Neuralangelo）
+args.eikonal_tet_sampling = False  # 是否在 SDF 异号四面体内额外采样（参考 Neuralangelo）
                                    # True: band内顶点 + 四面体内采样; False: 仅 band内顶点
+
+# [EDGE-SDF-LOSS] Edge SDF Loss 设置（参考 svraster TV loss）
+args.lambda_edge_sdf = 0.0        # Edge SDF loss 权重，0 表示关闭
+args.edge_sdf_start = 0           # 开始使用 edge sdf loss 的迭代
+args.edge_sdf_end = 30000         # 停止使用 edge sdf loss 的迭代
+args.edge_sdf_threshold = 0.1     # SDF band 阈值：只计算至少一端 |SDF| < threshold 的边
+args.edge_length_threshold = None # 边长阈值：只计算长度 < threshold 的边，None 表示不限制
+args.edge_sdf_target = None       # 目标值：None=平滑模式(最小化), 1.0=Eikonal模式(约束接近1)
 
 # [MESH-NORMAL-LOSS] Mesh 法线一致性 Loss 设置（参考 MILo）
 args.lambda_mesh_normal = 0.0   # mesh normal loss 权重
@@ -188,15 +198,15 @@ args.lambda_mesh_depth = 0.0     # mesh depth loss 权重
 args.lambda_mesh_occupancy = 0.0 # surface occupancy loss 权重
 args.mesh_depth_scale = None     # depth loss 的 scale 参数 (None则使用spatial_lr_scale)
 args.mesh_depth_ratio = 1.0      # MILo: median深度的混合比例 (0.0=仅期望深度, 1.0=仅中位深度)
-args.mesh_normal_start = 5001     # 开始使用 mesh normal loss 的迭代
-args.mesh_normal_stop = 18000     # 停止使用 mesh normal loss 的迭代
+args.mesh_normal_start = 5000     # 开始使用 mesh normal loss 的迭代
+args.mesh_normal_stop = 16000     # 停止使用 mesh normal loss 的迭代
 args.mesh_sdf_threshold = 0.0     # mesh 提取的 SDF 阈值
 
 # [DEPTH-NORMAL-LOSS] 深度推导法线与渲染法线一致性 Loss（参考 MILo）
 args.lambda_normal_depth = 0.0      # 渲染的normal vs 期望深度推导的normal
 args.lambda_normal_depth_med = 0.0  # 渲染的normal vs 中位深度推导的normal
-args.normal_depth_start = 5001         # 开始使用 normal-depth loss 的迭代
-args.normal_depth_end = 30000       # 停止使用 normal-depth loss 的迭代
+args.normal_depth_start = 5000       # 开始使用 normal-depth loss 的迭代
+args.normal_depth_end = 16000       # 停止使用 normal-depth loss 的迭代
 
 # [MASK-LOSS] Mask Loss 和 Transmittance Concentration Loss（参考 SVRaster）
 args.lambda_mask = 0.1           # mask loss 权重：约束 T 与 GT mask 对齐
@@ -280,12 +290,12 @@ else:
                                 current_sh_deg = args.max_sh_deg if args.sh_interval <= 0 else 0,
                                 **args.as_dict())
 
-# [GEOMETRIC-INIT] 验证几何初始化是否成功
-# 在训练开始前检查 Eikonal loss 和 SDF 分布
-init_mesh_path = args.output_path / "init_mesh.ply"
-init_result = model.verify_geometric_init(save_mesh_path=init_mesh_path)
-if not init_result['is_success']:
-    print("[WARNING] Geometric initialization may have issues. Consider checking sdf_bias parameter.")
+# # [GEOMETRIC-INIT] 验证几何初始化是否成功
+# # 在训练开始前检查 Eikonal loss 和 SDF 分布
+# init_mesh_path = args.output_path / "init_mesh.ply"
+# init_result = model.verify_geometric_init(save_mesh_path=init_mesh_path)
+# if not init_result['is_success']:
+#     print("[WARNING] Geometric initialization may have issues. Consider checking sdf_bias parameter.")
 
 min_t = args.min_t
 
@@ -335,8 +345,8 @@ print("Encoding LR")
 
 densification_sampler = SimpleSampler(len(train_cameras), args.num_samples)
 
-video_writer = cv2.VideoWriter(str(args.output_path / "training.mp4"), cv2.VideoWriter_fourcc(*'mp4v'), 30,
-                               pad_hw2even(sample_camera.image_width, sample_camera.image_height))
+# [DISABLED] video_writer = cv2.VideoWriter(str(args.output_path / "training.mp4"), cv2.VideoWriter_fourcc(*'mp4v'), 30,
+#                                pad_hw2even(sample_camera.image_width, sample_camera.image_height))
 
 # 创建渲染图保存目录
 render_save_dir = args.output_path / "renders"
@@ -439,9 +449,27 @@ for iteration in progress_bar:
                 eik_loss = eikonal_loss(gradients)
             if curvature_active and hessian_diag is not None:
                 curv_loss = curvature_loss(hessian_diag)
-                # [Coarse2Fine] curvature 权重衰减 (参考 Neuralangelo)
-                if args.coarse2fine_enabled:
-                    curv_weight_decay = model.backbone.get_curvature_weight_decay()
+                # [Neuralangelo] curvature 权重调度
+                curv_weight_decay = model.backbone.get_curvature_weight_decay(
+                    iteration=iteration,
+                    warmup_end=args.curvature_start + args.curvature_warmup,
+                    decay_end=args.curvature_end,
+                    decay_enabled=args.curvature_decay_enabled
+                )
+
+    # [EDGE-SDF-LOSS] Edge SDF Loss（参考 svraster TV loss）
+    edge_loss = torch.tensor(0.0, device=device)
+    edge_num_edges = 0
+    edge_sdf_active = (args.lambda_edge_sdf > 0 and
+                       args.edge_sdf_start <= iteration < args.edge_sdf_end)
+    if edge_sdf_active:
+        edge_loss, edge_num_edges = edge_sdf_loss(
+            model,
+            vert_sdf=None,  # 让函数内部计算
+            sdf_threshold=args.edge_sdf_threshold,
+            edge_length_threshold=args.edge_length_threshold,
+            target=args.edge_sdf_target
+        )
 
     # [MESH-LOSS] Mesh 正则化 Loss (normal + depth + occupancy)
     mesh_loss = torch.tensor(0.0, device=device)
@@ -539,7 +567,8 @@ for iteration in progress_bar:
            (args.lambda_normal_depth * normal_depth_loss if normal_depth_active and args.lambda_normal_depth > 0 else 0.0) + \
            (args.lambda_normal_depth_med * normal_depth_med_loss if normal_depth_active and args.lambda_normal_depth_med > 0 else 0.0) + \
            args.lambda_mask * mask_loss + \
-           args.lambda_T_concen * T_concen_loss
+           args.lambda_T_concen * T_concen_loss + \
+           (args.lambda_edge_sdf * edge_loss if edge_sdf_active else 0.0)
 
     loss.backward()
 
@@ -636,6 +665,9 @@ for iteration in progress_bar:
         postfix_dict["ND"] = repr(f"{normal_depth_loss.item():.3f}")
     if args.lambda_normal_depth_med > 0:
         postfix_dict["NDm"] = repr(f"{normal_depth_med_loss.item():.3f}")
+    # [EDGE-SDF-LOSS] 显示 edge sdf loss（仅当激活时）
+    if edge_sdf_active and edge_num_edges > 0:
+        postfix_dict["Edge"] = repr(f"{edge_loss.item():.3f}")
     progress_bar.set_postfix(postfix_dict)
 
     # 每k次迭代保存渲染图
@@ -846,7 +878,7 @@ for iteration in progress_bar:
                     print(f"[Mesh] Failed to render mesh at iter {iteration}: {e}")
 
 avged_psnrs = [sum(v)/len(v) for v in psnrs if len(v) == len(train_cameras)]
-video_writer.release()
+# [DISABLED] video_writer.release()
 
 torch.cuda.synchronize()
 torch.cuda.empty_cache()
@@ -864,16 +896,16 @@ with (args.output_path / "results.json").open("w") as f:
     )
     json.dump(all_data, f, cls=CustomEncoder)
 
-with torch.no_grad():
-    epath = cam_util.generate_cam_path(train_cameras, 400)
-    eimages = []
-    for camera in tqdm(epath):
-        render_pkg = render(camera, model, min_t=min_t, tile_size=args.tile_size)
-        image = render_pkg['render']
-        image = image.permute(1, 2, 0)
-        image = image.detach().cpu().numpy()
-        eimages.append(pad_image2even(image))
-mediapy.write_video(args.output_path / "rotating.mp4", eimages)
+# with torch.no_grad():
+#     epath = cam_util.generate_cam_path(train_cameras, 400)
+#     eimages = []
+#     for camera in tqdm(epath):
+#         render_pkg = render(camera, model, min_t=min_t, tile_size=args.tile_size)
+#         image = render_pkg['render']
+#         image = image.permute(1, 2, 0)
+#         image = image.detach().cpu().numpy()
+#         eimages.append(pad_image2even(image))
+# mediapy.write_video(args.output_path / "rotating.mp4", eimages)
 
 model.save2ply(args.output_path / "ckpt.ply")
 sd = model.state_dict()

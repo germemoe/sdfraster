@@ -162,93 +162,183 @@ def curvature_loss(hessian_diag: torch.Tensor, mask: torch.Tensor = None) -> tor
 
 def sample_eikonal_points(model, num_samples: int = 50000, band: float = 0.1, use_tet_sampling: bool = True):
     """
-    采样 Eikonal loss 计算点（参考 Neuralangelo 的采样策略）
+    采样 Eikonal loss 计算点
 
     策略：
-    1. Band 内顶点：|SDF| < band 的内部顶点（band=None 时使用所有内部顶点）
-    2. SDF 异号四面体内采样：穿过表面的四面体内随机采样（use_tet_sampling=True 时）
+    1. 找满足条件的候选点：|SDF| < band 的内部顶点（band=None 时使用所有内部顶点）
+    2. 如果候选点数量 >= num_samples：用 topk 取 |SDF| 最小的 num_samples 个点
+    3. 如果候选点数量 < num_samples 且 use_tet_sampling=True：
+       在候选点邻域球体内采样补足到目标数量
 
     Args:
         model: Model 实例
-        num_samples: 目标总采样点数（仅在 use_tet_sampling=True 时使用）
+        num_samples: 目标总采样点数
         band: SDF band 阈值（世界坐标），None 表示使用所有内部顶点
-        use_tet_sampling: 是否在 SDF 异号四面体内额外采样
+        use_tet_sampling: 当候选点不足时，是否在邻域内采样补足
 
     Returns:
         all_points: (M, 3) 采样点坐标
-        num_band: band 内顶点数
-        num_tet_samples: 四面体内采样点数
+        num_band: band 内顶点数（原始候选点数）
+        num_tet_samples: 邻域内额外采样点数
     """
     device = model.device
 
-    # 1. 获取所有顶点的 SDF
-    with torch.no_grad():
-        all_verts = model.vertices
-        vert_sdf = model.query_vert_sdf(all_verts)  # (num_verts,)
-
-    # 2. 内部顶点（排除 ext_vertices）
+    # 1. 只在内部顶点上操作（排除 ext_vertices）
     num_internal = model.num_int_verts
-    internal_mask = torch.arange(len(vert_sdf), device=device) < num_internal
+    internal_verts = model.vertices[:num_internal]  # (num_internal, 3)
 
+    with torch.no_grad():
+        vert_sdf = model.query_vert_sdf(internal_verts)  # (num_internal,)
+
+    # 2. 筛选候选点
     if band is not None:
-        # Band 内的内部顶点
-        band_mask = (vert_sdf.abs() < band) & internal_mask
+        candidate_mask = vert_sdf.abs() < band
+        candidate_indices = candidate_mask.nonzero(as_tuple=True)[0]
     else:
-        # 所有内部顶点
-        band_mask = internal_mask
+        # 所有内部顶点都是候选
+        candidate_indices = torch.arange(num_internal, device=device)
 
-    band_points = all_verts[band_mask]
-    num_band = band_points.shape[0]
+    num_candidates = candidate_indices.shape[0]
 
-    # 3. 如果不使用四面体采样，直接返回 band 内顶点
-    if not use_tet_sampling:
+    # 3. 根据候选点数量决定策略
+    if num_candidates >= num_samples:
+        # 候选点足够：用 topk 取 |SDF| 最小的 num_samples 个
+        candidate_sdf_abs = vert_sdf[candidate_indices].abs()
+        _, topk_indices = candidate_sdf_abs.topk(num_samples, largest=False)
+        selected_indices = candidate_indices[topk_indices]
+        band_points = internal_verts[selected_indices]
+        return band_points, num_candidates, 0
+
+    # 4. 候选点不足
+    band_points = internal_verts[candidate_indices]
+    num_band = num_candidates
+
+    if not use_tet_sampling or num_band == 0:
         return band_points, num_band, 0
 
-    # 4. 找到 SDF 异号的四面体（穿过表面）
-    tet_sdf = vert_sdf[model.indices.long()]  # (num_tets, 4)
-    has_positive = (tet_sdf > 0).any(dim=1)
-    has_negative = (tet_sdf < 0).any(dim=1)
-    crossing_mask = has_positive & has_negative  # 穿过表面的四面体
-    crossing_indices = model.indices[crossing_mask]  # (num_crossing, 4)
-    num_crossing = crossing_indices.shape[0]
+    # 5. 在候选点邻域球体内随机采样补足
+    num_need = num_samples - num_band
 
-    # 5. 在异号四面体内采样，补足到目标数量
-    num_need = max(0, num_samples - num_band)
-
-    if num_need > 0 and num_crossing > 0:
-        # 计算每个四面体采样的点数
-        samples_per_tet = max(1, (num_need + num_crossing - 1) // num_crossing)
-
-        # 使用 Dirichlet(1,1,1,1) 分布在四面体内均匀采样
-        # 重心坐标 (w0, w1, w2, w3)，满足 w0+w1+w2+w3=1, wi>=0
-        alpha = torch.ones(4, device=device)
-        bary = torch.distributions.Dirichlet(alpha).sample((num_crossing, samples_per_tet))  # (num_crossing, samples_per_tet, 4)
-
-        # 四面体顶点坐标
-        tet_verts = all_verts[crossing_indices.long()]  # (num_crossing, 4, 3)
-
-        # 重心坐标插值: point = sum(wi * vi)
-        sampled_points = torch.einsum('nvc,nsv->nsc', tet_verts, bary)  # (num_crossing, samples_per_tet, 3)
-        sampled_points = sampled_points.reshape(-1, 3)
-
-        # 截取到需要的数量
-        if sampled_points.shape[0] > num_need:
-            perm = torch.randperm(sampled_points.shape[0], device=device)[:num_need]
-            sampled_points = sampled_points[perm]
-
-        num_tet_samples = sampled_points.shape[0]
+    # 计算步长：使用 eps（数值梯度步长）作为邻域半径
+    if hasattr(model.backbone, 'get_normal_epsilon'):
+        eps = model.backbone.get_normal_epsilon() * float(model.scene_scaling)
     else:
-        sampled_points = torch.empty(0, 3, device=device)
-        num_tet_samples = 0
+        finest_res = model.backbone.base_resolution * (model.backbone.per_level_scale ** (model.backbone.L - 1))
+        eps = float(model.scene_scaling) / finest_res
 
-    # 5. 合并所有采样点
-    if num_band > 0 and num_tet_samples > 0:
-        all_points = torch.cat([band_points, sampled_points], dim=0)
-    elif num_band > 0:
-        all_points = band_points
-    elif num_tet_samples > 0:
-        all_points = sampled_points
+    # 从现有候选点中随机选取基点（允许重复）
+    base_indices = torch.randint(0, num_band, (num_need,), device=device)
+    base_points = band_points[base_indices]
+
+    # 球体内均匀采样：方向随机 + 半径 ~ U(0, 3*eps)
+    random_dirs = torch.randn(num_need, 3, device=device)
+    random_dirs = random_dirs / (random_dirs.norm(dim=-1, keepdim=True) + 1e-8)
+    random_radius = torch.rand(num_need, 1, device=device) * (3 * eps)  # U(0, 3*eps)
+    sampled_points = base_points + random_dirs * random_radius
+
+    # 6. 合并
+    all_points = torch.cat([band_points, sampled_points], dim=0)
+    return all_points, num_band, sampled_points.shape[0]
+
+
+def extract_edges_from_tets(indices: torch.Tensor) -> torch.Tensor:
+    """
+    从四面体索引中提取所有唯一的边
+
+    Args:
+        indices: (T, 4) 四面体顶点索引
+
+    Returns:
+        edges: (E, 2) 唯一边的顶点索引对，已排序（小索引在前）
+    """
+    # 每个四面体有 6 条边: (0,1), (0,2), (0,3), (1,2), (1,3), (2,3)
+    edge_pairs = torch.tensor([
+        [0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3]
+    ], device=indices.device)
+
+    # 提取所有边 (T*6, 2)
+    all_edges = indices[:, edge_pairs].reshape(-1, 2)
+
+    # 排序每条边（小索引在前），便于去重
+    all_edges = all_edges.sort(dim=1).values
+
+    # 去重
+    unique_edges = torch.unique(all_edges, dim=0)
+
+    return unique_edges
+
+
+def edge_sdf_loss(
+    model,
+    vert_sdf: torch.Tensor = None,
+    sdf_threshold: float = 0.1,
+    edge_length_threshold: float = None,
+    target: float = None
+):
+    """
+    Edge SDF Loss：约束边两端顶点的 SDF 变化率
+
+    逻辑：
+    - diff / edge_length 归一化，消除边长对 SDF 差异的影响
+    - 只考虑表面附近的边（至少一端 |SDF| < sdf_threshold）
+    - 排除包含外部点的边
+
+    Args:
+        model: Model 实例
+        vert_sdf: 预计算的顶点 SDF，None 则现场计算（只计算内部点）
+        sdf_threshold: SDF 阈值，只考虑表面附近的边
+        edge_length_threshold: 边长阈值，只考虑短边（可选）
+        target: 目标值，None 则最小化 diff/length（平滑），
+                设为 1.0 则约束 ((diff/length) - 1)^2（Eikonal 风格）
+
+    Returns:
+        loss: scalar
+        num_edges: 参与计算的边数
+    """
+    device = model.device
+    num_internal = model.num_int_verts
+
+    # 1. 获取内部边（使用缓存）
+    edges = model.get_internal_edges()  # (E, 2)，已排除外部点
+
+    if edges.shape[0] == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True), 0
+
+    # 2. 计算边长（detach，不让梯度流向顶点位置）
+    vertices = model.vertices
+    v0, v1 = vertices[edges[:, 0]], vertices[edges[:, 1]]
+    edge_length = (v0 - v1).norm(dim=-1).detach()  # (E,)
+
+    # 3. 获取顶点 SDF（只查询内部点，需要梯度以便反向传播）
+    if vert_sdf is None:
+        internal_verts = model.vertices[:num_internal]
+        vert_sdf = model.query_vert_sdf(internal_verts)  # (num_internal,)
+
+    sdf_a, sdf_b = vert_sdf[edges[:, 0]], vert_sdf[edges[:, 1]]
+    diff = (sdf_a - sdf_b).abs()
+
+    # 4. 筛选：表面附近的边（至少一端接近表面）
+    near_surface = (sdf_a.abs() < sdf_threshold) | (sdf_b.abs() < sdf_threshold)
+
+    # 5. 筛选：短边（可选）
+    if edge_length_threshold is not None:
+        short_edge = edge_length < edge_length_threshold
+        mask = near_surface & short_edge
     else:
-        all_points = torch.empty(0, 3, device=device)
+        mask = near_surface
 
-    return all_points, num_band, num_tet_samples
+    num_edges = mask.sum().item()
+    if num_edges == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True), 0
+
+    # 6. 计算 loss
+    ratio = diff[mask] / (edge_length[mask] + 1e-8)
+
+    if target is not None:
+        # Eikonal 风格：约束 ratio 接近 target
+        loss = ((ratio - target) ** 2).mean()
+    else:
+        # 平滑风格：最小化 ratio
+        loss = ratio.mean()
+
+    return loss, num_edges
