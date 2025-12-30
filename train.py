@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import sys
 sys.path.append(str(Path(os.path.abspath('')).parent))
-print(str(Path(os.path.abspath('')).parent))
+# print(str(Path(os.path.abspath('')).parent))
 import math
 import torch
 from data import loader
@@ -258,7 +258,8 @@ args.save_render_interval = 500  # 每k次迭代保存渲染图，0表示不保�
 args.save_mesh_interval = 1000   # 每k次迭代用MT提取mesh并保存，0表示不保存
 
 # [MESH-EVAL] DTU Mesh 评估设置（参考 svraster）
-args.eval_dtu = True            # 是否进行 DTU 评估
+args.eval_dtu = False            # 是否进行 DTU 评估（仅对 DTU 数据集有效）
+args.eval_dtu_apply_scale = False  # 是否应用 scale_mat 变换（当 DTU 数据有 cameras.npz 时需要）
 
 
 args = Args.from_namespace(args.get_parser().parse_args())
@@ -924,11 +925,23 @@ with torch.no_grad():
     if final_mesh_faces.shape[0] > 0:
         # [COORD-FIX] 将 mesh 顶点从训练坐标系变换回原始世界坐标系
         # 训练时做了 PCA 变换: 原始坐标 → pca_transform → 训练坐标
-        # 现在需要逆变换: 训练坐标 → inv(pca_transform) → 原始坐标
+        # 现在需要逆变换: 训练坐标 → inv(pca_transform) → 原始坐标（COLMAP坐标系）
         inv_transform = np.linalg.inv(scene_info.transform)
         verts_np = final_mesh_verts.cpu().numpy()
         verts_hom = np.hstack([verts_np, np.ones((verts_np.shape[0], 1))])
-        verts_world = (inv_transform @ verts_hom.T).T[:, :3]
+        verts_colmap = (inv_transform @ verts_hom.T).T[:, :3]
+
+        # [DTU-COORD] 如果存在 colmap_to_dtu.txt 变换矩阵，则应用它
+        # 这个矩阵需要通过点云配准得到（COLMAP → DTU 坐标系）
+        colmap_to_dtu_path = args.dataset_path / 'colmap_to_dtu.txt'
+        if colmap_to_dtu_path.exists():
+            print(f"[Mesh] Found colmap_to_dtu.txt, applying transform to DTU world coords")
+            colmap_to_dtu = np.loadtxt(str(colmap_to_dtu_path))
+            verts_hom = np.hstack([verts_colmap, np.ones((verts_colmap.shape[0], 1))])
+            verts_world = (colmap_to_dtu @ verts_hom.T).T[:, :3]
+        else:
+            verts_world = verts_colmap
+
         final_mesh_verts_world = torch.from_numpy(verts_world).float().to(final_mesh_verts.device)
 
         final_mesh = Meshes(final_mesh_verts_world, final_mesh_faces)
@@ -939,26 +952,39 @@ with torch.no_grad():
         # [DTU-EVAL] DTU 评估（参考 svraster）
         if args.eval_dtu:
             try:
-                script_path = os.path.join(os.path.dirname(__file__), 'eval_dtu_vanilla', 'evaluate_single_scene.py')
                 src_path = os.path.normpath(str(args.dataset_path))
                 scan_folder = os.path.basename(src_path)
+                dataset_root = os.path.dirname(src_path)
+
                 # 从文件夹名提取 scan_id（例如 scan37 -> 37）
                 scan_digits = ''.join([c for c in scan_folder if c.isdigit()])
                 scan_id = scan_digits if scan_digits else '37'
-                dataset_root = os.path.dirname(src_path)
-                eval_outdir = os.path.join(str(args.output_path), 'eval_dtu_vanilla')
-                os.makedirs(eval_outdir, exist_ok=True)
-                cmd = [
-                    sys.executable, script_path,
-                    '--input_mesh', str(final_mesh_path),
-                    '--scan_id', str(scan_id),
-                    '--output_dir', eval_outdir,
-                    '--mask_dir', dataset_root,
-                    '--DTU', dataset_root,
-                    # 默认不做 scale_mat 变换（mesh 已在世界坐标系）
-                ]
-                print('[EVAL-DTU] mesh eval cmd:', ' '.join(cmd))
-                subprocess.run(cmd, check=False)
+
+                # 检查是否为 DTU 数据集（需要 ObsMask 和 cameras.npz）
+                obs_mask_path = os.path.join(dataset_root, 'ObsMask', f'ObsMask{scan_id}_10.mat')
+                cameras_path = os.path.join(src_path, 'cameras.npz')
+                is_dtu = os.path.exists(obs_mask_path) or os.path.exists(cameras_path)
+
+                if not is_dtu:
+                    print(f"[EVAL-DTU] Skipping: not a DTU dataset (no ObsMask or cameras.npz found)")
+                    print(f"           Checked: {obs_mask_path}")
+                else:
+                    script_path = os.path.join(os.path.dirname(__file__), 'eval_dtu_vanilla', 'evaluate_single_scene.py')
+                    eval_outdir = os.path.join(str(args.output_path), 'eval_dtu_vanilla')
+                    os.makedirs(eval_outdir, exist_ok=True)
+                    cmd = [
+                        sys.executable, script_path,
+                        '--input_mesh', str(final_mesh_path),
+                        '--scan_id', str(scan_id),
+                        '--output_dir', eval_outdir,
+                        '--mask_dir', dataset_root,
+                        '--DTU', dataset_root,
+                    ]
+                    # 如果需要应用 scale_mat 变换
+                    if args.eval_dtu_apply_scale:
+                        cmd.append('--apply_scale_transform')
+                    print('[EVAL-DTU] mesh eval cmd:', ' '.join(cmd))
+                    subprocess.run(cmd, check=False)
             except Exception as e:
                 print(f"[EVAL-DTU] eval failed: {e}")
     else:

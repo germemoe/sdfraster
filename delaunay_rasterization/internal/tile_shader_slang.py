@@ -53,15 +53,26 @@ def vertex_and_tile_shader(indices,
               blockSize=(256, 1, 1),
               gridSize=(ceil_div(n_tetra, 256), 1, 1)
         )
+        torch.cuda.synchronize()  # [DEBUG] 同步检查 generate_keys 是否崩溃
+        print(f"[DEBUG tile_shader] generate_keys done, n_tetra={n_tetra}, total_size_index_buffer={total_size_index_buffer}")
 
         highest_tile_id_msb = (render_grid.grid_width*render_grid.grid_height).bit_length()
         sorted_keys, sorted_tetra_idx = sort_by_keys_cub.sort_by_keys(
             unsorted_keys, unsorted_tetra_idx, highest_tile_id_msb)
 
-        tile_ranges = torch.zeros((render_grid.grid_height*render_grid.grid_width, 2), 
+        tile_ranges = torch.zeros((render_grid.grid_height*render_grid.grid_width, 2),
                                   device="cuda",
                                   dtype=torch.int32)
         if total_size_index_buffer > 0:
+            # [DEBUG] 调试 compute_tile_ranges 崩溃
+            print(f"[DEBUG tile_shader] total_size_index_buffer: {total_size_index_buffer}")
+            print(f"[DEBUG tile_shader] sorted_keys shape: {sorted_keys.shape}, dtype: {sorted_keys.dtype}")
+            print(f"[DEBUG tile_shader] sorted_keys min: {sorted_keys.min()}, max: {sorted_keys.max()}")
+            print(f"[DEBUG tile_shader] tile_ranges shape: {tile_ranges.shape}")
+            print(f"[DEBUG tile_shader] grid: {render_grid.grid_width}x{render_grid.grid_height}")
+            gridSize_val = ceil_div(total_size_index_buffer, 256).item() if isinstance(total_size_index_buffer, torch.Tensor) else ceil_div(total_size_index_buffer, 256)
+            print(f"[DEBUG tile_shader] gridSize: {gridSize_val}")
+            torch.cuda.synchronize()  # 确保之前的 kernel 都完成
             slang_modules.tile_shader.compute_tile_ranges(sorted_keys=sorted_keys,
                                                         out_tile_ranges=tile_ranges).launchRaw(
                     blockSize=(256, 1, 1),

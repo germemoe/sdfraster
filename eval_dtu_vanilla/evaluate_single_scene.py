@@ -111,10 +111,10 @@ if __name__ == "__main__":
     )
 
     parser.add_argument('--input_mesh', type=str,  help='path to the mesh to be evaluated')
-    parser.add_argument('--scan_id', type=str,  help='scan id of the input mesh')
+    parser.add_argument('--scan_id', type=str, default='37', help='scan id of the input mesh')
     parser.add_argument('--output_dir', type=str, default='evaluation_results_single', help='path to the output folder')
-    parser.add_argument('--mask_dir', type=str,  default='mask', help='path to uncropped mask')
-    parser.add_argument('--DTU', type=str,  default='Offical_DTU_Dataset', help='path to the GT DTU point clouds')
+    parser.add_argument('--mask_dir', type=str,  default='/storage/jk/dataset/DTU', help='path to uncropped mask')
+    parser.add_argument('--DTU', type=str,  default='/storage/jk/dataset/DTU', help='path to the GT DTU point clouds')
     parser.add_argument('--apply_scale_transform', action='store_true',
                         help='apply scale_mat transform (for old meshes in training coords)')
     args = parser.parse_args()
