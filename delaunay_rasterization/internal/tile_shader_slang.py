@@ -36,6 +36,12 @@ def vertex_and_tile_shader(indices,
         index_buffer_offset = torch.cumsum(tiles_touched, dim=0, dtype=tiles_touched.dtype)
         max_mask = (tiles_touched == cam['grid_width']*cam['grid_height'])
         total_size_index_buffer = index_buffer_offset[-1]
+
+        # [DEBUG] 检查输入数据是否有异常
+        print(f"[DEBUG tile_shader] vs_tetra: min={vs_tetra.min().item():.4f}, max={vs_tetra.max().item():.4f}, has_nan={torch.isnan(vs_tetra).any()}, has_inf={torch.isinf(vs_tetra).any()}")
+        print(f"[DEBUG tile_shader] rect_tile_space: min={rect_tile_space.min().item()}, max={rect_tile_space.max().item()}")
+        print(f"[DEBUG tile_shader] tiles_touched: min={tiles_touched.min().item()}, max={tiles_touched.max().item()}, sum={tiles_touched.sum().item()}")
+
         unsorted_keys = torch.zeros((total_size_index_buffer,), 
                                     device="cuda", 
                                     dtype=torch.int64)
@@ -55,6 +61,7 @@ def vertex_and_tile_shader(indices,
         )
         torch.cuda.synchronize()  # [DEBUG] 同步检查 generate_keys 是否崩溃
         print(f"[DEBUG tile_shader] generate_keys done, n_tetra={n_tetra}, total_size_index_buffer={total_size_index_buffer}")
+        print(f"[DEBUG tile_shader] unsorted_keys: min={unsorted_keys.min().item()}, max={unsorted_keys.max().item()}")
 
         highest_tile_id_msb = (render_grid.grid_width*render_grid.grid_height).bit_length()
         sorted_keys, sorted_tetra_idx = sort_by_keys_cub.sort_by_keys(

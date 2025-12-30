@@ -258,8 +258,7 @@ args.save_render_interval = 500  # 每k次迭代保存渲染图，0表示不保�
 args.save_mesh_interval = 1000   # 每k次迭代用MT提取mesh并保存，0表示不保存
 
 # [MESH-EVAL] DTU Mesh 评估设置（参考 svraster）
-args.eval_dtu = False            # 是否进行 DTU 评估（仅对 DTU 数据集有效）
-args.eval_dtu_apply_scale = False  # 是否应用 scale_mat 变换（当 DTU 数据有 cameras.npz 时需要）
+args.eval_dtu = True            # 是否进行 DTU 评估（仅对 DTU 数据集有效）
 
 
 args = Args.from_namespace(args.get_parser().parse_args())
@@ -312,7 +311,7 @@ mesh_regularizer = MeshRegularizer(
     depth_scale=args.mesh_depth_scale,
     depth_ratio=args.mesh_depth_ratio,  # MILo: 期望/中位深度混合比例
     sdf_threshold=args.mesh_sdf_threshold,
-    use_opengl=True,
+    use_opengl=False,  # [DEBUG] 使用CUDA后端，避免OpenGL/CUDA冲突
 )
 
 if args.eval:
@@ -400,6 +399,10 @@ for iteration in progress_bar:
     gt_mask = camera.gt_alpha_mask.cuda()
 
     st = time.time()
+    # [DEBUG] 检查顶点是否有异常值
+    if iteration >= 5000:
+        verts = model.vertices
+        print(f"[DEBUG render] iter={iteration}, verts: min={verts.min().item():.4f}, max={verts.max().item():.4f}, has_nan={torch.isnan(verts).any()}, has_inf={torch.isinf(verts).any()}")
     ray_jitter = torch.rand((camera.image_height, camera.image_width, 2), device=device)
     render_pkg = render(camera, model, scene_scaling=model.scene_scaling, ray_jitter=ray_jitter, **args.as_dict())
     image = render_pkg['render']
@@ -493,6 +496,9 @@ for iteration in progress_bar:
         )
         mesh_loss = mesh_reg_result['loss']
         mesh_loss_active = mesh_reg_result['active']
+        # [DEBUG] 检查 mesh_regularizer 是否导致 CUDA 错误
+        torch.cuda.synchronize()
+        print(f"[DEBUG mesh_reg] iter={iteration}, mesh_loss={mesh_loss.item():.6f}, active={mesh_loss_active}")
 
     # [DEPTH-NORMAL-LOSS] 深度推导法线与渲染法线一致性 Loss
     normal_depth_loss = torch.tensor(0.0, device=device)
@@ -931,14 +937,17 @@ with torch.no_grad():
         verts_hom = np.hstack([verts_np, np.ones((verts_np.shape[0], 1))])
         verts_colmap = (inv_transform @ verts_hom.T).T[:, :3]
 
-        # [DTU-COORD] 如果存在 colmap_to_dtu.txt 变换矩阵，则应用它
-        # 这个矩阵需要通过点云配准得到（COLMAP → DTU 坐标系）
-        colmap_to_dtu_path = args.dataset_path / 'colmap_to_dtu.txt'
-        if colmap_to_dtu_path.exists():
-            print(f"[Mesh] Found colmap_to_dtu.txt, applying transform to DTU world coords")
-            colmap_to_dtu = np.loadtxt(str(colmap_to_dtu_path))
+        # [DTU-COORD] 如果存在 cameras.npz（DTU 格式），应用 scale_mat 变换到 DTU 世界坐标系
+        # COLMAP 坐标系 ≈ DTU 归一化坐标系，需要应用 scale_mat 变换
+        cameras_npz_path = args.dataset_path / 'cameras.npz'
+        if cameras_npz_path.exists():
+            print(f"[Mesh] Found cameras.npz, applying scale_mat transform to DTU world coords")
+            camera_dict = np.load(str(cameras_npz_path))
+            scale_mat = camera_dict['scale_mat_0'].astype(np.float32)
+            # scale_mat 是 4x4 仿射变换矩阵，对角线是 scale，最后一列是 translation
             verts_hom = np.hstack([verts_colmap, np.ones((verts_colmap.shape[0], 1))])
-            verts_world = (colmap_to_dtu @ verts_hom.T).T[:, :3]
+            verts_world = (scale_mat @ verts_hom.T).T[:, :3]
+            print(f"    scale = {scale_mat[0, 0]:.4f}, translation = {scale_mat[:3, 3]}")
         else:
             verts_world = verts_colmap
 
@@ -980,9 +989,6 @@ with torch.no_grad():
                         '--mask_dir', dataset_root,
                         '--DTU', dataset_root,
                     ]
-                    # 如果需要应用 scale_mat 变换
-                    if args.eval_dtu_apply_scale:
-                        cmd.append('--apply_scale_transform')
                     print('[EVAL-DTU] mesh eval cmd:', ' '.join(cmd))
                     subprocess.run(cmd, check=False)
             except Exception as e:
