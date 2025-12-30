@@ -396,13 +396,21 @@ void bwd_alpha_blend(TensorView<int32_t> sorted_gauss_idx,
                                    final_normal_state[uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 1)],
                                    final_normal_state[uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 2)]);
         // [DEPTH-OUTPUT] 从 final_depth_state 读取深度状态
+        // [DEPTH-FIX] 前向 splat_tiled 存储时乘了 rd_norm_inv（转为 z-space）
+        // 这里需要乘回 ray.d 长度，恢复为 t-space 以正确回退状态
         curr_depth_state = final_depth_state[uint2(uint32_t(pix_coord.y), uint32_t(pix_coord.x))];
         n_contrib_fwd = n_contributors[uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 0)];
     }
-    AlphaOut ao = {current_pixel_state, curr_distortion_state, curr_normal_state, curr_depth_state};
 
     Ray ray = get_ray(cam, center_pix_coord);  // 普通函数，不需要 no_diff
     int exit_face;
+
+    // [DEPTH-FIX] 将 z-space 深度转回 t-space
+    // 前向 splat_tiled 存储时乘了 rd_norm_inv，这里需要乘回 ray.d 长度
+    if (is_inside) {
+        curr_depth_state = curr_depth_state * length(ray.d);
+    }
+    AlphaOut ao = {current_pixel_state, curr_distortion_state, curr_normal_state, curr_depth_state};
 
     DifferentialPair<float2> dp_center_pix_coord = diffPair(center_pix_coord);
 

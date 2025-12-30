@@ -178,6 +178,7 @@ def sample_eikonal_points(model, num_samples: int = 50000, band: float = 0.1, us
 
     Returns:
         all_points: (M, 3) 采样点坐标
+        vertex_indices: (num_band,) band 内顶点的全局索引（用于查找边）
         num_band: band 内顶点数（原始候选点数）
         num_tet_samples: 邻域内额外采样点数
     """
@@ -207,14 +208,14 @@ def sample_eikonal_points(model, num_samples: int = 50000, band: float = 0.1, us
         _, topk_indices = candidate_sdf_abs.topk(num_samples, largest=False)
         selected_indices = candidate_indices[topk_indices]
         band_points = internal_verts[selected_indices]
-        return band_points, num_candidates, 0
+        return band_points, selected_indices, num_samples, 0
 
     # 4. 候选点不足
     band_points = internal_verts[candidate_indices]
     num_band = num_candidates
 
     if not use_tet_sampling or num_band == 0:
-        return band_points, num_band, 0
+        return band_points, candidate_indices, num_band, 0
 
     # 5. 在候选点邻域球体内随机采样补足
     num_need = num_samples - num_band
@@ -238,7 +239,7 @@ def sample_eikonal_points(model, num_samples: int = 50000, band: float = 0.1, us
 
     # 6. 合并
     all_points = torch.cat([band_points, sampled_points], dim=0)
-    return all_points, num_band, sampled_points.shape[0]
+    return all_points, candidate_indices, num_band, sampled_points.shape[0]
 
 
 def extract_edges_from_tets(indices: torch.Tensor) -> torch.Tensor:
@@ -340,5 +341,174 @@ def edge_sdf_loss(
     else:
         # 平滑风格：最小化 ratio
         loss = ratio.mean()
+
+    return loss, num_edges
+
+
+def gradient_tv_loss(
+    model,
+    vert_sdf: torch.Tensor = None,
+    vert_gradients: torch.Tensor = None,
+    sdf_threshold: float = 0.1,
+    edge_length_threshold: float = None,
+    normalize_by_edge_length: bool = True
+):
+    """
+    Gradient TV Loss：约束边两端顶点的 SDF 梯度变化
+
+    促进表面法向量的平滑性，减少噪声
+
+    逻辑：
+    - 计算边两端顶点梯度的 L2 距离
+    - 只考虑表面附近的边（至少一端 |SDF| < sdf_threshold）
+    - 排除包含外部点的边
+
+    Args:
+        model: Model 实例
+        vert_sdf: 预计算的顶点 SDF，None 则现场计算（只计算内部点）
+        vert_gradients: 预计算的顶点梯度 (N, 3)，None 则现场计算
+        sdf_threshold: SDF 阈值，只考虑表面附近的边
+        edge_length_threshold: 边长阈值，只考虑短边（可选）
+        normalize_by_edge_length: 是否用边长归一化梯度差异
+
+    Returns:
+        loss: scalar
+        num_edges: 参与计算的边数
+    """
+    device = model.device
+    num_internal = model.num_int_verts
+
+    # 1. 获取内部边（使用缓存）
+    edges = model.get_internal_edges()  # (E, 2)，已排除外部点
+
+    if edges.shape[0] == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True), 0
+
+    # 2. 计算边长（detach，不让梯度流向顶点位置）
+    vertices = model.vertices
+    v0, v1 = vertices[edges[:, 0]], vertices[edges[:, 1]]
+    edge_length = (v0 - v1).norm(dim=-1).detach()  # (E,)
+
+    # 3. 获取顶点 SDF 和梯度
+    internal_verts = model.vertices[:num_internal]
+
+    if vert_sdf is None or vert_gradients is None:
+        # 计算 SDF 和梯度
+        sdf, gradients, _ = model.compute_sdf_gradients(internal_verts, mode="numerical", taps=6)
+        if vert_sdf is None:
+            vert_sdf = sdf
+        if vert_gradients is None:
+            vert_gradients = gradients
+
+    # 4. 获取边两端的 SDF 和梯度
+    sdf_a, sdf_b = vert_sdf[edges[:, 0]], vert_sdf[edges[:, 1]]
+    grad_a, grad_b = vert_gradients[edges[:, 0]], vert_gradients[edges[:, 1]]  # (E, 3)
+
+    # 计算梯度 L2 距离
+    grad_diff = (grad_a - grad_b).norm(dim=-1)  # (E,)
+
+    # 5. 筛选：表面附近的边（至少一端接近表面）
+    near_surface = (sdf_a.abs() < sdf_threshold) | (sdf_b.abs() < sdf_threshold)
+
+    # 6. 筛选：短边（可选）
+    if edge_length_threshold is not None:
+        short_edge = edge_length < edge_length_threshold
+        mask = near_surface & short_edge
+    else:
+        mask = near_surface
+
+    num_edges = mask.sum().item()
+    if num_edges == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True), 0
+
+    # 7. 计算 loss
+    if normalize_by_edge_length:
+        # 用边长归一化，使梯度变化率与边长无关
+        loss = (grad_diff[mask] / (edge_length[mask] + 1e-8)).mean()
+    else:
+        # 直接使用梯度差异
+        loss = grad_diff[mask].mean()
+
+    return loss, num_edges
+
+
+def gradient_tv_loss_from_sampled(
+    model,
+    vertex_indices: torch.Tensor,
+    vert_gradients: torch.Tensor,
+    normalize_by_edge_length: bool = True
+):
+    """
+    Gradient TV Loss（复用 Eikonal 采样点版本）
+
+    只计算 Eikonal 采样点之间的边的梯度变化，避免重复计算梯度。
+
+    逻辑：
+    - 使用 sample_eikonal_points 返回的 vertex_indices（band 内顶点的全局索引）
+    - 只考虑两端点都在 vertex_indices 中的边
+    - 使用 Eikonal 计算时已经得到的梯度，不重新计算
+
+    Args:
+        model: Model 实例
+        vertex_indices: (K,) Eikonal 采样的顶点全局索引（来自 sample_eikonal_points）
+        vert_gradients: (K, 3) 这些顶点的 SDF 梯度（已在 Eikonal 计算时得到）
+        normalize_by_edge_length: 是否用边长归一化梯度差异
+
+    Returns:
+        loss: scalar
+        num_edges: 参与计算的边数
+    """
+    device = model.device
+
+    if vertex_indices.shape[0] == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True), 0
+
+    # 1. 获取内部边（使用缓存）
+    edges = model.get_internal_edges()  # (E, 2)，已排除外部点
+
+    if edges.shape[0] == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True), 0
+
+    # 2. 构建全局索引到局部索引的映射
+    # vertex_indices[local_idx] = global_idx
+    # 我们需要 global_to_local: global_idx -> local_idx
+    num_sampled = vertex_indices.shape[0]
+    max_vert_idx = model.vertices.shape[0]
+
+    # 使用 scatter 构建映射（-1 表示不在采样集中）
+    global_to_local = torch.full((max_vert_idx,), -1, dtype=torch.long, device=device)
+    local_indices = torch.arange(num_sampled, device=device)
+    global_to_local[vertex_indices] = local_indices
+
+    # 3. 筛选两端点都在 vertex_indices 中的边
+    local_a = global_to_local[edges[:, 0]]  # (E,)
+    local_b = global_to_local[edges[:, 1]]  # (E,)
+    valid_mask = (local_a >= 0) & (local_b >= 0)
+
+    valid_edges = edges[valid_mask]  # (E', 2)
+    valid_local_a = local_a[valid_mask]  # (E',)
+    valid_local_b = local_b[valid_mask]  # (E',)
+
+    num_edges = valid_edges.shape[0]
+    if num_edges == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True), 0
+
+    # 4. 计算边长（detach，不让梯度流向顶点位置）
+    vertices = model.vertices
+    v0, v1 = vertices[valid_edges[:, 0]], vertices[valid_edges[:, 1]]
+    edge_length = (v0 - v1).norm(dim=-1).detach()  # (E',)
+
+    # 5. 获取边两端的梯度（使用局部索引从 vert_gradients 中获取）
+    grad_a = vert_gradients[valid_local_a]  # (E', 3)
+    grad_b = vert_gradients[valid_local_b]  # (E', 3)
+
+    # 6. 计算梯度 L2 距离
+    grad_diff = (grad_a - grad_b).norm(dim=-1)  # (E',)
+
+    # 7. 计算 loss
+    if normalize_by_edge_length:
+        loss = (grad_diff / (edge_length + 1e-8)).mean()
+    else:
+        loss = grad_diff.mean()
 
     return loss, num_edges

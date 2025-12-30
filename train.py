@@ -28,7 +28,7 @@ torch.cuda.manual_seed_all(SEED)
 
 from utils import cam_util
 from utils.train_util import *
-from utils.model_util import eikonal_loss, curvature_loss, sample_eikonal_points, edge_sdf_loss
+from utils.model_util import eikonal_loss, curvature_loss, sample_eikonal_points, edge_sdf_loss, gradient_tv_loss, gradient_tv_loss_from_sampled
 # from models.vertex_color import Model, TetOptimizer
 from models.ingp_color import Model, TetOptimizer
 from models.frozen import freeze_model
@@ -125,7 +125,7 @@ args.network_lr = 1e-3
 args.final_network_lr = 1e-4
 args.hidden_dim = 64
 args.scale_multi = 0.35 # chosen such that 96% of the distribution is within the sphere
-args.log2_hashmap_size = 23
+args.log2_hashmap_size = 22
 args.per_level_scale = 2
 args.L = 8
 args.hashmap_dim = 8
@@ -187,6 +187,13 @@ args.edge_sdf_end = 30000         # 停止使用 edge sdf loss 的迭代
 args.edge_sdf_threshold = 0.1     # SDF band 阈值：只计算至少一端 |SDF| < threshold 的边
 args.edge_length_threshold = None # 边长阈值：只计算长度 < threshold 的边，None 表示不限制
 args.edge_sdf_target = None       # 目标值：None=平滑模式(最小化), 1.0=Eikonal模式(约束接近1)
+
+# [GRADIENT-TV-LOSS] Gradient TV Loss 设置（促进SDF梯度平滑）
+args.lambda_gradient_tv = 0.0     # Gradient TV loss 权重，0 表示关闭
+args.gradient_tv_start = 0        # 开始使用 gradient TV loss 的迭代
+args.gradient_tv_end = 30000      # 停止使用 gradient TV loss 的迭代
+args.gradient_tv_sdf_threshold = 0.1   # SDF band 阈值：只计算表面附近的边
+args.gradient_tv_normalize = True      # 是否用边长归一化梯度差异
 
 # [MESH-NORMAL-LOSS] Mesh 法线一致性 Loss 设置（参考 MILo）
 args.lambda_mesh_normal = 0.0   # mesh normal loss 权重
@@ -417,13 +424,14 @@ for iteration in progress_bar:
     if eikonal_active or curvature_active:
         # [NEW-SAMPLING] 使用新的采样策略：band内顶点 + SDF异号四面体内采样（可选）
         # 参考 Neuralangelo 的采样策略
-        sampled_points, num_band, num_tet_samples = sample_eikonal_points(
+        sampled_points, eik_vertex_indices, num_band, num_tet_samples = sample_eikonal_points(
             model,
             num_samples=args.num_eikonal_samples,
             band=args.eikonal_band_threshold,  # None 表示使用所有内部顶点
             use_tet_sampling=args.eikonal_tet_sampling  # False 则仅使用 band 内顶点
         )
         eik_num_samples = sampled_points.shape[0]
+        eik_gradients = None  # 用于复用给 gradient TV loss
 
         # 如果采样点为空，跳过 loss 计算
         if sampled_points.shape[0] > 0:
@@ -441,6 +449,7 @@ for iteration in progress_bar:
                 taps=args.gradient_taps,
                 eps=eps
             )
+            eik_gradients = gradients  # 保存梯度用于 gradient TV loss
             if eikonal_active:
                 eik_loss = eikonal_loss(gradients)
             if curvature_active and hessian_diag is not None:
@@ -454,17 +463,37 @@ for iteration in progress_bar:
                 )
 
     # [EDGE-SDF-LOSS] Edge SDF Loss（参考 svraster TV loss）
+    # [GRADIENT-TV-LOSS] Gradient TV Loss（促进SDF梯度平滑）
+    # Edge SDF 仍然使用全部内部顶点，Gradient TV 改为只计算 Eikonal 采样点
     edge_loss = torch.tensor(0.0, device=device)
     edge_num_edges = 0
+    grad_tv_loss = torch.tensor(0.0, device=device)
+    grad_tv_num_edges = 0
     edge_sdf_active = (args.lambda_edge_sdf > 0 and
                        args.edge_sdf_start <= iteration < args.edge_sdf_end)
+    grad_tv_active = (args.lambda_gradient_tv > 0 and
+                      args.gradient_tv_start <= iteration < args.gradient_tv_end)
+
+    # [EDGE-SDF-LOSS] 只有 edge_sdf_active 时才计算全部内部顶点的 SDF
     if edge_sdf_active:
+        num_internal = model.num_int_verts
+        internal_verts = model.vertices[:num_internal]
+        vert_sdf_internal = model.query_vert_sdf(internal_verts)
         edge_loss, edge_num_edges = edge_sdf_loss(
             model,
-            vert_sdf=None,  # 让函数内部计算
+            vert_sdf=vert_sdf_internal,
             sdf_threshold=args.edge_sdf_threshold,
             edge_length_threshold=args.edge_length_threshold,
             target=args.edge_sdf_target
+        )
+
+    # [GRADIENT-TV-LOSS] 使用 Eikonal 采样点的梯度，避免重复计算
+    if grad_tv_active and eik_gradients is not None and eik_vertex_indices is not None:
+        grad_tv_loss, grad_tv_num_edges = gradient_tv_loss_from_sampled(
+            model,
+            vertex_indices=eik_vertex_indices,
+            vert_gradients=eik_gradients,
+            normalize_by_edge_length=args.gradient_tv_normalize
         )
 
     # [MESH-LOSS] Mesh 正则化 Loss (normal + depth + occupancy)
@@ -564,7 +593,8 @@ for iteration in progress_bar:
            (args.lambda_normal_depth_med * normal_depth_med_loss if normal_depth_active and args.lambda_normal_depth_med > 0 else 0.0) + \
            args.lambda_mask * mask_loss + \
            args.lambda_T_concen * T_concen_loss + \
-           (args.lambda_edge_sdf * edge_loss if edge_sdf_active else 0.0)
+           (args.lambda_edge_sdf * edge_loss if edge_sdf_active else 0.0) + \
+           (args.lambda_gradient_tv * grad_tv_loss if grad_tv_active else 0.0)
 
     loss.backward()
 
@@ -664,6 +694,9 @@ for iteration in progress_bar:
     # [EDGE-SDF-LOSS] 显示 edge sdf loss（仅当激活时）
     if edge_sdf_active and edge_num_edges > 0:
         postfix_dict["Edge"] = repr(f"{edge_loss.item():.3f}")
+    # [GRADIENT-TV-LOSS] 显示 gradient TV loss（仅当激活时）
+    if grad_tv_active and grad_tv_num_edges > 0:
+        postfix_dict["GrdTV"] = repr(f"{grad_tv_loss.item():.3f}")
     progress_bar.set_postfix(postfix_dict)
 
     # 每k次迭代保存渲染图
