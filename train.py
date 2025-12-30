@@ -125,7 +125,7 @@ args.network_lr = 1e-3
 args.final_network_lr = 1e-4
 args.hidden_dim = 64
 args.scale_multi = 0.35 # chosen such that 96% of the distribution is within the sphere
-args.log2_hashmap_size = 22
+args.log2_hashmap_size = 19
 args.per_level_scale = 2
 args.L = 8
 args.hashmap_dim = 8
@@ -249,7 +249,6 @@ args.alpha_threshold = 0.1
 args.contrib_threshold = 0.0
 args.threshold_start = 4500
 args.voxel_size = 0.01
-args.sdf_sphere_radius_scale = 1.2  # SDF球形初始化：点云半径 × scale / scene_scaling
 args.init_num = 0  # 初始点云最小数量，不足则通过扰动扩充
 
 args.ablate_gradient = False

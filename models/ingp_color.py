@@ -26,43 +26,6 @@ from utils import hashgrid
 import tinycudann as tcnn
 import time
 
-# [SDF-MODIFICATION] 几何初始化函数，参考Neuralangelo的MLPforNeuralSDF
-def geometric_init_sdf_layer(linear: nn.Linear, k_in: int, out_bias: float = 0.5, invert: bool = False):
-    """
-    Initialize the SDF output layer with geometric initialization.
-    This initialization makes the network output approximate a sphere SDF initially.
-
-    Args:
-        linear: The linear layer to initialize
-        k_in: Input dimension
-        out_bias: Initial bias value (controls initial sphere radius)
-        invert: If True, invert the SDF (inside becomes outside)
-    """
-    nn.init.normal_(linear.weight, mean=np.sqrt(np.pi / k_in), std=0.0001)
-    nn.init.constant_(linear.bias, -out_bias)
-    if invert:
-        linear.weight.data *= -1
-        linear.bias.data *= -1
-
-# [SDF-MODIFICATION] 几何初始化第一层（参考 Neuralangelo）
-def geometric_init_first_layer(linear: nn.Linear, xyz_dim: int = 3):
-    """
-    Initialize the first layer for geometric initialization.
-    - xyz 部分：正常初始化（He init）
-    - hash 特征部分：权重设为 0（初始时忽略 hash 特征）
-
-    Args:
-        linear: The first linear layer
-        xyz_dim: Dimension of xyz input (default 3)
-    """
-    k_out = linear.out_features
-    # 全部用 He 初始化
-    nn.init.normal_(linear.weight, 0.0, np.sqrt(2 / k_out))
-    nn.init.constant_(linear.bias, 0.0)
-    # hash 特征部分的权重设为 0
-    if linear.in_features > xyz_dim:
-        linear.weight.data[:, xyz_dim:].zero_()
-
 torch.set_float32_matmul_precision('high')
 
 def pad_for_tinycudann(x: torch.Tensor, granularity: int):
@@ -137,8 +100,6 @@ class iNGPDW(nn.Module):
                  d_init=0.1,
                  c_init=0.6,
                  density_offset=-4,  # [DENSITY-RELATED] 密度偏移参数 (保留用于兼容性)
-                 sdf_bias=0.5,  # [SDF-MODIFICATION] SDF初始偏移，控制初始球体半径
-                 sdf_inside_out=False,  # [SDF-MODIFICATION] 是否反转SDF内外
                  # [SDF-MODIFICATION] NeuS s_var 参数 (参考 Neuralangelo)
                  s_var_init=1.4,  # 初始值 (存储的是 log(inv_s)，1.4 对应 inv_s≈4.05，适合扫描数据)
                  s_var_anneal_end=0.1,  # schedule 模式的结束进度
@@ -159,8 +120,6 @@ class iNGPDW(nn.Module):
         self.per_level_scale = per_level_scale
         self.base_resolution = base_resolution
         self.density_offset = density_offset  # [DENSITY-RELATED] 保留用于兼容性
-        self.sdf_bias = sdf_bias  # [SDF-MODIFICATION] SDF偏移参数
-        self.sdf_inside_out = sdf_inside_out  # [SDF-MODIFICATION] SDF内外反转标志
         self.ablate_downweighing = ablate_downweighing
         self.k_samples = k_samples
         self.trunc_sigma = trunc_sigma
@@ -230,47 +189,10 @@ class iNGPDW(nn.Module):
             network.apply(lambda m: init_linear(m, gain))
             return network
 
-        def mk_sdf_net(input_dim, out_bias, inside_out=False):
-            """创建 SDF 网络 (对齐 Neuralangelo MLPforNeuralSDF)
-
-            使用 Softplus(β=100) 激活函数，与 Neuralangelo 配置一致。
-            注意：几何初始化在 Softplus 下不如 ReLU 精确，但训练会逐渐收敛。
-
-            结构：1 隐藏层
-            - 第一层：weight ~ N(0, sqrt(2/k_out)), bias=0, weight[:, 3:]=0
-            - 输出层：weight ~ N(sqrt(π/k_in), 0.0001), bias=-out_bias
-            """
-            network = nn.Sequential(
-                nn.Linear(input_dim, hidden_dim),
-                nn.Softplus(beta=100),  # 对齐 Neuralangelo
-                nn.Linear(hidden_dim, 1)
-            )
-
-            # Neuralangelo 风格几何初始化
-            with torch.no_grad():
-                linear_layers = [m for m in network if isinstance(m, nn.Linear)]
-
-                # 第一层：先全部初始化，再把 hash 部分置零
-                nn.init.constant_(linear_layers[0].bias, 0.0)
-                nn.init.normal_(linear_layers[0].weight, 0.0, np.sqrt(2 / hidden_dim))
-                if input_dim > 3:
-                    nn.init.constant_(linear_layers[0].weight[:, 3:], 0.0)
-
-                # 输出层：球体 SDF 初始化
-                nn.init.normal_(linear_layers[-1].weight, mean=np.sqrt(np.pi / hidden_dim), std=0.0001)
-                nn.init.constant_(linear_layers[-1].bias, -out_bias)
-                if inside_out:
-                    linear_layers[-1].weight.data *= -1
-                    linear_layers[-1].bias.data *= -1
-
-            return network
-
         self.network = mk_head(1+12+sh_dim)
 
-        # [SDF-MODIFICATION] 创建SDF预测网络 (Neuralangelo 风格)
-        # 输入 = [xyz(3维), hash_features(L*dim维)]，使用 Softplus 和几何初始化
-        sdf_input_dim = 3 + self.encoding.n_output_dims  # xyz + hash features
-        self.sdf_net = mk_sdf_net(sdf_input_dim, sdf_bias, sdf_inside_out)
+        # SDF 网络：使用标准 mk_head，只接收 hash 特征
+        self.sdf_net = mk_head(1)
         self.density_net = self.sdf_net  # [DENSITY-RELATED] 保留别名用于兼容性
         self.color_net     = mk_head(3)
         self.gradient_net  = mk_head(3)
@@ -401,23 +323,18 @@ class iNGPDW(nn.Module):
 
     def forward(self, x, cr, compute_sdf=True):
         # x: hash grid 输入坐标 (N, 3)，范围 [0, 1]
-        # xyz_input = x * 2 - 1 = cv/2，范围 [-1, 1]
-        xyz_input = x * 2 - 1
-
         if self.k_samples > 1:
             output = self._encode(x, cr)
             output = output.view(-1, self.k_samples, output.shape[-1]).mean(dim=1)
-            xyz_input = xyz_input.view(-1, self.k_samples, 3).mean(dim=1)
         else:
             output = self._encode(x, cr)
 
         h = output.reshape(-1, self.L * self.dim).float()
 
-        # [SDF-MODIFICATION] SDF网络前向传播
+        # SDF网络前向传播：只接收 hash 特征
         # 渲染时 compute_sdf=False（使用 query_vert_sdf 的顶点 SDF），跳过计算节省开销
         if compute_sdf:
-            sdf_input = torch.cat([xyz_input, h], dim=-1)  # (N, 3 + L*dim)
-            sdf = self.sdf_net(sdf_input)
+            sdf = self.sdf_net(h)
         else:
             sdf = torch.zeros((h.shape[0], 1), device=h.device, dtype=h.dtype)
 
@@ -461,8 +378,6 @@ class Model(BaseModel):
                  center: torch.Tensor,
                  scene_scaling: float,
                  density_offset=-1,  # [DENSITY-RELATED] Model类的密度偏移参数 (保留用于兼容性)
-                 sdf_bias=0.5,  # [SDF-MODIFICATION] SDF初始偏移参数
-                 sdf_inside_out=False,  # [SDF-MODIFICATION] SDF内外反转标志
                  use_contraction=True,  # [CONTRACTION] 是否使用空间收缩
                  current_sh_deg=2,
                  max_sh_deg=2,
@@ -472,8 +387,6 @@ class Model(BaseModel):
         super().__init__()
         self.device = vertices.device
         self.density_offset = density_offset  # [DENSITY-RELATED] 存储密度偏移 (保留用于兼容性)
-        self.sdf_bias = sdf_bias  # [SDF-MODIFICATION] 存储SDF偏移参数
-        self.sdf_inside_out = sdf_inside_out  # [SDF-MODIFICATION] 存储SDF内外反转标志
         self.use_contraction = use_contraction  # [CONTRACTION] 存储是否使用空间收缩
         self.max_sh_deg = max_sh_deg
         self.current_sh_deg = current_sh_deg
@@ -484,8 +397,7 @@ class Model(BaseModel):
         ], device=self.device)
         sh_dim = ((1+max_sh_deg)**2-1)*3
 
-        # [SDF-MODIFICATION] iNGPDW接收SDF参数 (sdf_bias, sdf_inside_out) 通过kwargs传递
-        module = iNGPDW(sh_dim, sdf_bias=sdf_bias, sdf_inside_out=sdf_inside_out, **kwargs)
+        module = iNGPDW(sh_dim, **kwargs)
         self.compile = module.compile
         if module.compile:
             self.backbone = torch.compile(module).to(self.device)
@@ -649,11 +561,7 @@ class Model(BaseModel):
         output = checkpoint(self.backbone, x, cr, compute_sdf, use_reentrant=True)
         # output = (sdf, rgb, grd, sh)，compute_sdf=False 时 sdf 是 dummy 值
         sdf_output = output[0]
-        if compute_sdf:
-            sdf_world = sdf_output * self.scene_scaling
-        else:
-            sdf_world = sdf_output  # dummy
-        return circumcenter, sdf_world, *output[1:]
+        return circumcenter, sdf_output, *output[1:]
 
     def get_cell_values(self, camera: Camera, mask=None,
                         all_circumcenters=None, radii=None):
@@ -690,7 +598,6 @@ class Model(BaseModel):
     @staticmethod
     def init_from_pcd(point_cloud, cameras, device, max_sh_deg,
                       voxel_size=0.00, **kwargs):
-        sdf_sphere_radius_scale = kwargs.pop('sdf_sphere_radius_scale', 1.2)
         init_num = kwargs.pop('init_num', 0)  # 初始点云最小数量
         torch.manual_seed(2)
 
@@ -741,49 +648,6 @@ class Model(BaseModel):
             vertices = vertices[:init_num]
             print(f"[Init] Expanded point cloud from {original_num} to {vertices.shape[0]} points")
 
-        # [SDF-MODIFICATION] 基于点云中心计算点云半径
-        # center 现在是点云中心，所以这里计算的是点云到自身中心的距离
-        pcd_dists = torch.linalg.norm(vertices - center.cpu().reshape(1, 3), dim=1, ord=2)  # 到点云中心的距离
-
-        # 基于密度启发式找半径（参考 svraster 的 main_scene_bound_pcd_heuristic）
-        pcd_dists_sorted, _ = pcd_dists.sort()
-        pcd_density_rate = 0.1  # 密度阈值比例
-        # 计算密度: N(r) / V(r)，其中 V(r) ∝ r^3
-        valid_mask = pcd_dists_sorted > 0
-        density = torch.zeros_like(pcd_dists_sorted)
-        density[valid_mask] = (1 + torch.arange(len(pcd_dists_sorted), device=vertices.device).float()[valid_mask]) / ((2 * pcd_dists_sorted[valid_mask]) ** 3 + 1e-6)
-
-        # 至少覆盖 5% 的点
-        begin_idx = round(len(density) * 0.05)
-        # 找密度最大的位置
-        max_idx = begin_idx + density[begin_idx:].argmax().item()
-        # 找密度下降到最大值 * pcd_density_rate 的位置
-        target_density = pcd_density_rate * density[max_idx]
-        below_target = density[max_idx:] < target_density
-        if below_target.any():
-            target_idx = max_idx + torch.where(below_target)[0][0].item()
-        else:
-            target_idx = len(density) - 1
-
-        pcd_radius = pcd_dists_sorted[target_idx]
-        new_radius = pcd_radius.cpu().item()
-
-        # [CONTRACTION] 获取 use_contraction 参数
-        use_contraction = kwargs.get('use_contraction', True)
-
-        # 计算 sdf_bias（网络输入空间中的球体半径）
-        # 有 contraction: xyz_input = cv/2 ≈ normalized/2，所以 sdf_bias 需要除以 2
-        # 无 contraction: xyz_input = normalized，不需要除以 2
-        if use_contraction:
-            sdf_bias = (pcd_radius * sdf_sphere_radius_scale / scaling / 2).item()
-        else:
-            sdf_bias = (pcd_radius * sdf_sphere_radius_scale / scaling).item()
-        print(f"[SDF Init] Scene center (pcd): {center}, "
-              f"pcd_radius (density-based): {pcd_radius:.4f}, "
-              f"scene_scaling: {scaling:.4f}, "
-              f"use_contraction: {use_contraction}, "
-              f"sdf_bias (xyz_input space): {sdf_bias:.4f}")
-
         # vertices = sample_uniform_in_sphere(10000, 3, base_radius=0, radius=new_radius, device='cpu') + center.reshape(1, 3).cpu()
 
         # vertices = vertices + torch.randn(*vertices.shape) * 1e-3
@@ -815,7 +679,7 @@ class Model(BaseModel):
         # ext_vertices = torch.empty((0, 3))
 
         model = Model(vertices.cuda(), ext_vertices, center, scaling,
-                      max_sh_deg=max_sh_deg, sdf_bias=sdf_bias, **kwargs)
+                      max_sh_deg=max_sh_deg, **kwargs)
         return model
 
     @staticmethod
@@ -903,23 +767,15 @@ class Model(BaseModel):
                 # 不使用收缩：直接线性归一化到 [0, 1]
                 x = (normalized + 1) / 2
 
-            # 3. Hash Grid 编码 + C2F（和 Neuralangelo 对齐）
+            # 3. Hash Grid 编码 + C2F
             h = self.backbone.encoding(x)
             if self.backbone.coarse2fine_enabled and self.backbone.active_levels < self.backbone.L:
                 h = h * self.backbone._get_c2f_mask(h)
             h = h.float()
 
-            # 4. SDF 网络输入 = [xyz_input, hash_features]
-            # xyz_input = x * 2 - 1，范围 [-1, 1]
-            xyz_input = x * 2 - 1
-            sdf_input = torch.cat([xyz_input, h], dim=-1)
-            sdf_normalized = self.backbone.sdf_net(sdf_input)
-
-            # 5. 将归一化空间的 SDF 转换为世界空间
-            # sdf_world = sdf_normalized * scene_scaling
-            # 这样梯度 ∇_world(sdf_world) = ∇_xyz(sdf_normalized) 才是正确的
-            sdf_world = sdf_normalized * self.scene_scaling
-            sdf_list.append(sdf_world.reshape(-1))
+            # 4. SDF 网络前向传播：只接收 hash 特征
+            sdf = self.backbone.sdf_net(h)
+            sdf_list.append(sdf.reshape(-1))
 
         return torch.cat(sdf_list)
 
@@ -1290,237 +1146,6 @@ class Model(BaseModel):
         eikonal_loss = ((grad_norms - 1) ** 2).mean()
 
         return sdf, gradients, eikonal_loss
-
-    @torch.no_grad()
-    def verify_geometric_init(self, save_mesh_path=None, num_samples=10000, mc_resolution=128):
-        """
-        验证几何初始化是否成功（Neuralangelo 风格）
-
-        检查项：
-        1. 初始 SDF 场是否近似球体（中心负，边缘正）
-        2. Eikonal loss 是否接近 0（梯度范数接近 1）
-        3. 归一化空间 vs 世界空间的 Eikonal 对比（调试坐标变换）
-        4. 可选：使用 Marching Cubes 提取并保存初始 mesh
-
-        Args:
-            save_mesh_path: 如果提供，保存初始 mesh 到此路径
-            num_samples: 用于计算 Eikonal loss 的采样点数
-            mc_resolution: Marching Cubes 分辨率
-
-        Returns:
-            dict: 包含验证结果的字典
-        """
-        import mcubes
-        import trimesh
-
-        print("\n" + "="*60)
-        print("[Geometric Init Verification]")
-        print("="*60)
-
-        # 1. 查询内部顶点 SDF（排除 ext_vertices）
-        # contracted_vertices 是内部点，ext_vertices 是外部辅助点
-        internal_verts = self.contracted_vertices  # (N_internal, 3)
-        vert_sdf = self.query_vert_sdf(internal_verts)
-        sdf_min, sdf_max = vert_sdf.min().item(), vert_sdf.max().item()
-        sdf_mean, sdf_std = vert_sdf.mean().item(), vert_sdf.std().item()
-        num_inside = (vert_sdf < 0).sum().item()
-        num_outside = (vert_sdf > 0).sum().item()
-
-        print(f"  SDF Statistics (internal vertices only, excluding {self.ext_vertices.shape[0]} ext_vertices):")
-        print(f"    Total internal vertices: {internal_verts.shape[0]}")
-        print(f"    min={sdf_min:.4f}, max={sdf_max:.4f}")
-        print(f"    mean={sdf_mean:.4f}, std={sdf_std:.4f}")
-        print(f"    inside (SDF<0): {num_inside}, outside (SDF>0): {num_outside}")
-
-        # [DIAGNOSTIC] 测试理想球面上的 SDF 值
-        # 如果几何初始化成功，球面上的点 SDF 应该接近 0
-        sdf_bias = self.backbone.sdf_bias
-        # 世界空间的球体半径 = sdf_bias * scene_scaling
-        sphere_radius_world = sdf_bias * float(self.scene_scaling)
-        print(f"\n  Sphere Surface Test (sdf_bias={sdf_bias:.4f}, sphere_radius_world={sphere_radius_world:.4f}):")
-
-        # 在 xyz_input 空间中采样球面点
-        n_sphere_samples = 1000
-        # 均匀采样球面方向
-        phi = torch.rand(n_sphere_samples, device=self.device) * 2 * np.pi
-        cos_theta = torch.rand(n_sphere_samples, device=self.device) * 2 - 1
-        sin_theta = torch.sqrt(1 - cos_theta**2)
-        sphere_dirs = torch.stack([
-            sin_theta * torch.cos(phi),
-            sin_theta * torch.sin(phi),
-            cos_theta
-        ], dim=-1)  # (N, 3) 单位球面方向
-
-        # 转换到世界坐标
-        # 在 xyz_input 空间中，球面半径 = sdf_bias
-        # 无 contraction: xyz_input = normalized, 世界坐标 = normalized * scaling + center
-        # 有 contraction: xyz_input = cv/2, 对于 |cv|<1: cv = normalized, 世界坐标 = cv * scaling + center
-        if self.use_contraction:
-            sphere_xyz_input = sphere_dirs * sdf_bias
-            sphere_cv = sphere_xyz_input * 2  # cv = xyz_input * 2
-            sphere_world = sphere_cv * float(self.scene_scaling) + self.center
-        else:
-            sphere_xyz_input = sphere_dirs * sdf_bias
-            sphere_normalized = sphere_xyz_input  # normalized = xyz_input
-            sphere_world = sphere_normalized * float(self.scene_scaling) + self.center
-
-        # 查询 SDF（现在返回世界空间的 SDF）
-        sphere_sdf = self.query_vert_sdf(sphere_world)
-        print(f"    Sphere SDF: min={sphere_sdf.min().item():.4f}, max={sphere_sdf.max().item():.4f}, "
-              f"mean={sphere_sdf.mean().item():.4f}, std={sphere_sdf.std().item():.4f}")
-        print(f"    (Ideal: mean≈0, std≈0)")
-
-        # 测试中心点和远点
-        center_sdf = self.query_vert_sdf(self.center.reshape(1, 3))
-        # 世界空间的期望中心 SDF = -sdf_bias * scene_scaling
-        expected_center_sdf = -sphere_radius_world
-        print(f"    Center SDF: {center_sdf.item():.4f} (Ideal: {expected_center_sdf:.4f})")
-
-        # 计算内部点云的边界（用于 Eikonal 采样和 Marching Cubes）
-        verts_normalized = (internal_verts - self.center) / self.scene_scaling
-        verts_min = verts_normalized.min(dim=0).values
-        verts_max = verts_normalized.max(dim=0).values
-        # 稍微扩展边界
-        margin = (verts_max - verts_min) * 0.1
-        bounds_min = (verts_min - margin).clamp(min=-1)
-        bounds_max = (verts_max + margin).clamp(max=1)
-        # [FIX] 使用正方形 bounds（取各轴最大范围），避免球形 SDF 被截断成椭球
-        max_range = (bounds_max - bounds_min).max() / 2
-        center_bounds = (bounds_max + bounds_min) / 2
-        bounds_min = (center_bounds - max_range).clamp(min=-1)
-        bounds_max = (center_bounds + max_range).clamp(max=1)
-        print(f"  Internal vertices bounds (normalized, squared): [{bounds_min.tolist()}] to [{bounds_max.tolist()}]")
-
-        # 2. 采样点计算 Eikonal loss
-        # [FIX] 几何初始化只在球体内部和表面附近有效
-        # 采样范围设为 1.2 倍球体半径（稍微超出表面）
-        sample_radius = sdf_bias * 1.2
-        grid_size = int(num_samples ** (1/3))
-        lin = torch.linspace(-sample_radius, sample_radius, grid_size, device=self.device)
-        xx, yy, zz = torch.meshgrid(lin, lin, lin, indexing='ij')
-        sample_points_normalized = torch.stack([xx, yy, zz], dim=-1).reshape(-1, 3)
-
-        # 只保留在采样球内的点
-        sample_dist = sample_points_normalized.norm(dim=-1)
-        sample_mask = sample_dist < sample_radius
-        sample_points_normalized = sample_points_normalized[sample_mask]
-        print(f"  Eikonal sampling: {sample_points_normalized.shape[0]} points within radius {sample_radius:.4f}")
-
-        # 转换到世界坐标
-        sample_points_world = sample_points_normalized * float(self.scene_scaling) + self.center
-
-        # 计算梯度
-        _, gradients, _ = self.compute_sdf_gradients(sample_points_world, mode="numerical", taps=6)
-        grad_norms = gradients.norm(dim=-1)
-        eikonal_loss = ((grad_norms - 1) ** 2).mean().item()
-        grad_norm_mean = grad_norms.mean().item()
-        grad_norm_std = grad_norms.std().item()
-
-        print(f"  Eikonal Statistics [World Space] (should be ~0 if init successful):")
-        print(f"    Eikonal loss: {eikonal_loss:.6f}")
-        print(f"    Gradient norm: mean={grad_norm_mean:.4f}, std={grad_norm_std:.4f}")
-        print(f"    (Ideal: mean=1.0, std=0.0)")
-
-        # 2.5. 对比：归一化空间 Eikonal
-        # 直接在归一化空间计算，不涉及 scaling，用于排查坐标变换问题
-        eps_normalized = 1.0 / self.backbone.resolutions[self.backbone.active_levels - 1]
-        sdf_norm, grad_norm_space, eikonal_norm = self._compute_eikonal_normalized_space(
-            sample_points_normalized, eps_normalized
-        )
-        grad_norm_space_norms = grad_norm_space.norm(dim=-1)
-        grad_norm_space_mean = grad_norm_space_norms.mean().item()
-        grad_norm_space_std = grad_norm_space_norms.std().item()
-
-        print(f"\n  Eikonal Statistics [Normalized Space] (for debugging coord transforms):")
-        print(f"    eps (normalized): {eps_normalized:.6f}")
-        print(f"    Eikonal loss: {eikonal_norm:.6f}")
-        print(f"    Gradient norm: mean={grad_norm_space_mean:.4f}, std={grad_norm_space_std:.4f}")
-
-        # 对比分析
-        print(f"\n  [Comparison: World vs Normalized Space]")
-        eikonal_diff = abs(eikonal_loss - eikonal_norm)
-        grad_diff = abs(grad_norm_mean - grad_norm_space_mean)
-        print(f"    Eikonal diff: {eikonal_diff:.6f}")
-        print(f"    Grad norm diff: {grad_diff:.4f}")
-        if eikonal_diff < 0.01 and grad_diff < 0.05:
-            print(f"    → Coordinate transform is consistent ✓")
-        elif eikonal_norm < eikonal_loss * 0.5:
-            print(f"    → Normalized space is significantly better!")
-            print(f"    → Coordinate transform may have issues")
-        else:
-            print(f"    → Both spaces show similar issues")
-            print(f"    → Problem likely in geometric init itself")
-
-        # 3. 判断是否成功
-        is_success = eikonal_loss < 0.1 and 0.8 < grad_norm_mean < 1.2
-        if is_success:
-            print(f"  ✓ Geometric initialization appears SUCCESSFUL")
-        else:
-            print(f"  ✗ Geometric initialization may have ISSUES")
-            print(f"    (Expected Eikonal<0.1, got {eikonal_loss:.4f})")
-            print(f"    (Expected grad_norm~1.0, got {grad_norm_mean:.4f})")
-
-        # 4. 使用 Marching Cubes 提取并保存初始 mesh（基于内部点云边界）
-        if save_mesh_path is not None:
-            try:
-                print(f"  Extracting initial mesh with Marching Cubes (resolution={mc_resolution})...")
-                # 在内部点云边界范围内构建网格
-                lin_x = torch.linspace(bounds_min[0].item(), bounds_max[0].item(), mc_resolution, device=self.device)
-                lin_y = torch.linspace(bounds_min[1].item(), bounds_max[1].item(), mc_resolution, device=self.device)
-                lin_z = torch.linspace(bounds_min[2].item(), bounds_max[2].item(), mc_resolution, device=self.device)
-                xx, yy, zz = torch.meshgrid(lin_x, lin_y, lin_z, indexing='ij')
-                grid_points_normalized = torch.stack([xx, yy, zz], dim=-1)  # (R, R, R, 3)
-
-                # 转换到世界坐标
-                grid_points_world = grid_points_normalized * float(self.scene_scaling) + self.center
-
-                # 分块查询 SDF（避免 OOM）
-                grid_shape = grid_points_world.shape[:3]
-                grid_points_flat = grid_points_world.reshape(-1, 3)
-                sdf_values = self.query_vert_sdf(grid_points_flat)
-                sdf_grid = sdf_values.reshape(grid_shape).cpu().numpy()
-
-                # Marching Cubes
-                vertices, faces = mcubes.marching_cubes(sdf_grid, 0.0)
-                if vertices.shape[0] > 0:
-                    # 转换顶点坐标：从网格索引到世界坐标
-                    # vertices 是 [0, resolution-1] 范围的索引
-                    # 先转换到归一化空间 [bounds_min, bounds_max]
-                    bounds_min_np = bounds_min.cpu().numpy()
-                    bounds_max_np = bounds_max.cpu().numpy()
-                    vertices = vertices / (mc_resolution - 1) * (bounds_max_np - bounds_min_np) + bounds_min_np
-                    # 再转换到世界坐标
-                    vertices = vertices * float(self.scene_scaling.cpu()) + self.center.cpu().numpy()
-
-                    mesh = trimesh.Trimesh(vertices, faces)
-                    mesh.export(str(save_mesh_path))
-                    print(f"  Initial mesh saved to: {save_mesh_path}")
-                    print(f"    Vertices: {vertices.shape[0]}, Faces: {faces.shape[0]}")
-                else:
-                    print(f"  Warning: No faces extracted from initial SDF (all values same sign?)")
-            except Exception as e:
-                print(f"  Warning: Failed to extract mesh: {e}")
-                import traceback
-                traceback.print_exc()
-
-        print("="*60 + "\n")
-
-        return {
-            'sdf_min': sdf_min,
-            'sdf_max': sdf_max,
-            'sdf_mean': sdf_mean,
-            'sdf_std': sdf_std,
-            'num_inside': num_inside,
-            'num_outside': num_outside,
-            'eikonal_loss': eikonal_loss,
-            'grad_norm_mean': grad_norm_mean,
-            'grad_norm_std': grad_norm_std,
-            # Normalized space results (for debugging)
-            'eikonal_loss_normalized': eikonal_norm,
-            'grad_norm_mean_normalized': grad_norm_space_mean,
-            'grad_norm_std_normalized': grad_norm_space_std,
-            'is_success': is_success,
-        }
 
 class TetOptimizer:
     def __init__(self,
