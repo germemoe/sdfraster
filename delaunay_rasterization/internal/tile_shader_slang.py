@@ -63,7 +63,10 @@ def vertex_and_tile_shader(indices,
         print(f"[DEBUG tile_shader] generate_keys done, n_tetra={n_tetra}, total_size_index_buffer={total_size_index_buffer}")
         print(f"[DEBUG tile_shader] unsorted_keys: min={unsorted_keys.min().item()}, max={unsorted_keys.max().item()}")
 
-        highest_tile_id_msb = (render_grid.grid_width*render_grid.grid_height).bit_length()
+        # [SORT_DEBUG]
+        # highest_tile_id_msb = (render_grid.grid_width*render_grid.grid_height).bit_length()
+        tile_count = render_grid.grid_width * render_grid.grid_height
+        highest_tile_id_msb = (tile_count - 1).bit_length()
         sorted_keys, sorted_tetra_idx = sort_by_keys_cub.sort_by_keys(
             unsorted_keys, unsorted_tetra_idx, highest_tile_id_msb)
 

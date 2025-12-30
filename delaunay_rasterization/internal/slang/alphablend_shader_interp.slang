@@ -293,6 +293,10 @@ AlphaOut alpha_blend(TensorView<int32_t> sorted_gauss_idx,
         if (tile_idx_start + splat_pointer_offset < tile_idx_end)
         {
             uint32_t coll_id = uint32_t(sorted_gauss_idx[tile_idx_start + splat_pointer_offset]);
+            // [MEMORY-GUARD] 边界检查，防止越界访问
+            if (coll_id >= indices.size(0)) {
+                coll_id = 0;
+            }
             collected_idx[thread_rank] = coll_id;
             collected_splats[thread_rank] = load_tet_alphablend_interp(coll_id, vertices, indices, tet_density, vert_sdf);
         }
@@ -414,6 +418,10 @@ void bwd_alpha_blend(TensorView<int32_t> sorted_gauss_idx,
         if (tile_idx_start + progress < tile_idx_end)
         {
             uint32_t coll_id = uint32_t(sorted_gauss_idx[tile_idx_end - progress - 1]);
+            // [MEMORY-GUARD] 边界检查，防止越界访问
+            if (coll_id >= indices.size(0)) {
+                coll_id = 0;
+            }
             collected_idx[thread_rank] = coll_id;
             collected_splats[thread_rank] = load_tet_alphablend_interp(coll_id, vertices, indices, tet_density, vert_sdf);
         }
@@ -597,6 +605,10 @@ void kern_calc_tet_err(TensorView<int32_t> sorted_gauss_idx,
         if (tile_idx_start + splat_pointer_offset < tile_idx_end)
         {
             uint32_t coll_id = uint32_t(sorted_gauss_idx[tile_idx_start + splat_pointer_offset]);
+            // [MEMORY-GUARD] 边界检查，防止越界访问
+            if (coll_id >= indices.size(0)) {
+                coll_id = 0;
+            }
             collected_idx[thread_rank] = coll_id;
             collected_splats[thread_rank] = load_tet_alphablend_interp(coll_id, vertices, indices, tet_density, vert_sdf);
         }

@@ -51,6 +51,12 @@ class AlphaBlendTiledRender(torch.autograd.Function):
         if inv_s_tensor.dim() == 0:
             inv_s_tensor = inv_s_tensor.unsqueeze(0)
 
+        # [MEMORY-GUARD] ray_jitter 形状检查
+        assert(len(ray_jitter.shape) == 3)
+        assert(ray_jitter.shape[0] == render_grid.image_height)
+        assert(ray_jitter.shape[1] == render_grid.image_width)
+        assert(ray_jitter.shape[2] == 2)
+
         alpha_blend_tile_shader = slang_modules.alpha_blend_shaders_interp[(render_grid.tile_height, render_grid.tile_width)]
         st = time.time()
         splat_kernel_with_args = alpha_blend_tile_shader.splat_tiled(

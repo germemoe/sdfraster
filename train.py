@@ -45,14 +45,10 @@ import matplotlib.pyplot as plt
 
 def viz_tensordepth(x, alpha_mass=None, mode='log'):
     """深度图可视化函数，参考 svraster 实现"""
-    # [DEBUG] 打印 depth tensor 的统计信息
-    print(f"[DEBUG viz_tensordepth] depth: min={x.min():.6f}, max={x.max():.6f}, mean={x.mean():.6f}")
     if alpha_mass is not None:
-        print(f"[DEBUG viz_tensordepth] alpha: min={alpha_mass.min():.6f}, max={alpha_mass.max():.6f}")
         m = (alpha_mass > 0.01) & (x > 0)
     else:
         m = (x > 0)
-    print(f"[DEBUG viz_tensordepth] valid pixels (m.sum): {m.sum()}")
 
     x = x.cpu().numpy()
     m = m.cpu().numpy()
@@ -311,7 +307,7 @@ mesh_regularizer = MeshRegularizer(
     depth_scale=args.mesh_depth_scale,
     depth_ratio=args.mesh_depth_ratio,  # MILo: 期望/中位深度混合比例
     sdf_threshold=args.mesh_sdf_threshold,
-    use_opengl=False,  # [DEBUG] 使用CUDA后端，避免OpenGL/CUDA冲突
+    use_opengl=True,
 )
 
 if args.eval:
@@ -399,10 +395,6 @@ for iteration in progress_bar:
     gt_mask = camera.gt_alpha_mask.cuda()
 
     st = time.time()
-    # [DEBUG] 检查顶点是否有异常值
-    if iteration >= 5000:
-        verts = model.vertices
-        print(f"[DEBUG render] iter={iteration}, verts: min={verts.min().item():.4f}, max={verts.max().item():.4f}, has_nan={torch.isnan(verts).any()}, has_inf={torch.isinf(verts).any()}")
     ray_jitter = torch.rand((camera.image_height, camera.image_width, 2), device=device)
     render_pkg = render(camera, model, scene_scaling=model.scene_scaling, ray_jitter=ray_jitter, **args.as_dict())
     image = render_pkg['render']
@@ -496,9 +488,6 @@ for iteration in progress_bar:
         )
         mesh_loss = mesh_reg_result['loss']
         mesh_loss_active = mesh_reg_result['active']
-        # [DEBUG] 检查 mesh_regularizer 是否导致 CUDA 错误
-        torch.cuda.synchronize()
-        print(f"[DEBUG mesh_reg] iter={iteration}, mesh_loss={mesh_loss.item():.6f}, active={mesh_loss_active}")
 
     # [DEPTH-NORMAL-LOSS] 深度推导法线与渲染法线一致性 Loss
     normal_depth_loss = torch.tensor(0.0, device=device)
