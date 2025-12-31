@@ -108,6 +108,9 @@ inline float3 compute_integral(float3 c0, float3 c1, float ddt) {
     return w0 * c0 + w1 * c1;
 }
 
+// [SDF-ALPHA-MODE] 开关：true = 使用中点+梯度计算出入点SDF（NeuS风格），false = 直接插值出入点SDF
+static const bool USE_GRADIENT_SDF = false;
+
 [Differentiable]
 inline CtrlPt integrate_tetra_segment(
     in SplatTetrahedra_interp g,
@@ -129,12 +132,38 @@ inline CtrlPt integrate_tetra_segment(
     float3 c_enter = dot(g.grd, v_enter) + g.base_color;  // c0
     float3 c_exit  = dot(g.grd, v_exit)  + g.base_color;  // c1
 
-    // SDF at endpoints（顶点 sdf 重心插值）
-    float4 bary_enter = compute_barycentric(p_enter, g.tet.verts[0], g.tet.verts[1], g.tet.verts[2], g.tet.verts[3]);
-    float4 bary_exit  = compute_barycentric(p_exit , g.tet.verts[0], g.tet.verts[1], g.tet.verts[2], g.tet.verts[3]);
+    // [SDF-ALPHA-MODE] 计算四面体内SDF梯度（常值），后面复用于normal计算
+    float3 sdf_grad = compute_tet_sdf_gradient(
+        g.tet.verts[0], g.tet.verts[1], g.tet.verts[2], g.tet.verts[3],
+        g.vert_sdf);
 
-    float sdf_enter = interpolate_sdf(bary_enter, g.vert_sdf);
-    float sdf_exit  = interpolate_sdf(bary_exit , g.vert_sdf);
+    float sdf_enter, sdf_exit;
+
+    if (USE_GRADIENT_SDF) {
+        // [SDF-ALPHA-MODE] 新方式：使用中点SDF + 梯度计算出入点SDF
+        // 参考 NeuS renderer.py 第237-247行
+        float3 p_mid = (p_enter + p_exit) * 0.5f;
+
+        // 计算中点的重心坐标和SDF
+        float4 bary_mid = compute_barycentric(p_mid, g.tet.verts[0], g.tet.verts[1], g.tet.verts[2], g.tet.verts[3]);
+        float sdf_mid = interpolate_sdf(bary_mid, g.vert_sdf);
+
+        // 沿射线方向的SDF变化量（无需归一化）
+        // 数学上: dot(∇sdf, ray_d/|ray_d|) * (dt * |ray_d|) = dot(∇sdf, ray_d) * dt
+        // 归一化和距离缩放相互抵消，可直接计算
+        float sdf_delta = dot(sdf_grad, ray_d) * dt * 0.5f;
+
+        // 根据中点SDF和变化量估算出入点SDF
+        sdf_enter = sdf_mid - sdf_delta;
+        sdf_exit  = sdf_mid + sdf_delta;
+    } else {
+        // 原方式：直接插值出入点的SDF
+        float4 bary_enter = compute_barycentric(p_enter, g.tet.verts[0], g.tet.verts[1], g.tet.verts[2], g.tet.verts[3]);
+        float4 bary_exit  = compute_barycentric(p_exit , g.tet.verts[0], g.tet.verts[1], g.tet.verts[2], g.tet.verts[3]);
+
+        sdf_enter = interpolate_sdf(bary_enter, g.vert_sdf);
+        sdf_exit  = interpolate_sdf(bary_exit , g.vert_sdf);
+    }
 
     // Φ = sigmoid(sdf * inv_s)
     float u0 = sdf_enter * inv_s;
@@ -180,11 +209,7 @@ inline CtrlPt integrate_tetra_segment(
     // 如果你需要一个"等效密度"给 distortion：rho_hat = tau / dt
     float rho_hat = (dt > 1e-8f) ? (tau / dt) : 0.0f;
 
-    // [NORMAL-OUTPUT] 计算四面体内 SDF 梯度作为法向量
-    float3 sdf_grad = compute_tet_sdf_gradient(
-        g.tet.verts[0], g.tet.verts[1], g.tet.verts[2], g.tet.verts[3],
-        g.vert_sdf);
-    // 归一化得到法向量
+    // [NORMAL-OUTPUT] 复用上面已计算的 sdf_grad 作为法向量
     float grad_len = length(sdf_grad);
     float3 normal = (grad_len > 1e-8f)
         ? sdf_grad / grad_len

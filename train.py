@@ -28,7 +28,7 @@ torch.cuda.manual_seed_all(SEED)
 
 from utils import cam_util
 from utils.train_util import *
-from utils.model_util import eikonal_loss, curvature_loss
+from utils.model_util import eikonal_loss, curvature_loss, sample_eikonal_points, edge_sdf_loss, gradient_tv_loss, gradient_tv_loss_from_sampled
 # from models.vertex_color import Model, TetOptimizer
 from models.ingp_color import Model, TetOptimizer
 from models.frozen import freeze_model
@@ -106,8 +106,8 @@ class SimpleSampler:
 eps = torch.finfo(torch.float).eps
 args = Args()
 args.tile_size = 4
-args.image_folder = "images_2"
-args.eval = False
+args.image_folder = "images_4"
+args.eval = True
 args.dataset_path = Path("/optane/nerf_datasets/360/bonsai")
 args.output_path = Path("output/test/")
 args.iterations = 18000
@@ -121,14 +121,14 @@ args.sh_interval = 0
 args.sh_step = 1
 
 # iNGP Settings
-args.use_tccn = False
+args.use_tccn = True
 args.encoding_lr = 3e-3
 args.final_encoding_lr = 3e-4
 args.network_lr = 1e-3
 args.final_network_lr = 1e-4
 args.hidden_dim = 64
 args.scale_multi = 0.35 # chosen such that 96% of the distribution is within the sphere 
-args.log2_hashmap_size = 23
+args.log2_hashmap_size = 21
 args.per_level_scale = 2
 args.L = 8
 args.hashmap_dim = 8
@@ -165,11 +165,32 @@ args.lambda_curvature = 0.0 #5e-4   # Curvature loss 权重
 args.eikonal_start = 0            # 开始使用 eikonal loss 的迭代
 args.eikonal_end = 30000          # 停止使用 eikonal loss 的迭代
 args.curvature_start = 0         # 开始使用 curvature loss 的迭代
-args.curvature_end = 30000        # 停止使用 curvature loss 的迭代
+args.curvature_end = 18000        # 停止使用 curvature loss 的迭代
+args.curvature_warmup = 2000      # curvature loss warmup 迭代数（从 curvature_start 开始）
+args.curvature_decay_enabled = True  # 是否启用 curvature 权重衰减
 args.gradient_mode = "numerical"  # "analytical" 或 "numerical"
 args.gradient_taps = 4            # 数值梯度采样点数：4 或 6
 args.gradient_eps = 1e-3          # 数值梯度步长
-args.num_eikonal_samples = 200000  # Eikonal loss 采样点数（选择 |SDF| 最小的点）
+args.num_eikonal_samples = 100000  # Eikonal loss 采样点数
+args.eikonal_band_threshold = None # SDF band 阈值：仅计算 |SDF| < threshold 的顶点的 loss
+                                   # 设为 None 则计算所有内部顶点
+args.eikonal_tet_sampling = False  # 是否在 band 内顶点邻域额外采样
+                                   # True: band内顶点 + 邻域采样; False: 仅 band内顶点
+
+# [EDGE-SDF-LOSS] Edge SDF Loss 设置（参考 svraster TV loss）
+args.lambda_edge_sdf = 0.0        # Edge SDF loss 权重，0 表示关闭
+args.edge_sdf_start = 0           # 开始使用 edge sdf loss 的迭代
+args.edge_sdf_end = 30000         # 停止使用 edge sdf loss 的迭代
+args.edge_sdf_threshold = 0.1     # SDF band 阈值：只计算至少一端 |SDF| < threshold 的边
+args.edge_length_threshold = None # 边长阈值：只计算长度 < threshold 的边，None 表示不限制
+args.edge_sdf_target = None       # 目标值：None=平滑模式(最小化), 1.0=Eikonal模式(约束接近1)
+
+# [GRADIENT-TV-LOSS] Gradient TV Loss 设置（促进SDF梯度平滑）
+args.lambda_gradient_tv = 0.0     # Gradient TV loss 权重，0 表示关闭
+args.gradient_tv_start = 0        # 开始使用 gradient TV loss 的迭代
+args.gradient_tv_end = 30000      # 停止使用 gradient TV loss 的迭代
+args.gradient_tv_sdf_threshold = 0.1   # SDF band 阈值：只计算表面附近的边
+args.gradient_tv_normalize = True      # 是否用边长归一化梯度差异
 
 # [MESH-NORMAL-LOSS] Mesh 法线一致性 Loss 设置（参考 MILo）
 args.lambda_mesh_normal = 0.0   # mesh normal loss 权重
@@ -226,7 +247,7 @@ args.contrib_threshold = 0.0
 args.threshold_start = 4500
 args.voxel_size = 0.01
 args.sdf_sphere_radius_scale = 1.2  # SDF球形初始化：点云半径 × scale / scene_scaling
-args.init_num = 100000  # 初始点云最小数量，不足则通过扰动扩充
+args.init_num = 0  # 初始点云最小数量，不足则通过扰动扩充
 
 args.ablate_gradient = False
 args.ablate_circumsphere = True
@@ -235,6 +256,9 @@ args.ablate_downweighing = False
 # 渲染图保存设置
 args.save_render_interval = 500  # 每k次迭代保存渲染图，0表示不保存
 args.save_mesh_interval = 1000   # 每k次迭代用MT提取mesh并保存，0表示不保存
+
+# [MESH-EVAL] DTU Mesh 评估设置（参考 svraster）
+args.eval_dtu = True            # 是否进行 DTU 评估（仅对 DTU 数据集有效）
 
 
 args = Args.from_namespace(args.get_parser().parse_args())
@@ -376,38 +400,80 @@ for iteration in progress_bar:
     # [SDF-MODIFICATION] Eikonal 和 Curvature Loss
     eik_loss = torch.tensor(0.0, device=device)
     curv_loss = torch.tensor(0.0, device=device)
+    eik_num_samples = 0  # 追踪 band 内的采样点数
+    curv_weight_decay = 1.0  # curvature 权重衰减因子
+    eik_vertex_indices = None  # 用于 gradient TV loss
+    eik_gradients = None  # 用于 gradient TV loss
+
     # 检查迭代范围
     eikonal_active = args.lambda_eikonal > 0 and args.eikonal_start <= iteration < args.eikonal_end
     curvature_active = args.lambda_curvature > 0 and args.curvature_start <= iteration < args.curvature_end
     if eikonal_active or curvature_active:
-        # 获取活跃顶点
-        active_verts = model.active_vertices  # (N, 3)
-
-        # 采样策略：选择 |SDF| 最小的点（离表面最近）
-        num_samples = min(args.num_eikonal_samples, active_verts.shape[0])
-        if num_samples < active_verts.shape[0]:
-            with torch.no_grad():
-                active_sdf = model.query_vert_sdf(active_verts)  # (N,)
-                # 使用 quantile 比 topk 更快：O(n) vs O(n log k)
-                keep_ratio = num_samples / active_verts.shape[0]
-                sdf_abs = active_sdf.abs()
-                threshold = sdf_abs.quantile(keep_ratio)
-                mask = sdf_abs <= threshold
-            sampled_points = active_verts[mask]
-        else:
-            sampled_points = active_verts
-
-        # 在采样点上计算 SDF 梯度
-        _, gradients, hessian_diag = model.compute_sdf_gradients(
-            points=sampled_points,
-            mode=args.gradient_mode,
-            taps=args.gradient_taps,
-            eps=args.gradient_eps
+        # [NEW-SAMPLING] 使用新的采样策略：band内顶点 + 邻域采样（可选）
+        sampled_points, eik_vertex_indices, num_band, num_tet_samples = sample_eikonal_points(
+            model,
+            num_samples=args.num_eikonal_samples,
+            band=args.eikonal_band_threshold,  # None 表示使用所有内部顶点
+            use_tet_sampling=args.eikonal_tet_sampling  # False 则仅使用 band 内顶点
         )
-        if eikonal_active:
-            eik_loss = eikonal_loss(gradients)
-        if curvature_active and hessian_diag is not None:
-            curv_loss = curvature_loss(hessian_diag)
+        eik_num_samples = sampled_points.shape[0]
+
+        # 如果采样点为空，跳过 loss 计算
+        if sampled_points.shape[0] > 0:
+            # 在采样点上计算 SDF 梯度
+            _, gradients, hessian_diag = model.compute_sdf_gradients(
+                points=sampled_points,
+                mode=args.gradient_mode,
+                taps=args.gradient_taps,
+                eps=args.gradient_eps
+            )
+            eik_gradients = gradients  # 保存梯度用于 gradient TV loss
+
+            if eikonal_active:
+                eik_loss = eikonal_loss(gradients)
+            if curvature_active and hessian_diag is not None:
+                curv_loss = curvature_loss(hessian_diag)
+                # [Neuralangelo] curvature 权重调度
+                if hasattr(model.backbone, 'get_curvature_weight_decay'):
+                    curv_weight_decay = model.backbone.get_curvature_weight_decay(
+                        iteration=iteration,
+                        warmup_end=args.curvature_start + args.curvature_warmup,
+                        decay_end=args.curvature_end,
+                        decay_enabled=args.curvature_decay_enabled
+                    )
+
+    # [EDGE-SDF-LOSS] Edge SDF Loss（参考 svraster TV loss）
+    # [GRADIENT-TV-LOSS] Gradient TV Loss（促进SDF梯度平滑）
+    edge_loss = torch.tensor(0.0, device=device)
+    edge_num_edges = 0
+    grad_tv_loss = torch.tensor(0.0, device=device)
+    grad_tv_num_edges = 0
+    edge_sdf_active = (args.lambda_edge_sdf > 0 and
+                       args.edge_sdf_start <= iteration < args.edge_sdf_end)
+    grad_tv_active = (args.lambda_gradient_tv > 0 and
+                      args.gradient_tv_start <= iteration < args.gradient_tv_end)
+
+    # [EDGE-SDF-LOSS] 只有 edge_sdf_active 时才计算全部内部顶点的 SDF
+    if edge_sdf_active:
+        num_internal = model.num_int_verts
+        internal_verts = model.vertices[:num_internal]
+        vert_sdf_internal = model.query_vert_sdf(internal_verts)
+        edge_loss, edge_num_edges = edge_sdf_loss(
+            model,
+            vert_sdf=vert_sdf_internal,
+            sdf_threshold=args.edge_sdf_threshold,
+            edge_length_threshold=args.edge_length_threshold,
+            target=args.edge_sdf_target
+        )
+
+    # [GRADIENT-TV-LOSS] 使用 Eikonal 采样点的梯度，避免重复计算
+    if grad_tv_active and eik_gradients is not None and eik_vertex_indices is not None:
+        grad_tv_loss, grad_tv_num_edges = gradient_tv_loss_from_sampled(
+            model,
+            vertex_indices=eik_vertex_indices,
+            vert_gradients=eik_gradients,
+            normalize_by_edge_length=args.gradient_tv_normalize
+        )
 
     # [MESH-LOSS] Mesh 正则化 Loss (normal + depth + occupancy)
     mesh_loss = torch.tensor(0.0, device=device)
@@ -500,12 +566,14 @@ for iteration in progress_bar:
            args.lambda_dist * dl_loss + \
            args.lambda_sh * render_pkg['sh_reg'] + \
            (args.lambda_eikonal * eik_loss if eikonal_active else 0.0) + \
-           (args.lambda_curvature * curv_loss if curvature_active else 0.0) + \
+           (args.lambda_curvature * curv_weight_decay * curv_loss if curvature_active else 0.0) + \
            mesh_loss + \
            (args.lambda_normal_depth * normal_depth_loss if normal_depth_active and args.lambda_normal_depth > 0 else 0.0) + \
            (args.lambda_normal_depth_med * normal_depth_med_loss if normal_depth_active and args.lambda_normal_depth_med > 0 else 0.0) + \
            args.lambda_mask * mask_loss + \
-           args.lambda_T_concen * T_concen_loss
+           args.lambda_T_concen * T_concen_loss + \
+           (args.lambda_edge_sdf * edge_loss if edge_sdf_active else 0.0) + \
+           (args.lambda_gradient_tv * grad_tv_loss if grad_tv_active else 0.0)
 
     loss.backward()
 
@@ -820,3 +888,79 @@ sd = model.state_dict()
 sd['indices'] = model.indices
 sd['empty_indices'] = model.empty_indices
 torch.save(sd, args.output_path / "ckpt.pth")
+
+# [MESH-EVAL] 提取最终 mesh 并保存（参考 svraster）
+import subprocess
+with torch.no_grad():
+    # 提取最终 mesh
+    vert_sdf = model.query_vert_sdf()
+    final_mesh_verts, final_mesh_faces = marching_tetrahedra(
+        model.vertices, model.indices, vert_sdf
+    )
+    if final_mesh_faces.shape[0] > 0:
+        # [COORD-FIX] 将 mesh 顶点从训练坐标系变换回原始世界坐标系
+        # 训练时做了 PCA 变换: 原始坐标 → pca_transform → 训练坐标
+        # 现在需要逆变换: 训练坐标 → inv(pca_transform) → 原始坐标（COLMAP坐标系）
+        inv_transform = np.linalg.inv(scene_info.transform)
+        verts_np = final_mesh_verts.cpu().numpy()
+        verts_hom = np.hstack([verts_np, np.ones((verts_np.shape[0], 1))])
+        verts_colmap = (inv_transform @ verts_hom.T).T[:, :3]
+
+        # [DTU-COORD] 如果存在 cameras.npz（DTU 格式），应用 scale_mat 变换到 DTU 世界坐标系
+        # COLMAP 坐标系 ≈ DTU 归一化坐标系，需要应用 scale_mat 变换
+        cameras_npz_path = args.dataset_path / 'cameras.npz'
+        if cameras_npz_path.exists():
+            print(f"[Mesh] Found cameras.npz, applying scale_mat transform to DTU world coords")
+            camera_dict = np.load(str(cameras_npz_path))
+            scale_mat = camera_dict['scale_mat_0'].astype(np.float32)
+            # scale_mat 是 4x4 仿射变换矩阵，对角线是 scale，最后一列是 translation
+            verts_hom = np.hstack([verts_colmap, np.ones((verts_colmap.shape[0], 1))])
+            verts_world = (scale_mat @ verts_hom.T).T[:, :3]
+            print(f"    scale = {scale_mat[0, 0]:.4f}, translation = {scale_mat[:3, 3]}")
+        else:
+            verts_world = verts_colmap
+
+        final_mesh_verts_world = torch.from_numpy(verts_world).float().to(final_mesh_verts.device)
+
+        final_mesh = Meshes(final_mesh_verts_world, final_mesh_faces)
+        final_mesh_path = args.output_path / "final_mesh.ply"
+        save_mesh_as_ply(str(final_mesh_path), final_mesh)
+        print(f"[Mesh] Saved final mesh: {final_mesh_verts.shape[0]} verts, {final_mesh_faces.shape[0]} faces (transformed to world coords)")
+
+        # [DTU-EVAL] DTU 评估（参考 svraster）
+        if args.eval_dtu:
+            try:
+                src_path = os.path.normpath(str(args.dataset_path))
+                scan_folder = os.path.basename(src_path)
+                dataset_root = os.path.dirname(src_path)
+
+                # 从文件夹名提取 scan_id（例如 scan37 -> 37）
+                scan_digits = ''.join([c for c in scan_folder if c.isdigit()])
+                scan_id = scan_digits if scan_digits else '37'
+
+                # 检查是否为 DTU 数据集（需要 ObsMask 和 cameras.npz）
+                obs_mask_path = os.path.join(dataset_root, 'ObsMask', f'ObsMask{scan_id}_10.mat')
+                cameras_path = os.path.join(src_path, 'cameras.npz')
+                is_dtu = os.path.exists(obs_mask_path) or os.path.exists(cameras_path)
+
+                if not is_dtu:
+                    print(f"[EVAL-DTU] Skipping: not a DTU dataset (no ObsMask or cameras.npz found)")
+                    print(f"           Checked: {obs_mask_path}")
+                else:
+                    script_path = os.path.join(os.path.dirname(__file__), 'eval_dtu_vanilla', 'evaluate_single_scene.py')
+                    eval_outdir = os.path.join(str(args.output_path), 'eval_dtu_vanilla')
+                    os.makedirs(eval_outdir, exist_ok=True)
+                    cmd = [
+                        sys.executable, script_path,
+                        '--input_mesh', str(final_mesh_path),
+                        '--scan_id', str(scan_id),
+                        '--output_dir', eval_outdir,
+                        '--mask_dir', dataset_root,
+                        '--DTU', dataset_root,
+                    ]
+                    print('[EVAL-DTU] mesh eval cmd:', ' '.join(cmd))
+                    subprocess.run(cmd, check=False)
+            except Exception as e:
+                print(f"[EVAL-DTU] eval failed: {e}")
+    else:
+        print("[Mesh] No faces extracted, skipping mesh evaluation")
