@@ -136,7 +136,7 @@ args.hashmap_dim = 8
 args.base_resolution = 64
 
 # Coarse-to-Fine 策略 (参考 Neuralangelo)
-args.coarse2fine_enabled = False  # 是否启用 coarse2fine
+args.coarse2fine_enabled = True  # 是否启用 coarse2fine
 args.coarse2fine_init_level = 4   # 初始激活的 hash grid 层数
 args.coarse2fine_step = 3000      # 每隔多少 iteration 增加一层
 

@@ -1177,7 +1177,7 @@ class TetOptimizer:
             {"params": model.backbone.sh_net.parameters(),        "lr": network_lr,       "name": "sh"},
         ]
         # [SDF-MODIFICATION] s_var 学习率倍率（实际 lr 由 update_learning_rate 设置）
-        self.s_var_lr_multiplier = 100
+        self.s_var_lr_multiplier = 1
         if model.backbone.s_var_learn:
             # 初始 lr 会被 update_learning_rate 立即覆盖，这里只是占位
             net_param_groups.append({"params": [model.backbone.s_var], "lr": network_lr, "name": "s_var"})
