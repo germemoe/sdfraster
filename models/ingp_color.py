@@ -26,24 +26,6 @@ from utils import hashgrid
 import tinycudann as tcnn
 import time
 
-# [SDF-MODIFICATION] 几何初始化函数，参考Neuralangelo的MLPforNeuralSDF
-def geometric_init_sdf_layer(linear: nn.Linear, k_in: int, out_bias: float = 0.5, invert: bool = False):
-    """
-    Initialize the SDF output layer with geometric initialization.
-    This initialization makes the network output approximate a sphere SDF initially.
-
-    Args:
-        linear: The linear layer to initialize
-        k_in: Input dimension
-        out_bias: Initial bias value (controls initial sphere radius)
-        invert: If True, invert the SDF (inside becomes outside)
-    """
-    nn.init.normal_(linear.weight, mean=np.sqrt(np.pi / k_in), std=0.0001)
-    nn.init.constant_(linear.bias, -out_bias)
-    if invert:
-        linear.weight.data *= -1
-        linear.bias.data *= -1
-
 torch.set_float32_matmul_precision('high')
 
 def pad_for_tinycudann(x: torch.Tensor, granularity: int):
@@ -118,8 +100,6 @@ class iNGPDW(nn.Module):
                  d_init=0.1,
                  c_init=0.6,
                  density_offset=-4,  # [DENSITY-RELATED] 密度偏移参数 (保留用于兼容性)
-                 sdf_bias=0.5,  # [SDF-MODIFICATION] SDF初始偏移，控制初始球体半径
-                 sdf_inside_out=False,  # [SDF-MODIFICATION] 是否反转SDF内外
                  # [SDF-MODIFICATION] NeuS s_var 参数 (参考 Neuralangelo)
                  s_var_init=1.4,  # 初始值 (存储的是 log(inv_s)，1.4 对应 inv_s≈4.05，适合扫描数据)
                  s_var_anneal_end=0.1,  # schedule 模式的结束进度
@@ -128,6 +108,10 @@ class iNGPDW(nn.Module):
                  k_samples=1,
                  trunc_sigma=1,
                  use_tcnn=False,
+                 # Coarse-to-Fine 参数 (参考 Neuralangelo)
+                 coarse2fine_enabled=False,
+                 coarse2fine_init_level=4,
+                 coarse2fine_step=5000,
                  **kwargs):
         super().__init__()
         self.scale_multi = scale_multi
@@ -136,11 +120,21 @@ class iNGPDW(nn.Module):
         self.per_level_scale = per_level_scale
         self.base_resolution = base_resolution
         self.density_offset = density_offset  # [DENSITY-RELATED] 保留用于兼容性
-        self.sdf_bias = sdf_bias  # [SDF-MODIFICATION] SDF偏移参数
-        self.sdf_inside_out = sdf_inside_out  # [SDF-MODIFICATION] SDF内外反转标志
         self.ablate_downweighing = ablate_downweighing
         self.k_samples = k_samples
         self.trunc_sigma = trunc_sigma
+
+        # Coarse-to-Fine 参数 (参考 Neuralangelo)
+        self.coarse2fine_enabled = coarse2fine_enabled
+        self.coarse2fine_init_level = min(coarse2fine_init_level, L)
+        self.coarse2fine_step = coarse2fine_step
+        self.active_levels = self.coarse2fine_init_level if coarse2fine_enabled else L
+
+        # 计算每一层的分辨率 (用于 eps 计算)
+        self.resolutions = []
+        for lv in range(L):
+            res = int(np.floor(base_resolution * (per_level_scale ** lv))) + 1
+            self.resolutions.append(res)
 
         # [SDF-MODIFICATION] NeuS s_var 参数初始化 (参考 Neuralangelo)
         # s_var 存储的是 log(inv_s)，使用时 inv_s = exp(s_var)
@@ -177,9 +171,15 @@ class iNGPDW(nn.Module):
             self.compile = True
 
 
-        def mk_head(n):
+        def mk_head(n, input_dim=None):
+            """创建 MLP 头部网络
+            Args:
+                n: 输出维度
+                input_dim: 输入维度，默认使用 encoding.n_output_dims
+            """
+            in_dim = input_dim if input_dim is not None else self.encoding.n_output_dims
             network = nn.Sequential(
-                nn.Linear(self.encoding.n_output_dims, hidden_dim),
+                nn.Linear(in_dim, hidden_dim),
                 nn.SELU(inplace=True),
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.SELU(inplace=True),
@@ -191,9 +191,8 @@ class iNGPDW(nn.Module):
 
         self.network = mk_head(1+12+sh_dim)
 
-        # [SDF-MODIFICATION] 创建SDF预测网络，替代原来的density_net
-        # SDF网络使用几何初始化，使初始输出近似为球体SDF
-        self.sdf_net = mk_head(1)  # [SDF-MODIFICATION] SDF预测网络头
+        # SDF 网络：使用标准 mk_head，只接收 hash 特征
+        self.sdf_net = mk_head(1)
         self.density_net = self.sdf_net  # [DENSITY-RELATED] 保留别名用于兼容性
         self.color_net     = mk_head(3)
         self.gradient_net  = mk_head(3)
@@ -212,15 +211,30 @@ class iNGPDW(nn.Module):
                     nn.init.uniform_(last.weight.data, a=-eps, b=eps)
                     last.bias.zero_()
 
-            # [SDF-MODIFICATION] SDF网络使用几何初始化
-            sdf_last = self.sdf_net[-1]
-            geometric_init_sdf_layer(sdf_last, sdf_last.in_features,
-                                    out_bias=sdf_bias, invert=sdf_inside_out)
 
+    @torch.no_grad()
+    def _get_c2f_mask(self, h: torch.Tensor):
+        """
+        Coarse-to-Fine mask（和 Neuralangelo 完全对齐）
+
+        Args:
+            h: (N, L * dim) hash 特征
+        Returns:
+            mask: (N, L * dim) mask，前 active_levels * dim 维为 1，其余为 0
+        """
+        mask = torch.zeros_like(h)
+        mask[..., :(self.active_levels * self.dim)] = 1.0
+        return mask
 
     def _encode(self, x: torch.Tensor, cr: torch.Tensor):
         output = self.encoding(x)
+
+        # Coarse-to-Fine mask（和 Neuralangelo 对齐）
+        if self.coarse2fine_enabled and self.active_levels < self.L:
+            output = output * self._get_c2f_mask(output)
+
         output = output.reshape(-1, self.dim, self.L)
+
         if not self.ablate_downweighing:
             cr = cr.detach() * self.scale_multi
             n = torch.arange(self.L, device=x.device).reshape(1, 1, -1)
@@ -230,9 +244,85 @@ class iNGPDW(nn.Module):
             output = output * scaling
         return output
 
+    def set_active_levels(self, iteration):
+        """更新 coarse2fine 的激活层数 (参考 Neuralangelo)"""
+        if not self.coarse2fine_enabled:
+            return
+        # 每 coarse2fine_step 迭代增加一层
+        new_levels = self.coarse2fine_init_level + iteration // self.coarse2fine_step
+        self.active_levels = min(new_levels, self.L)
 
-    def forward(self, x, cr):
-        # output = self._encode(x, cr)
+    def get_normal_epsilon(self):
+        """获取当前的数值梯度步长 (参考 Neuralangelo set_normal_epsilon)
+
+        Neuralangelo: eps = 1 / resolution_of_current_active_level
+        这样 coarse2fine 时，eps 从大到小，与分辨率匹配
+        """
+        if self.coarse2fine_enabled:
+            # 使用当前激活层的分辨率
+            epsilon_res = self.resolutions[self.active_levels - 1]
+        else:
+            # 使用最细分辨率
+            epsilon_res = self.resolutions[-1]
+        return 1.0 / epsilon_res
+
+    def get_curvature_weight_decay(
+        self,
+        iteration: int,
+        warmup_end: int = 5000,
+        decay_end: int = 30000,
+        decay_enabled: bool = True
+    ):
+        """获取 curvature loss 的权重因子 (参考 Neuralangelo)
+
+        三种模式：
+        1. C2F 开启: Neuralangelo 逻辑（warmup + 基于 anneal_levels 衰减）
+        2. C2F 关闭 + decay_enabled: warmup 后线性衰减到 final_weight
+        3. C2F 关闭 + not decay_enabled: 固定权重 1.0（无 warmup，无 decay）
+
+        最终权重参考 Neuralangelo: 1 / (growth_rate^(L-1))
+
+        Args:
+            iteration: 当前迭代数
+            warmup_end: warmup 结束的迭代数
+            decay_end: 线性衰减结束的迭代数（仅非 C2F 模式）
+            decay_enabled: 是否启用衰减（仅非 C2F 模式）
+
+        Returns:
+            权重因子
+        """
+        # 最终权重: 参考 Neuralangelo，1 / (growth_rate^(L-1))
+        final_weight = 1.0 / (self.per_level_scale ** (self.L - 1))
+
+        # 模式 1: C2F 开启，使用 Neuralangelo 逻辑
+        if self.coarse2fine_enabled:
+            if iteration <= warmup_end:
+                return iteration / warmup_end
+            else:
+                if self.active_levels > 1:
+                    decay_factor = self.per_level_scale ** (self.active_levels - 1)
+                    return 1.0 / decay_factor
+                else:
+                    return 1.0
+
+        # 模式 3: 不启用衰减，固定权重
+        if not decay_enabled:
+            return 1.0
+
+        # 模式 2: 启用衰减，warmup + 线性衰减到 final_weight
+        if iteration <= warmup_end:
+            # Warmup: 0 → 1
+            return iteration / warmup_end
+        elif iteration <= decay_end:
+            # 线性衰减: 1 → final_weight
+            progress = (iteration - warmup_end) / (decay_end - warmup_end)
+            return 1.0 - progress * (1.0 - final_weight)
+        else:
+            return final_weight
+
+
+    def forward(self, x, cr, compute_sdf=True):
+        # x: hash grid 输入坐标 (N, 3)，范围 [0, 1]
         if self.k_samples > 1:
             output = self._encode(x, cr)
             output = output.view(-1, self.k_samples, output.shape[-1]).mean(dim=1)
@@ -241,25 +331,20 @@ class iNGPDW(nn.Module):
 
         h = output.reshape(-1, self.L * self.dim).float()
 
-        # [SDF-MODIFICATION] SDF网络前向传播，直接输出SDF值
-        sdf = self.sdf_net(h)  # [SDF-MODIFICATION] 输出SDF值 (可正可负)
-        # === [DENSITY-RELATED] 原密度代码 (已注释) ===
-        # sigma = self.density_net(h)  # [DENSITY-RELATED] 密度网络前向传播
-        # density = safe_exp(sigma + self.density_offset)  # [DENSITY-RELATED] 密度激活函数
-        # === [DENSITY-RELATED] 原密度代码结束 ===
+        # SDF网络前向传播：只接收 hash 特征
+        # 渲染时 compute_sdf=False（使用 query_vert_sdf 的顶点 SDF），跳过计算节省开销
+        if compute_sdf:
+            sdf = self.sdf_net(h)
+        else:
+            sdf = torch.zeros((h.shape[0], 1), device=h.device, dtype=h.dtype)
 
         rgb = self.color_net(h)
         field_samples = self.gradient_net(h)
         sh  = self.sh_net(h).half()
 
         rgb = rgb.reshape(-1, 3, 1) + 0.5
-        # [SDF-MODIFICATION] SDF直接输出，不需要激活函数
-        # 注意：后续渲染代码需要将SDF转换为alpha (使用NeuS公式)
-        # grd = torch.tanh(field_samples.reshape(-1, 1, 3)) / math.sqrt(3)
         grd = field_samples.reshape(-1, 1, 3)
         grd = grd / ((grd * grd).sum(dim=-1, keepdim=True) + 1).sqrt()
-        # grd = rgb * torch.tanh(field_samples.reshape(-1, 3, 3))  # shape (T, 3, 3)
-        # [SDF-MODIFICATION] 返回SDF作为第一个元素
         return sdf, rgb.reshape(-1, 3), grd, sh
 
     # [SDF-MODIFICATION] NeuS s_var 相关方法
@@ -293,8 +378,7 @@ class Model(BaseModel):
                  center: torch.Tensor,
                  scene_scaling: float,
                  density_offset=-1,  # [DENSITY-RELATED] Model类的密度偏移参数 (保留用于兼容性)
-                 sdf_bias=0.5,  # [SDF-MODIFICATION] SDF初始偏移参数
-                 sdf_inside_out=False,  # [SDF-MODIFICATION] SDF内外反转标志
+                 use_contraction=True,  # [CONTRACTION] 是否使用空间收缩
                  current_sh_deg=2,
                  max_sh_deg=2,
                  ablate_circumsphere=False,
@@ -303,8 +387,7 @@ class Model(BaseModel):
         super().__init__()
         self.device = vertices.device
         self.density_offset = density_offset  # [DENSITY-RELATED] 存储密度偏移 (保留用于兼容性)
-        self.sdf_bias = sdf_bias  # [SDF-MODIFICATION] 存储SDF偏移参数
-        self.sdf_inside_out = sdf_inside_out  # [SDF-MODIFICATION] 存储SDF内外反转标志
+        self.use_contraction = use_contraction  # [CONTRACTION] 存储是否使用空间收缩
         self.max_sh_deg = max_sh_deg
         self.current_sh_deg = current_sh_deg
         self.dir_offset = torch.tensor([
@@ -314,8 +397,7 @@ class Model(BaseModel):
         ], device=self.device)
         sh_dim = ((1+max_sh_deg)**2-1)*3
 
-        # [SDF-MODIFICATION] iNGPDW接收SDF参数 (sdf_bias, sdf_inside_out) 通过kwargs传递
-        module = iNGPDW(sh_dim, sdf_bias=sdf_bias, sdf_inside_out=sdf_inside_out, **kwargs)
+        module = iNGPDW(sh_dim, **kwargs)
         self.compile = module.compile
         if module.compile:
             self.backbone = torch.compile(module).to(self.device)
@@ -353,6 +435,7 @@ class Model(BaseModel):
         self.alpha = 0
         self.ablate_circumsphere = ablate_circumsphere
         self.ablate_gradient = ablate_gradient
+        self._cached_internal_edges = None  # [EDGE-CACHE] 内部边缓存
 
         k_samples = self.backbone.k_samples
         # indices = torch.arange(k_samples, dtype=torch.float32) + 0.5
@@ -393,12 +476,47 @@ class Model(BaseModel):
     def num_int_verts(self):
         return self.contracted_vertices.shape[0]
 
+    def get_internal_edges(self):
+        """
+        获取内部边（两端都是内部点的边），使用缓存避免重复计算
+
+        Returns:
+            edges: (E, 2) 内部边的顶点索引对
+        """
+        if self._cached_internal_edges is not None:
+            return self._cached_internal_edges
+
+        # 提取所有边
+        from utils.model_util import extract_edges_from_tets
+        edges = extract_edges_from_tets(self.indices)  # (E, 2)
+
+        num_internal = self.num_int_verts
+        num_verts = self.vertices.shape[0]
+
+        # 安全检查：确保索引不越界
+        valid_edges = (edges[:, 0] < num_verts) & (edges[:, 1] < num_verts)
+        if not valid_edges.all():
+            edges = edges[valid_edges]
+
+        # 排除包含外部点的边（只保留两端都是内部点的边）
+        internal_mask = (edges[:, 0] < num_internal) & (edges[:, 1] < num_internal)
+        edges = edges[internal_mask]
+
+        self._cached_internal_edges = edges
+        return edges
+
     def get_circumcenters(self):
         circumcenter =  pre_calc_cell_values(
             self.vertices, self.indices, self.center, self.scene_scaling)
         return circumcenter
 
-    def compute_batch_features(self, vertices, indices, start, end, circumcenters=None):
+    def compute_batch_features(self, vertices, indices, start, end, circumcenters=None, compute_sdf=True):
+        """
+        计算四面体批次的特征
+
+        Args:
+            compute_sdf: 是否计算 SDF。渲染时设为 False（使用 query_vert_sdf），其他用途设为 True
+        """
         tets = vertices[indices[start:end]]
         if circumcenters is None:
             circumcenter, radius = calculate_circumcenters_torch(tets.double())
@@ -407,40 +525,43 @@ class Model(BaseModel):
             radius = torch.linalg.norm(circumcenter - vertices[indices[start:end, 0]], dim=-1)
         if self.ablate_circumsphere:
             circumcenter = tets.mean(dim=1)
-            # radius = torch.linalg.norm(circumcenter - vertices[indices[start:end, 0]], dim=-1)
         if self.training:
             circumcenter += self.alpha*torch.randn_like(circumcenter) * radius.reshape(-1, 1)
         if self.backbone.k_samples > 1:
-            # eps = torch.randn((circumcenter.shape[0], self.backbone.k_samples, 3),
-            #                   device=circumcenter.device)
-
             eps = self.sphere_pattern.unsqueeze(0)
             if self.training:
                 rand_mat = torch.randn(3, 3, device=circumcenter.device)
                 q, _ = torch.linalg.qr(rand_mat)
                 if torch.det(q) < 0:
-                    q[:, 0] = -q[:, 0] # Flip one axis
+                    q[:, 0] = -q[:, 0]
                 eps = torch.matmul(q, eps.transpose(-1, -2)).transpose(-1, -2)
 
             sampled_cc = circumcenter.reshape(-1, 1, 3) + eps * radius.reshape(-1, 1, 1) * self.backbone.trunc_sigma
             sampled_radius = radius.reshape(-1, 1, 1).expand(-1, self.backbone.k_samples, 1)
             normalized = (sampled_cc.detach() - self.center) / self.scene_scaling
-            cv, cr = contract_mean_std(normalized.reshape(-1, 3), sampled_radius.reshape(-1) / self.scene_scaling)
-            x = (cv/2 + 1)/2
+            # [CONTRACTION] 根据 use_contraction 决定是否使用空间收缩
+            if self.use_contraction:
+                cv, cr = contract_mean_std(normalized.reshape(-1, 3), sampled_radius.reshape(-1) / self.scene_scaling)
+                x = (cv/2 + 1)/2
+            else:
+                # 不使用收缩：直接线性归一化到 [0, 1]
+                x = (normalized.reshape(-1, 3) + 1) / 2
+                cr = sampled_radius.reshape(-1) / self.scene_scaling
         else:
             normalized = (circumcenter.detach() - self.center) / self.scene_scaling
-            cv, cr = contract_mean_std(normalized, radius / self.scene_scaling)
-            x = (cv/2 + 1)/2
+            # [CONTRACTION] 根据 use_contraction 决定是否使用空间收缩
+            if self.use_contraction:
+                cv, cr = contract_mean_std(normalized, radius / self.scene_scaling)
+                x = (cv/2 + 1)/2
+            else:
+                # 不使用收缩：直接线性归一化到 [0, 1]
+                x = (normalized + 1) / 2
+                cr = radius / self.scene_scaling
 
-        output = checkpoint(self.backbone, x, cr, use_reentrant=True)
-
-        # cr = cr.reshape(-1, 1)
-        # x, n = pad_for_tinycudann(x, 256)
-        # cr, n = pad_for_tinycudann(cr, 256)
-        # N = circumcenter.shape[0]
-        # output = self.backbone(x, cr.reshape(-1, 1))
-        # output = [v[:N] for v in output]
-        return circumcenter, *output
+        output = checkpoint(self.backbone, x, cr, compute_sdf, use_reentrant=True)
+        # output = (sdf, rgb, grd, sh)，compute_sdf=False 时 sdf 是 dummy 值
+        sdf_output = output[0]
+        return circumcenter, sdf_output, *output[1:]
 
     def get_cell_values(self, camera: Camera, mask=None,
                         all_circumcenters=None, radii=None):
@@ -453,9 +574,9 @@ class Model(BaseModel):
         start = 0
         for start in range(0, indices.shape[0], self.chunk_size):
             end = min(start + self.chunk_size, indices.shape[0])
-            # [SDF-MODIFICATION] compute_batch_features 返回 sdf
-            circumcenters, sdf, rgb, grd, sh = self.compute_batch_features(
-                vertices, indices, start, end, circumcenters=all_circumcenters)
+            # [SDF-MODIFICATION] compute_sdf=False：渲染使用 query_vert_sdf，跳过 sdf_net 计算
+            circumcenters, sdf_dummy, rgb, grd, sh = self.compute_batch_features(
+                vertices, indices, start, end, circumcenters=all_circumcenters, compute_sdf=False)
             # === [DENSITY-RELATED] 原密度代码 (已注释) ===
             # circumcenters, density, rgb, grd, sh = self.compute_batch_features(...)
             # === [DENSITY-RELATED] 原密度代码结束 ===
@@ -463,10 +584,9 @@ class Model(BaseModel):
                 grd = torch.zeros_like(grd)
             centroids = vertices[indices[start:end]].mean(dim=1)
             shs[start:end] = sh.reshape(-1, sh_dim, 3)
-            # [SDF-MODIFICATION] activate_output 接收 sdf 参数
-            # TODO: activate_output 需要修改以处理SDF而非density
+            # [SDF-MODIFICATION] sdf_dummy 是占位值（渲染不使用 cell_values[0]）
             dvrgbs = activate_output(camera.camera_center.to(self.device),
-                                     sdf, rgb, grd,  # [SDF-MODIFICATION] sdf 替代 density
+                                     sdf_dummy, rgb, grd,
                                      sh.reshape(-1, sh_dim, 3),
                                      indices[start:end],
                                      centroids,
@@ -478,7 +598,6 @@ class Model(BaseModel):
     @staticmethod
     def init_from_pcd(point_cloud, cameras, device, max_sh_deg,
                       voxel_size=0.00, **kwargs):
-        sdf_sphere_radius_scale = kwargs.pop('sdf_sphere_radius_scale', 1.2)
         init_num = kwargs.pop('init_num', 0)  # 初始点云最小数量
         torch.manual_seed(2)
 
@@ -521,42 +640,6 @@ class Model(BaseModel):
             vertices = vertices[:init_num]
             print(f"[Init] Expanded point cloud from {original_num} to {vertices.shape[0]} points")
 
-        # [SDF-MODIFICATION] 参考 svraster 的点云边界计算方式
-        # 使用点云中位数作为中心，基于密度启发式计算半径（排除离群点）
-        pcd_center = vertices.median(dim=0).values  # 点云中位数作为中心
-        pcd_dists = torch.linalg.norm(vertices - pcd_center, dim=1, ord=2)  # 到点云中心的距离
-
-        # 基于密度启发式找半径（参考 svraster 的 main_scene_bound_pcd_heuristic）
-        pcd_dists_sorted, _ = pcd_dists.sort()
-        pcd_density_rate = 0.1  # 密度阈值比例
-        # 计算密度: N(r) / V(r)，其中 V(r) ∝ r^3
-        valid_mask = pcd_dists_sorted > 0
-        density = torch.zeros_like(pcd_dists_sorted)
-        density[valid_mask] = (1 + torch.arange(len(pcd_dists_sorted), device=vertices.device).float()[valid_mask]) / ((2 * pcd_dists_sorted[valid_mask]) ** 3 + 1e-6)
-
-        # 至少覆盖 5% 的点
-        begin_idx = round(len(density) * 0.05)
-        # 找密度最大的位置
-        max_idx = begin_idx + density[begin_idx:].argmax().item()
-        # 找密度下降到最大值 * pcd_density_rate 的位置
-        target_density = pcd_density_rate * density[max_idx]
-        below_target = density[max_idx:] < target_density
-        if below_target.any():
-            target_idx = max_idx + torch.where(below_target)[0][0].item()
-        else:
-            target_idx = len(density) - 1
-
-        pcd_radius = pcd_dists_sorted[target_idx]
-        new_radius = pcd_radius.cpu().item()
-
-        # 计算 sdf_bias（网络输入空间中的球体半径）
-        # 坐标变换流程: world → normalized(÷scaling) → contracted → x=(cv/2+1)/2
-        sdf_bias = (pcd_radius * sdf_sphere_radius_scale / scaling / 2).item()
-        print(f"[SDF Init] Point cloud center: {pcd_center}, "
-              f"pcd_radius (density-based): {pcd_radius:.4f}, "
-              f"scene_scaling: {scaling:.4f}, "
-              f"sdf_bias (network space): {sdf_bias:.4f}")
-
         # vertices = sample_uniform_in_sphere(10000, 3, base_radius=0, radius=new_radius, device='cpu') + center.reshape(1, 3).cpu()
 
         # vertices = vertices + torch.randn(*vertices.shape) * 1e-3
@@ -588,7 +671,7 @@ class Model(BaseModel):
         # ext_vertices = torch.empty((0, 3))
 
         model = Model(vertices.cuda(), ext_vertices, center, scaling,
-                      max_sh_deg=max_sh_deg, sdf_bias=sdf_bias, **kwargs)
+                      max_sh_deg=max_sh_deg, **kwargs)
         return model
 
     @staticmethod
@@ -647,10 +730,10 @@ class Model(BaseModel):
         """[DEPRECATED] 请使用 calc_tet_sdf()，此方法保留用于兼容"""
         return self.calc_tet_sdf()
 
-    # [SDF-MODIFICATION] 直接查询顶点SDF值（方案B：全局顶点SDF）
+    # [SDF-MODIFICATION] 直接查询顶点SDF值
     def query_vert_sdf(self, points=None):
         """
-        直接查询点的SDF值，不使用 downweighing（因为 SDF 只和位置有关）
+        直接查询点的SDF值
 
         Args:
             points: (N, 3) 世界坐标，如果为 None 则查询所有顶点
@@ -668,21 +751,27 @@ class Model(BaseModel):
             # 1. 坐标归一化
             normalized = (pts - self.center) / self.scene_scaling
 
-            # 2. 空间收缩 (只需要坐标，不需要 std)
-            cv, _ = contract_mean_std(normalized, torch.zeros(pts.shape[0], device=pts.device))
-            x = (cv / 2 + 1) / 2
+            # 2. [CONTRACTION] 根据 use_contraction 决定是否使用空间收缩
+            if self.use_contraction:
+                cv, _ = contract_mean_std(normalized, torch.zeros(pts.shape[0], device=pts.device))
+                x = (cv / 2 + 1) / 2  # [0, 1] 范围
+            else:
+                # 不使用收缩：直接线性归一化到 [0, 1]
+                x = (normalized + 1) / 2
 
-            # 3. Hash Grid 编码 (直接用 encoding，不经过 _encode 避免 downweighing)
+            # 3. Hash Grid 编码 + C2F
             h = self.backbone.encoding(x)
-            h = h.reshape(-1, self.backbone.L * self.backbone.dim).float()
+            if self.backbone.coarse2fine_enabled and self.backbone.active_levels < self.backbone.L:
+                h = h * self.backbone._get_c2f_mask(h)
+            h = h.float()
 
-            # 4. SDF 网络
+            # 4. SDF 网络前向传播：只接收 hash 特征
             sdf = self.backbone.sdf_net(h)
             sdf_list.append(sdf.reshape(-1))
 
         return torch.cat(sdf_list)
 
-    def compute_sdf_gradients(self, points=None, mode="numerical", taps=4, eps=1e-3):
+    def compute_sdf_gradients(self, points=None, mode="numerical", taps=4, eps=None):
         """
         计算 SDF 的梯度和 Hessian 对角元素（用于 Eikonal 和 Curvature Loss）
 
@@ -690,7 +779,9 @@ class Model(BaseModel):
             points: (N, 3) 查询点坐标，如果为 None 则使用所有顶点
             mode: "analytical" 使用 autograd，"numerical" 使用数值差分
             taps: 数值差分的采样点数，4 或 6（仅 mode="numerical" 时有效）
-            eps: 数值差分的步长
+            eps: 数值差分的步长（世界坐标）
+                 如果为 None，自动计算：eps = scene_scaling / finest_resolution
+                 (参考 Neuralangelo: eps = 1/resolution 在归一化空间)
 
         Returns:
             sdf: (N,) SDF 值
@@ -699,6 +790,20 @@ class Model(BaseModel):
         """
         if points is None:
             points = self.vertices
+
+        # [SDF-MODIFICATION] 自动计算 eps (参考 Neuralangelo)
+        # Neuralangelo: eps = 1/resolution 在归一化空间
+        # 我们需要转换到世界坐标：eps_world = eps_normalized * scene_scaling
+        if eps is None:
+            # 获取最细分辨率
+            finest_resolution = self.backbone.base_resolution * (
+                self.backbone.per_level_scale ** (self.backbone.L - 1)
+            )
+            # eps 在归一化 [0,1] 空间为 1/resolution
+            # 转换到世界坐标：乘以 scene_scaling
+            eps = float(self.scene_scaling) / finest_resolution
+            # [CONTRACTION] 注意：如果启用 contraction，实际步长在远离中心处会有偏差
+            # 关闭 contraction 后，这个近似是精确的
 
         if mode == "analytical":
             return self._compute_gradients_analytical(points)
@@ -855,6 +960,16 @@ class Model(BaseModel):
         return self.vertices[active_indices]
 
     @property
+    def active_internal_vertices(self):
+        """获取活跃的内部顶点（排除 ext_vertices，用于 Eikonal loss）"""
+        active_indices = self.indices.unique()
+        num_internal = self.contracted_vertices.shape[0]
+        # 只保留索引 < num_internal 的顶点（即 contracted_vertices）
+        internal_mask = active_indices < num_internal
+        internal_indices = active_indices[internal_mask]
+        return self.contracted_vertices[internal_indices]
+
+    @property
     def active_vertex_indices(self):
         """获取活跃顶点的索引"""
         return self.indices.unique()
@@ -876,6 +991,8 @@ class Model(BaseModel):
             alpha_threshold: NeuS alpha 阈值，如果四面体最大可能 alpha < threshold，则裁剪
                             设为 0 禁用此裁剪
         """
+        # [EDGE-CACHE] 清除边缓存
+        self._cached_internal_edges = None
         torch.cuda.empty_cache()
         verts = self.vertices
         if high_precision:
@@ -950,6 +1067,78 @@ class Model(BaseModel):
             weight_decay = weight_decay + (param[ind:].reshape(-1, self.nominal_offset_size)**2).mean(dim=1).sum()
             return weight_decay
 
+    def _query_sdf_normalized_space(self, points_normalized):
+        """
+        直接在归一化空间查询 SDF，不乘 scaling（用于调试坐标变换问题）
+
+        Args:
+            points_normalized: (N, 3) 归一化坐标 [-1, 1]
+        Returns:
+            sdf_normalized: (N,) 归一化空间的 SDF（不乘 scaling）
+        """
+        sdf_list = []
+        for start in range(0, points_normalized.shape[0], self.chunk_size):
+            end = min(start + self.chunk_size, points_normalized.shape[0])
+            pts_norm = points_normalized[start:end]
+
+            # 归一化 → hash [0, 1]
+            x = (pts_norm + 1) / 2
+
+            # Hash Grid 编码 + C2F
+            h = self.backbone.encoding(x)
+            if self.backbone.coarse2fine_enabled and self.backbone.active_levels < self.backbone.L:
+                h = h * self.backbone._get_c2f_mask(h)
+            h = h.float()
+
+            # SDF 网络输入
+            xyz_input = x * 2 - 1  # = pts_norm
+            sdf_input = torch.cat([xyz_input, h], dim=-1)
+
+            # SDF 网络输出（不乘 scaling！）
+            sdf_normalized = self.backbone.sdf_net(sdf_input)
+            sdf_list.append(sdf_normalized.reshape(-1))
+
+        return torch.cat(sdf_list)
+
+    def _compute_eikonal_normalized_space(self, points_normalized, eps):
+        """
+        在归一化空间用数值差分计算 Eikonal loss（用于调试坐标变换问题）
+
+        Args:
+            points_normalized: (N, 3) 归一化坐标 [-1, 1]
+            eps: 归一化空间的步长 (通常 = 1/resolution)
+        Returns:
+            sdf: (N,) SDF 值（归一化空间）
+            gradients: (N, 3) 梯度
+            eikonal_loss: scalar
+        """
+        # 中心点 SDF
+        sdf = self._query_sdf_normalized_space(points_normalized)
+
+        # 6 个偏移方向
+        eps_x = torch.tensor([eps, 0., 0.], device=self.device)
+        eps_y = torch.tensor([0., eps, 0.], device=self.device)
+        eps_z = torch.tensor([0., 0., eps], device=self.device)
+
+        # 计算 6 个偏移点的 SDF
+        sdf_x_pos = self._query_sdf_normalized_space(points_normalized + eps_x)
+        sdf_x_neg = self._query_sdf_normalized_space(points_normalized - eps_x)
+        sdf_y_pos = self._query_sdf_normalized_space(points_normalized + eps_y)
+        sdf_y_neg = self._query_sdf_normalized_space(points_normalized - eps_y)
+        sdf_z_pos = self._query_sdf_normalized_space(points_normalized + eps_z)
+        sdf_z_neg = self._query_sdf_normalized_space(points_normalized - eps_z)
+
+        # 中心差分
+        gradient_x = (sdf_x_pos - sdf_x_neg) / (2 * eps)
+        gradient_y = (sdf_y_pos - sdf_y_neg) / (2 * eps)
+        gradient_z = (sdf_z_pos - sdf_z_neg) / (2 * eps)
+        gradients = torch.stack([gradient_x, gradient_y, gradient_z], dim=-1)
+
+        grad_norms = gradients.norm(dim=-1)
+        eikonal_loss = ((grad_norms - 1) ** 2).mean()
+
+        return sdf, gradients, eikonal_loss
+
 class TetOptimizer:
     def __init__(self,
                  model: Model,
@@ -987,8 +1176,10 @@ class TetOptimizer:
             {"params": model.backbone.gradient_net.parameters(),  "lr": network_lr, "name": "gradient"},
             {"params": model.backbone.sh_net.parameters(),        "lr": network_lr,       "name": "sh"},
         ]
-        # [SDF-MODIFICATION] 如果 s_var 是可学习参数，添加到优化器
+        # [SDF-MODIFICATION] s_var 学习率倍率（实际 lr 由 update_learning_rate 设置）
+        self.s_var_lr_multiplier = 100
         if model.backbone.s_var_learn:
+            # 初始 lr 会被 update_learning_rate 立即覆盖，这里只是占位
             net_param_groups.append({"params": [model.backbone.s_var], "lr": network_lr, "name": "s_var"})
 
         self.net_optim = optim.CustomAdam(net_param_groups, ignore_param_list=[], betas=[0.9, 0.999], eps=1e-15)
@@ -1051,7 +1242,11 @@ class TetOptimizer:
         self.iteration = iteration
         self.model.alpha = self.alpha_sched(iteration)
         for param_group in self.net_optim.param_groups:
-            lr = self.net_scheduler_args(iteration)
+            # [SDF-MODIFICATION] s_var 使用独立的学习率倍率
+            if param_group.get("name") == "s_var":
+                lr = self.net_scheduler_args(iteration) * self.s_var_lr_multiplier
+            else:
+                lr = self.net_scheduler_args(iteration)
             param_group['lr'] = lr
         for param_group in self.optim.param_groups:
             if param_group["name"] == "encoding":

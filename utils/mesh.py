@@ -366,7 +366,7 @@ class MeshRenderer(nn.Module):
                 feature_img = dr.antialias(feature_img, rast_out, pos, mesh.faces)
 
             if return_depth:
-                output_pkg["depth"] = feature_img[..., depth_idx:depth_idx + 1]
+                output_pkg["depth"] = feature_img[..., depth_idx:depth_idx + 1].squeeze()  # (H, W)
 
             if return_colors:
                 output_pkg["rgb"] = feature_img[..., color_idx:color_idx + 3]
@@ -379,7 +379,9 @@ class MeshRenderer(nn.Module):
                 print(f"[WARNING] Rasterized {torch.sum(error_mask)} pixels with invalid triangle index.")
                 fragments.pix_to_face = torch.clamp(fragments.pix_to_face, min=0, max=mesh.faces.shape[0] - 1)
                 valid_mask = valid_mask & ~error_mask
-            output_pkg["normals"] = mesh.face_normals[fragments.pix_to_face].squeeze()[None] * valid_mask
+            # normals: (H, W, 3), valid_mask: (H, W) -> (H, W, 1) for broadcast
+            normals = mesh.face_normals[fragments.pix_to_face.squeeze()]  # (H, W, 3)
+            output_pkg["normals"] = normals * valid_mask.squeeze()[..., None]  # (H, W, 3)
 
         if return_pix_to_face:
             output_pkg["pix_to_face"] = fragments.pix_to_face
@@ -507,7 +509,7 @@ class ScalableMeshRenderer(nn.Module):
             feature_img = dr.antialias(feature_img, rast_out, pos, mesh.faces)
 
         if return_depth:
-            output_pkg["depth"] = feature_img[..., depth_idx:depth_idx + 1]
+            output_pkg["depth"] = feature_img[..., depth_idx:depth_idx + 1].squeeze()  # (H, W)
 
         if return_colors:
             output_pkg["rgb"] = feature_img[..., color_idx:color_idx + 3]
@@ -519,7 +521,9 @@ class ScalableMeshRenderer(nn.Module):
                 print(f"[WARNING] Rasterized {torch.sum(error_mask)} pixels with invalid triangle index.")
                 fragments.pix_to_face = torch.clamp(fragments.pix_to_face, min=0, max=mesh.faces.shape[0] - 1)
                 valid_mask = valid_mask & ~error_mask
-            output_pkg["normals"] = mesh.face_normals[fragments.pix_to_face].squeeze()[None] * valid_mask
+            # normals: (H, W, 3), valid_mask: (H, W) -> (H, W, 1) for broadcast
+            normals = mesh.face_normals[fragments.pix_to_face.squeeze()]  # (H, W, 3)
+            output_pkg["normals"] = normals * valid_mask.squeeze()[..., None]  # (H, W, 3)
 
         if return_pix_to_face:
             output_pkg["pix_to_face"] = fragments.pix_to_face

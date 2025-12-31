@@ -121,18 +121,25 @@ args.sh_interval = 0
 args.sh_step = 1
 
 # iNGP Settings
-args.use_tccn = True
+args.use_tcnn = True  # True: 使用 tiny-cuda-nn (更快), False: 使用 PyTorch 实现
+args.use_contraction = True  # True: 使用 Mip-NeRF 360 空间收缩, False: 仅线性归一化 (推荐关闭以正确计算 eikonal)
 args.encoding_lr = 3e-3
 args.final_encoding_lr = 3e-4
 args.network_lr = 1e-3
 args.final_network_lr = 1e-4
 args.hidden_dim = 64
-args.scale_multi = 0.35 # chosen such that 96% of the distribution is within the sphere 
+args.scale_multi = 0.35 # chosen such that 96% of the distribution is within the sphere
 args.log2_hashmap_size = 21
 args.per_level_scale = 2
 args.L = 8
 args.hashmap_dim = 8
 args.base_resolution = 64
+
+# Coarse-to-Fine 策略 (参考 Neuralangelo)
+args.coarse2fine_enabled = False  # 是否启用 coarse2fine
+args.coarse2fine_init_level = 4   # 初始激活的 hash grid 层数
+args.coarse2fine_step = 3000      # 每隔多少 iteration 增加一层
+
 args.density_offset = -4
 args.lambda_weight_decay = 1
 args.percent_alpha = 0.0 # preconditioning
@@ -358,6 +365,10 @@ for iteration in progress_bar:
     do_cloning = iteration in dschedule
     do_sh_up = not args.sh_interval == 0 and iteration % args.sh_interval == 0 and iteration > 0
     do_sh_step = iteration % args.sh_step == 0
+
+    # Coarse-to-Fine: 更新激活的 hash grid 层数
+    if args.coarse2fine_enabled:
+        model.backbone.set_active_levels(iteration)
 
     if do_delaunay or do_freeze:
         st = time.time()
@@ -656,6 +667,9 @@ for iteration in progress_bar:
         "Eik": repr(f"{eik_loss.item():.3f}"),
         "Curv": repr(f"{curv_loss.item():.1e}"),
     }
+    # Coarse-to-Fine: 显示当前激活层数
+    if args.coarse2fine_enabled:
+        postfix_dict["C2F"] = f"{model.backbone.active_levels}/{model.backbone.L}"
     # [MESH-LOSS] 显示 mesh loss（仅当激活时）
     if mesh_loss_active:
         postfix_dict["Mesh"] = repr(f"{mesh_loss.item():.3f}")
