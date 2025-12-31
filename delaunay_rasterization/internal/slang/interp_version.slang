@@ -109,7 +109,7 @@ inline float3 compute_integral(float3 c0, float3 c1, float ddt) {
 }
 
 // [SDF-ALPHA-MODE] 开关：true = 使用中点+梯度计算出入点SDF（NeuS风格），false = 直接插值出入点SDF
-static const bool USE_GRADIENT_SDF = true;
+static const bool USE_GRADIENT_SDF = false;
 
 [Differentiable]
 inline CtrlPt integrate_tetra_segment(

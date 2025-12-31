@@ -602,17 +602,9 @@ class Model(BaseModel):
         torch.manual_seed(2)
 
         ccenters = torch.stack([c.camera_center.reshape(3) for c in cameras], dim=0).to(device)
-        cam_center = ccenters.mean(dim=0)
-
-        # [SDF-MODIFICATION] 使用点云中心而不是相机中心
-        # 这样几何初始化的球心在点云中心（归一化后的原点）
-        vertices_temp = torch.as_tensor(point_cloud.points).float()
-        pcd_center = vertices_temp.median(dim=0).values.to(device)  # 点云中位数作为中心
-        center = pcd_center  # 使用点云中心
-
-        # scaling 仍用相机到点云中心的最大距离，保证场景完全包含
+        center = ccenters.mean(dim=0)
         scaling = torch.linalg.norm(ccenters - center.reshape(1, 3), dim=1, ord=torch.inf).max()
-        print(f"Scene scaling: {scaling}. Center (pcd): {center}. Camera center: {cam_center}")
+        print(f"Scene scaling: {scaling}. Center: {center}")
 
         vertices = torch.as_tensor(point_cloud.points).float()
 
