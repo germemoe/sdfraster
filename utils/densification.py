@@ -323,99 +323,84 @@ def apply_densification(
     within_mask = (within_var > args.within_thresh)
     total_mask = (total_var > args.total_thresh)
     error_driven_mask = within_mask | total_mask
+    n_error_split = error_driven_mask.sum().item()
 
-    # [SDF-DENSIFY] 基于 SDF 的分裂策略：接近表面且尺寸过大的四面体
+    # [SDF-DENSIFY] 基于 SDF 的分裂策略
+    # 数量 = 当前顶点数 × ratio
+    # 选择表面附近外接圆最大的 TopK 四面体
+    # 分裂点 = 四面体重心
     sdf_driven_mask = torch.zeros_like(error_driven_mask, dtype=torch.bool)
-    sdf_split_count = 0
+    sdf_split_points = None  # 单独存储 SDF 分裂的点位置
 
     if (hasattr(args, 'sdf_densify_enabled') and args.sdf_densify_enabled
-        and iteration >= getattr(args, 'sdf_densify_start', 5000)):
-        # 计算每个四面体的外接圆半径
-        tet_vertices = model.vertices[model.indices]  # (N_tets, 4, 3)
-        from utils.topo_utils import calculate_circumcenters_torch
-        _, circumradii = calculate_circumcenters_torch(tet_vertices.double())  # (N_tets,)
-        circumradii = circumradii.float().squeeze(-1) if circumradii.dim() > 1 else circumradii.float()
+        and iteration >= getattr(args, 'sdf_densify_start', 5000)
+        and iteration <= getattr(args, 'sdf_densify_end', 15000)):
 
-        # 获取每个四面体的顶点 SDF
-        vert_sdf = model.query_vert_sdf()  # (N_verts,)
-        tet_sdf = vert_sdf[model.indices]  # (N_tets, 4)
+        # SDF 分裂数量 = 当前顶点数 × ratio
+        sdf_split_ratio = getattr(args, 'sdf_densify_ratio', 0.1)
+        n_sdf_split = int(model.num_int_verts * sdf_split_ratio)
 
-        # 判断是否接近表面：四面体中至少有一个顶点接近表面
-        min_abs_sdf = tet_sdf.abs().min(dim=1).values  # (N_tets,)
+        if n_sdf_split > 0:
+            # 计算每个四面体的外接圆半径
+            tet_vertices = model.vertices[model.indices]  # (N_tets, 4, 3)
+            from utils.topo_utils import calculate_circumcenters_torch
+            _, circumradii = calculate_circumcenters_torch(tet_vertices.double())
+            circumradii = circumradii.float().squeeze(-1) if circumradii.dim() > 1 else circumradii.float()
 
-        # SDF 分裂条件：接近表面 且 尺寸过大
-        sdf_threshold = getattr(args, 'sdf_densify_threshold', 0.02)
-        radius_threshold = getattr(args, 'sdf_densify_radius_thresh', 0.05)
-        sdf_driven_mask = (min_abs_sdf < sdf_threshold) & (circumradii > radius_threshold)
+            # 获取每个四面体的顶点 SDF
+            vert_sdf = model.query_vert_sdf()  # (N_verts,)
+            tet_sdf = vert_sdf[model.indices]  # (N_tets, 4)
 
-        # 排除已经被误差驱动分裂选中的（避免重复）
-        sdf_driven_mask = sdf_driven_mask & (~error_driven_mask)
+            # 判断是否接近表面：四面体中至少有一个顶点接近表面
+            sdf_threshold = getattr(args, 'sdf_densify_threshold', 0.02)
+            min_abs_sdf = tet_sdf.abs().min(dim=1).values  # (N_tets,)
+            surface_mask = min_abs_sdf < sdf_threshold
 
-        sdf_split_count = sdf_driven_mask.sum().item()
+            # 排除已经被误差驱动分裂选中的（避免重复）
+            surface_mask = surface_mask & (~error_driven_mask)
 
-    # 合并两种分裂策略
-    clone_mask = error_driven_mask | sdf_driven_mask
+            if surface_mask.sum() > 0:
+                # 从表面附近的四面体中，选择外接圆最大的 TopK
+                surface_radii = circumradii.clone()
+                surface_radii[~surface_mask] = -1  # 非表面四面体设为 -1
 
-    # 如果候选数量超过预算，分配预算：优先误差驱动，剩余给SDF驱动
-    if clone_mask.sum() > target_addition:
-        sdf_weight = getattr(args, 'sdf_densify_weight', 0.3)
-        target_error = int(target_addition * (1 - sdf_weight))
-        target_sdf = target_addition - target_error
+                n_sdf_split = min(n_sdf_split, surface_mask.sum().item())
+                _, topk_indices = torch.topk(surface_radii, n_sdf_split)
+                sdf_driven_mask[topk_indices] = True
 
-        # 误差驱动分裂
-        if error_driven_mask.sum() > target_error:
-            true_indices = error_driven_mask.nonzero().squeeze(-1)
-            perm = torch.randperm(true_indices.size(0))
-            selected_indices = true_indices[perm[:target_error]]
-            error_driven_mask_selected = torch.zeros_like(error_driven_mask, dtype=torch.bool)
-            error_driven_mask_selected[selected_indices] = True
-        else:
-            error_driven_mask_selected = error_driven_mask
-            target_sdf += (target_error - error_driven_mask.sum().item())  # 未用完的配额给SDF
+                # 计算分裂点 = 四面体重心
+                sdf_tet_vertices = tet_vertices[topk_indices]  # (K, 4, 3)
+                sdf_split_points = sdf_tet_vertices.mean(dim=1)  # (K, 3) 重心
 
-        # SDF 驱动分裂
-        if sdf_driven_mask.sum() > target_sdf:
-            true_indices = sdf_driven_mask.nonzero().squeeze(-1)
-            perm = torch.randperm(true_indices.size(0))
-            selected_indices = true_indices[perm[:target_sdf]]
-            sdf_driven_mask_selected = torch.zeros_like(sdf_driven_mask, dtype=torch.bool)
-            sdf_driven_mask_selected[selected_indices] = True
-        else:
-            sdf_driven_mask_selected = sdf_driven_mask
+    # 误差驱动分裂的点位置
+    error_split_point, bad = get_approx_ray_intersections(stats.within_var_rays)
+    error_split_point = error_split_point[error_driven_mask]
+    bad = bad[error_driven_mask]
 
-        clone_mask = error_driven_mask_selected | sdf_driven_mask_selected
+    # 使用四面体内的随机重心坐标位置作为回退
+    error_clone_indices = model.indices[error_driven_mask]
+    if error_clone_indices.shape[0] > 0:
+        barycentric = torch.rand((error_clone_indices.shape[0], 4, 1), device=device).clip(min=0.1, max=0.9)
+        barycentric_weights = barycentric / barycentric.sum(dim=1, keepdim=True)
+        random_locations = (model.vertices[error_clone_indices] * barycentric_weights).sum(dim=1)
+        error_split_point[bad] = random_locations[bad]
+
+    # 合并分裂点
+    if sdf_split_points is not None and sdf_split_points.shape[0] > 0:
+        split_point = torch.cat([error_split_point, sdf_split_points.float()], dim=0)
     else:
-        # 候选数量不足预算，全部分裂
-        pass
+        split_point = error_split_point
 
-    clone_indices = model.indices[clone_mask]
-    split_point, bad = get_approx_ray_intersections(stats.within_var_rays)
-    # grow_point = safe_math.safe_div(
-    #     stats.tet_moments[:, :3],
-    #     stats.tet_moments[:, 3:4]
-    # )
-    # split_point[bad] = grow_point[bad]
-    split_point = split_point[clone_mask]
-    bad = bad[clone_mask]
-    barycentric = torch.rand((clone_indices.shape[0], clone_indices.shape[1], 1), device=device).clip(min=0.01, max=0.99)
-    barycentric_weights = barycentric / (1e-3+barycentric.sum(dim=1, keepdim=True))
-    random_locations = (model.vertices[clone_indices] * barycentric_weights).sum(dim=1)
-    # split_point[bad] = random_locations[bad]    # fall back
+    n_total_split = split_point.shape[0]
+    n_sdf_split_actual = sdf_split_points.shape[0] if sdf_split_points is not None else 0
 
-    tet_optim.split(split_point, **args.as_dict())
-    # keep_verts = keep_verts > 0
-    # keep_verts = torch.cat([keep_verts, torch.ones((model.vertices.shape[0] - keep_verts.shape[0]), device=device, dtype=bool)])
-    # print(f"Pruned: {(~keep_verts).sum()}")
-    # tet_optim.remove_points(keep_verts.reshape(-1))
+    if n_total_split > 0:
+        tet_optim.split(split_point, **args.as_dict())
 
     gc.collect()
     torch.cuda.empty_cache()
 
-    # 统计实际分裂数量
-    error_split_count = (clone_mask & error_driven_mask).sum().item()
-    sdf_split_count_actual = (clone_mask & sdf_driven_mask).sum().item()
-
     print(
-        f"#Grow: {total_mask.sum():4d} #Split: {within_mask.sum():4d} #SDF: {sdf_split_count_actual:4d} | "
-        f"Total Avg: {total_var.mean():.4f} Within Avg: {within_var.mean():.4f}"
+        f"#Grow: {total_mask.sum():4d} #Split: {within_mask.sum():4d} #SDF: {n_sdf_split_actual:4d} "
+        f"#Total: {n_total_split:5d} | Total Avg: {total_var.mean():.4f} Within Avg: {within_var.mean():.4f}"
     )

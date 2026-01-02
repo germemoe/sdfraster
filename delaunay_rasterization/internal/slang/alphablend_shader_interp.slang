@@ -20,6 +20,31 @@ import interp_version;
 static const uint TILE_HEIGHT = PYTHON_TILE_HEIGHT;
 static const uint TILE_WIDTH = PYTHON_TILE_WIDTH;
 
+// [DEPTH-MODE] 深度渲染模式开关
+// true  = 使用 upstream 风格的密度加权积分深度 (compute_integral1D)
+// false = 使用当前的期望深度 (T * alpha * t_mid)
+static const bool USE_INTEGRAL_DEPTH = false;
+
+// [DEPTH-MODE] phi 函数，用于 compute_integral1D
+[Differentiable]
+inline float phi_depth(float x) {
+    if (abs(x) < 1e-6) {
+        return 1.0f - x / 2.0f;
+    }
+    return -(safe_expm1(-x)) / x;
+}
+
+// [DEPTH-MODE] 密度加权积分深度（upstream 风格）
+// 计算 w0 * t_enter + w1 * t_exit，其中权重基于光学厚度 tau
+[Differentiable]
+inline float compute_integral1D_depth(float t_enter, float t_exit, float tau) {
+    float alpha = safe_exp(-tau);
+    float phi_val = phi_depth(tau);
+    float w0 = phi_val - alpha;
+    float w1 = 1.0f - phi_val;
+    return w0 * t_enter + w1 * t_exit;
+}
+
 groupshared SplatTetrahedra_interp collected_splats[TILE_HEIGHT * TILE_WIDTH];
 groupshared uint32_t collected_idx[TILE_HEIGHT * TILE_WIDTH];
 
@@ -183,6 +208,7 @@ struct AlphaOut: IDifferentiable {
 };
 
 // [NORMAL-OUTPUT] Normal blending: accumulated_normal += normal * alpha * T
+// 注意：svraster 也是用 T * alpha * normal，只是在体素内部累积时已经乘了 alpha
 [Differentiable]
 float3 update_normal_state(float3 prev_normal, float3 ctrl_normal, float4 ctrl_rgba, float T) {
     // ctrl_rgba.rgb 已经是 color * alpha，所以这里直接用 alpha
@@ -196,19 +222,41 @@ float3 undo_normal_state(float3 curr_normal, float3 ctrl_normal, float4 ctrl_rgb
     return curr_normal - ctrl_normal * alpha * T;
 }
 
-// [DEPTH-OUTPUT] Expected depth: depth += T * alpha * t_mid
-// [T-TO-Z-SVRASTER] 在 t 空间累加，最后写入时才乘 ray.d.z（仿 svraster）
+// [DEPTH-OUTPUT] 深度累积
+// USE_INTEGRAL_DEPTH=true:  upstream 风格，depth += T * compute_integral1D(enter, exit, tau)
+// USE_INTEGRAL_DEPTH=false: 期望深度，depth += T * alpha * t_mid
+// [T-TO-Z-SVRASTER] 在 t 空间累加，最后写入时才乘 rd_norm_inv
 [Differentiable]
 float update_depth_state(float prev_depth, float4 ctrl_rgba, float2 ctrl_dist, float T) {
-    float alpha = 1.0f - safe_exp(-ctrl_rgba.a);
-    float t_mid = (ctrl_dist.x + ctrl_dist.y) * 0.5f;
-    return prev_depth + T * alpha * t_mid;  // 累加 t 空间深度
+    float tau = ctrl_rgba.a;  // 光学厚度
+    float t_enter = ctrl_dist.x;
+    float t_exit = ctrl_dist.y;
+
+    if (USE_INTEGRAL_DEPTH) {
+        // upstream 风格：密度加权积分深度
+        float depth_contrib = compute_integral1D_depth(t_enter, t_exit, tau);
+        return prev_depth + T * depth_contrib;
+    } else {
+        // 当前风格：期望深度 T * alpha * t_mid
+        float alpha = 1.0f - safe_exp(-tau);
+        float t_mid = (t_enter + t_exit) * 0.5f;
+        return prev_depth + T * alpha * t_mid;
+    }
 }
 
 float undo_depth_state(float curr_depth, float4 ctrl_rgba, float2 ctrl_dist, float T) {
-    float alpha = 1.0f - safe_exp(-ctrl_rgba.a);
-    float t_mid = (ctrl_dist.x + ctrl_dist.y) * 0.5f;
-    return curr_depth - T * alpha * t_mid;  // 回退 t 空间深度
+    float tau = ctrl_rgba.a;
+    float t_enter = ctrl_dist.x;
+    float t_exit = ctrl_dist.y;
+
+    if (USE_INTEGRAL_DEPTH) {
+        float depth_contrib = compute_integral1D_depth(t_enter, t_exit, tau);
+        return curr_depth - T * depth_contrib;
+    } else {
+        float alpha = 1.0f - safe_exp(-tau);
+        float t_mid = (t_enter + t_exit) * 0.5f;
+        return curr_depth - T * alpha * t_mid;
+    }
 }
 
 [Differentiable]
@@ -556,6 +604,8 @@ void splat_tiled(TensorView<int32_t> sorted_gauss_idx,
       distortion_img.storeOnce(uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 3), pixel_states.distortion_state.w);
       distortion_img.storeOnce(uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 4), pixel_states.distortion_state.v);
       // [NORMAL-OUTPUT] 写入 normal 输出
+      // 注意：每个四面体的法线已在 integrate_tetra_segment 中归一化，
+      // Python 端 (train.py) 会对最终输出再做 F.normalize
       normal_img.storeOnce(uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 0), pixel_states.normal_state.x);
       normal_img.storeOnce(uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 1), pixel_states.normal_state.y);
       normal_img.storeOnce(uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 2), pixel_states.normal_state.z);

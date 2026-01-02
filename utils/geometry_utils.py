@@ -210,24 +210,23 @@ def transform_normal_world_to_view(normal_world, camera):
     """
     device = normal_world.device
 
-    # Get rotation part of world_view_transform (3x3)
-    # world_view_transform[:3,:3] stores R (cam-to-world rotation)
-    # To transform world->view, we need R^T: n_view = n_world @ R^T
+    # world_view_transform = W2V.T，所以 world_view_transform[:3,:3] = R.T
+    # 法线变换（行向量）: n_view = n_world @ R.T = n_world @ world_view_transform[:3,:3]
     R = camera.world_view_transform[:3, :3].to(device)
 
     # Transform normals: world -> view
     original_shape = normal_world.shape
     normal_flat = normal_world.reshape(-1, 3)
-    normal_view = normal_flat @ R.T  # [FIX] Use R.T instead of R
+    normal_view = normal_flat @ R  # n_world @ R.T where R.T is stored in world_view_transform
 
     return normal_view.reshape(original_shape)
 
 
 def compute_normal_consistency_loss(normal1, normal2, mask=None):
-    """Compute normal consistency loss between two normal maps (MILo style).
+    """Compute normal consistency loss between two normal maps.
 
     Uses cosine similarity: loss = 1 - dot(n1, n2)
-    MILo does NOT use absolute value - expects normals to be in same direction.
+    Expects normals to point in the same direction (both towards camera).
 
     Args:
         normal1: (3, H, W) or (H, W, 3) first normal map
@@ -246,7 +245,7 @@ def compute_normal_consistency_loss(normal1, normal2, mask=None):
     # Compute dot product
     dot_product = (normal1 * normal2).sum(dim=-1)  # (H, W)
 
-    # Loss: 1 - cos(angle) (MILo style, no abs)
+    # Loss: 1 - cos(angle)
     loss = 1.0 - dot_product
 
     if mask is not None:

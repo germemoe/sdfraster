@@ -111,6 +111,10 @@ inline float3 compute_integral(float3 c0, float3 c1, float ddt) {
 // [SDF-ALPHA-MODE] 开关：true = 使用中点+梯度计算出入点SDF（NeuS风格），false = 直接插值出入点SDF
 static const bool USE_GRADIENT_SDF = false;
 
+// [NORMAL-MODE] 开关：true = 不归一化四面体梯度（在Python端统一归一化），false = 每个四面体归一化
+// 默认 true，与 svraster 保持一致：不归一化的梯度可以让距离表面较远区域的贡献自然衰减
+static const bool SKIP_GRADIENT_NORMALIZE = true;
+
 [Differentiable]
 inline CtrlPt integrate_tetra_segment(
     in SplatTetrahedra_interp g,
@@ -210,10 +214,17 @@ inline CtrlPt integrate_tetra_segment(
     float rho_hat = (dt > 1e-8f) ? (tau / dt) : 0.0f;
 
     // [NORMAL-OUTPUT] 复用上面已计算的 sdf_grad 作为法向量
-    float grad_len = length(sdf_grad);
-    float3 normal = (grad_len > 1e-8f)
-        ? sdf_grad / grad_len
-        : float3(0.0f, 0.0f, 1.0f);
+    float3 normal;
+    if (SKIP_GRADIENT_NORMALIZE) {
+        // 不归一化，直接使用梯度，Python端统一归一化
+        normal = sdf_grad;
+    } else {
+        // 每个四面体归一化
+        float grad_len = length(sdf_grad);
+        normal = (grad_len > 1e-8f)
+            ? sdf_grad / grad_len
+            : float3(0.0f, 0.0f, 1.0f);
+    }
 
     float4 rgba = { seg_rgb.x, seg_rgb.y, seg_rgb.z, tau };
     return { rgba, {enter, exit}, rho_hat, normal };

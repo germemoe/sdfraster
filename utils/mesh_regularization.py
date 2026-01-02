@@ -172,7 +172,9 @@ class MeshRegularizer(nn.Module):
         sdf_shifted = vert_sdf - threshold
 
         # Run marching tetrahedra
-        mesh_verts, mesh_faces = marching_tetrahedra(vertices, tets, sdf_shifted)
+        # 排除包含外部球面采样点的四面体
+        num_internal = model.num_int_verts if hasattr(model, 'num_int_verts') else None
+        mesh_verts, mesh_faces = marching_tetrahedra(vertices, tets, sdf_shifted, num_internal=num_internal)
 
         if mesh_verts.shape[0] == 0:
             return None
@@ -420,6 +422,8 @@ class MeshRegularizer(nn.Module):
         camera,
         gaussian_depth: torch.Tensor,
         gaussian_depth_med: torch.Tensor = None,  # MILo: median depth for mixing
+        gaussian_normal: torch.Tensor = None,     # (3, H, W) 渲染的法线（世界空间）
+        normal_source: str = "depth",             # "depth", "depth_med", or "rendered"
         spatial_lr_scale: float = None,  # MILo: spatial_lr_scale for depth loss
         iteration: int = None,
         gt_mask: torch.Tensor = None,  # GT alpha mask，排除背景散乱法线
@@ -431,6 +435,11 @@ class MeshRegularizer(nn.Module):
             camera: Camera object for rendering
             gaussian_depth: (H, W) expected depth from Gaussian rendering
             gaussian_depth_med: (H, W) median depth from Gaussian rendering (MILo style)
+            gaussian_normal: (3, H, W) rendered normal in world space (for normal_source="rendered")
+            normal_source: Source for computing gaussian normal:
+                - "depth": use expected depth (default)
+                - "depth_med": use median depth
+                - "rendered": use rendered normal directly (skip depth_to_normal)
             spatial_lr_scale: MILo-style spatial scale for depth loss (camera radius * 1.1)
             iteration: Current training iteration (for scheduling)
             gt_mask: (H, W) or (1, H, W) GT alpha mask，背景为0前景为1
@@ -471,8 +480,27 @@ class MeshRegularizer(nn.Module):
         # Render mesh normals and depth
         mesh_normal, rasterization_mask, mesh_depth = self.render_mesh_normal(mesh, camera)
 
-        # Compute Gaussian normals from depth
-        gaussian_normal = self.compute_gaussian_normal(gaussian_depth, camera)
+        # Compute Gaussian normals based on normal_source
+        # mesh_normal 已在相机空间 (view space)，gaussian_normal 也需要在相机空间
+        if normal_source == "rendered" and gaussian_normal is not None:
+            # 使用渲染的法线，需要从世界空间转到相机空间
+            # gaussian_normal: (3, H, W) 世界空间
+            # 转换到相机空间: n_view = n_world @ R (R = world_view_transform[:3,:3])
+            R = camera.world_view_transform[:3, :3].to(device)
+            if gaussian_normal.shape[0] == 3:
+                # (3, H, W) -> (H, W, 3)
+                gn_hwc = gaussian_normal.permute(1, 2, 0)
+            else:
+                gn_hwc = gaussian_normal  # 假设已经是 (H, W, 3)
+            gn_view = gn_hwc @ R  # world -> view
+            gn_view = F.normalize(gn_view, dim=-1)
+            computed_gaussian_normal = gn_view.permute(2, 0, 1)  # (3, H, W)
+        elif normal_source == "depth_med" and gaussian_depth_med is not None:
+            # 使用中位深度推导法线
+            computed_gaussian_normal = self.compute_gaussian_normal(gaussian_depth_med, camera)
+        else:
+            # 默认：使用期望深度推导法线
+            computed_gaussian_normal = self.compute_gaussian_normal(gaussian_depth, camera)
 
         # Build combined mask
         H, W = gaussian_depth.shape
@@ -498,7 +526,7 @@ class MeshRegularizer(nn.Module):
         # 1. Normal consistency loss
         if self.normal_weight > 0:
             normal_loss = self.compute_normal_consistency_loss(
-                mesh_normal, gaussian_normal, combined_mask
+                mesh_normal, computed_gaussian_normal, combined_mask
             )
             result['normal_loss_raw'] = normal_loss
             total_loss = total_loss + self.normal_weight * normal_loss
@@ -525,7 +553,7 @@ class MeshRegularizer(nn.Module):
         result['loss'] = total_loss
         result['mesh_normal'] = mesh_normal
         result['mesh_depth'] = mesh_depth
-        result['gaussian_normal'] = gaussian_normal
+        result['gaussian_normal'] = computed_gaussian_normal
         result['active'] = True
 
         return result

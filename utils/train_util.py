@@ -69,11 +69,11 @@ def render(camera: Camera, model, cell_values=None, tile_size=16, min_t=0.1,
     total_density = (distortion_img[:, :, 2]**2).clip(min=1e-6)
     distortion_loss = (((distortion_img[:, :, 0] - distortion_img[:, :, 1]) + distortion_img[:, :, 4]) / total_density).clip(min=0)
 
-    # [NORMAL-NORMALIZE] 对渲染的 normal 做归一化（仿 tet-splatting）
-    # 1. 除以 alpha 得到加权平均（而非加权和）
-    # 2. 重新归一化保证是单位向量
+    # [NORMAL-NORMALIZE] 对渲染的 normal 做归一化
+    # svraster 不除以 alpha，直接归一化
     rendered_normal = normal_img.permute(2,0,1)  # (3, H, W)
-    rendered_normal = rendered_normal / alpha.clamp_min(1e-5)  # 除以 alpha 得到加权平均
+    # 注释掉除以 alpha 的操作，与 svraster 保持一致
+    # rendered_normal = rendered_normal / alpha.clamp_min(1e-5)  # 除以 alpha 得到加权平均
     rendered_normal = F.normalize(rendered_normal, p=2, dim=0)  # 重新归一化
 
     render_pkg = {

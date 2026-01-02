@@ -50,13 +50,15 @@ base_tet_edges = torch.tensor([0, 1, 0, 2, 0, 3, 1, 2, 1, 3, 2, 3], dtype=torch.
 v_id = torch.pow(2, torch.arange(4, dtype=torch.long))
 
 
-def _unbatched_marching_tetrahedra(vertices, tets, sdf):
+def _unbatched_marching_tetrahedra(vertices, tets, sdf, num_internal=None):
     """Unbatched marching tetrahedra - extracts triangle mesh from SDF on tetrahedra.
 
     Args:
         vertices: (N_verts, 3) - vertex positions
         tets: (N_tets, 4) - tetrahedron vertex indices
         sdf: (N_verts,) - SDF values at each vertex (positive = outside, negative = inside)
+        num_internal: If provided, exclude tetrahedra containing any vertex with index >= num_internal
+                     (i.e., external boundary vertices like ext_vertices)
 
     Returns:
         verts: (N_mesh_verts, 3) - mesh vertex positions
@@ -73,7 +75,7 @@ def _unbatched_marching_tetrahedra(vertices, tets, sdf):
 
         for tet_chunk in torch.chunk(tets, tets.shape[0] // chunk_size + 1):
             torch.cuda.empty_cache()
-            verts, faces, verts_ids = _unbatched_marching_tetrahedra(vertices, tet_chunk, sdf)
+            verts, faces, verts_ids = _unbatched_marching_tetrahedra(vertices, tet_chunk, sdf, num_internal)
 
             if merged_verts is None:
                 merged_verts = verts
@@ -108,7 +110,14 @@ def _unbatched_marching_tetrahedra(vertices, tets, sdf):
         occ_sum = torch.sum(occ_fx4, -1)
 
         # Valid tetrahedra are those with some vertices inside and some outside
+        # occ_sum: 0 = all inside, 4 = all outside, 1-3 = mixed
         valid_tets = (occ_sum > 0) & (occ_sum < 4)
+
+        # [EXT-EXCLUDE] Exclude tetrahedra containing external boundary vertices
+        # If num_internal is provided, exclude tets where any vertex index >= num_internal
+        if num_internal is not None:
+            has_ext_vertex = (tets >= num_internal).any(dim=1)
+            valid_tets = valid_tets & (~has_ext_vertex)
 
         if valid_tets.sum() == 0:
             # No surface intersection
@@ -168,7 +177,7 @@ def _unbatched_marching_tetrahedra(vertices, tets, sdf):
     return verts, faces, interp_v
 
 
-def marching_tetrahedra(vertices, tets, sdf):
+def marching_tetrahedra(vertices, tets, sdf, num_internal=None):
     """Convert SDF on tetrahedral mesh to triangle mesh using marching tetrahedra.
 
     This is a differentiable mesh extraction algorithm.
@@ -177,6 +186,8 @@ def marching_tetrahedra(vertices, tets, sdf):
         vertices: (N_verts, 3) or (batch, N_verts, 3) - vertex positions
         tets: (N_tets, 4) - tetrahedron vertex indices
         sdf: (N_verts,) or (batch, N_verts) - SDF values (positive = outside, negative = inside)
+        num_internal: If provided, exclude tetrahedra containing any vertex with index >= num_internal
+                     (i.e., external boundary vertices like ext_vertices from sphere sampling)
 
     Returns:
         verts: (N_mesh_verts, 3) - interpolated mesh vertex positions
@@ -188,15 +199,15 @@ def marching_tetrahedra(vertices, tets, sdf):
     """
     # Handle batched input
     if vertices.dim() == 3:
-        results = [_unbatched_marching_tetrahedra(vertices[b], tets, sdf[b])
+        results = [_unbatched_marching_tetrahedra(vertices[b], tets, sdf[b], num_internal)
                    for b in range(vertices.shape[0])]
         return list(zip(*results))[:2]  # Return only verts and faces
     else:
-        verts, faces, _ = _unbatched_marching_tetrahedra(vertices, tets, sdf)
+        verts, faces, _ = _unbatched_marching_tetrahedra(vertices, tets, sdf, num_internal)
         return verts, faces
 
 
-def marching_tetrahedra_with_interpolation(vertices, tets, sdf):
+def marching_tetrahedra_with_interpolation(vertices, tets, sdf, num_internal=None):
     """Same as marching_tetrahedra but returns edge information for custom interpolation.
 
     This is useful when you want to compute vertex positions differently
@@ -206,6 +217,7 @@ def marching_tetrahedra_with_interpolation(vertices, tets, sdf):
         vertices: (N_verts, 3) - vertex positions
         tets: (N_tets, 4) - tetrahedron vertex indices
         sdf: (N_verts,) - SDF values
+        num_internal: If provided, exclude tetrahedra containing any vertex with index >= num_internal
 
     Returns:
         edge_endpoints: (N_mesh_verts, 2, 3) - positions of edge endpoints
@@ -221,6 +233,11 @@ def marching_tetrahedra_with_interpolation(vertices, tets, sdf):
         occ_sum = torch.sum(occ_fx4, -1)
 
         valid_tets = (occ_sum > 0) & (occ_sum < 4)
+
+        # [EXT-EXCLUDE] Exclude tetrahedra containing external boundary vertices
+        if num_internal is not None:
+            has_ext_vertex = (tets >= num_internal).any(dim=1)
+            valid_tets = valid_tets & (~has_ext_vertex)
 
         if valid_tets.sum() == 0:
             return (

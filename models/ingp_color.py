@@ -28,6 +28,23 @@ import time
 
 torch.set_float32_matmul_precision('high')
 
+# [GEOMETRIC-INIT] 几何初始化函数，参考 Neuralangelo 的 MLPforNeuralSDF
+def geometric_init_sdf_layer(linear: nn.Linear, k_in: int, out_bias: float = 0.5, invert: bool = False):
+    """
+    Initialize the SDF output layer with geometric initialization.
+    This initialization makes the network output approximate a sphere SDF initially.
+
+    Args:
+        linear: The linear layer to initialize
+        k_in: Input dimension
+        out_bias: Initial bias value (controls initial sphere radius)
+        invert: If True, invert the SDF (inside becomes outside) - only inverts weight, not bias
+    """
+    nn.init.normal_(linear.weight, mean=np.sqrt(np.pi / k_in), std=0.0001)
+    nn.init.constant_(linear.bias, -out_bias)
+    if invert:
+        linear.weight.data *= -1
+
 def pad_for_tinycudann(x: torch.Tensor, granularity: int):
     """
     Pads the input tensor to ensure its total number of elements is a multiple
@@ -100,6 +117,10 @@ class iNGPDW(nn.Module):
                  d_init=0.1,
                  c_init=0.6,
                  density_offset=-4,  # [DENSITY-RELATED] 密度偏移参数 (保留用于兼容性)
+                 # [GEOMETRIC-INIT] Neuralangelo 风格的几何初始化参数
+                 use_geometric_init=False,  # True: xyz输入+几何初始化, False: 仅hash特征
+                 sdf_bias=0.5,              # 几何初始化的 SDF 偏移（控制初始球体半径）
+                 sdf_inside_out=False,      # 是否反转 SDF 内外
                  # [SDF-MODIFICATION] NeuS s_var 参数 (参考 Neuralangelo)
                  s_var_init=1.4,  # 初始值 (存储的是 log(inv_s)，1.4 对应 inv_s≈4.05，适合扫描数据)
                  s_var_anneal_end=0.1,  # schedule 模式的结束进度
@@ -123,6 +144,11 @@ class iNGPDW(nn.Module):
         self.ablate_downweighing = ablate_downweighing
         self.k_samples = k_samples
         self.trunc_sigma = trunc_sigma
+
+        # [GEOMETRIC-INIT] 保存几何初始化参数
+        self.use_geometric_init = use_geometric_init
+        self.sdf_bias = sdf_bias
+        self.sdf_inside_out = sdf_inside_out
 
         # Coarse-to-Fine 参数 (参考 Neuralangelo)
         self.coarse2fine_enabled = coarse2fine_enabled
@@ -189,10 +215,49 @@ class iNGPDW(nn.Module):
             network.apply(lambda m: init_linear(m, gain))
             return network
 
+        def mk_sdf_net_geometric(input_dim, out_bias, inside_out=False):
+            """[GEOMETRIC-INIT] 创建 SDF 网络 (对齐 Neuralangelo MLPforNeuralSDF)
+
+            使用 Softplus(β=100) 激活函数，与 Neuralangelo 配置一致。
+            结构：1 隐藏层
+            - 第一层：weight ~ N(0, sqrt(2/k_out)), bias=0, weight[:, 3:]=0 (hash部分)
+            - 输出层：weight ~ N(sqrt(π/k_in), 0.0001), bias=-out_bias
+            """
+            network = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.Softplus(beta=100),  # 对齐 Neuralangelo
+                nn.Linear(hidden_dim, 1)
+            )
+
+            # Neuralangelo 风格几何初始化
+            with torch.no_grad():
+                linear_layers = [m for m in network if isinstance(m, nn.Linear)]
+
+                # 第一层：先全部初始化，再把 hash 部分置零
+                nn.init.constant_(linear_layers[0].bias, 0.0)
+                nn.init.normal_(linear_layers[0].weight, 0.0, np.sqrt(2 / hidden_dim))
+                if input_dim > 3:
+                    nn.init.constant_(linear_layers[0].weight[:, 3:], 0.0)
+
+                # 输出层：球体 SDF 初始化
+                nn.init.normal_(linear_layers[-1].weight, mean=np.sqrt(np.pi / hidden_dim), std=0.0001)
+                nn.init.constant_(linear_layers[-1].bias, -out_bias)
+                if inside_out:
+                    linear_layers[-1].weight.data *= -1
+
+            return network
+
         self.network = mk_head(1+12+sh_dim)
 
-        # SDF 网络：使用标准 mk_head，只接收 hash 特征
-        self.sdf_net = mk_head(1)
+        # [GEOMETRIC-INIT] SDF 网络：根据 use_geometric_init 选择
+        if use_geometric_init:
+            # Neuralangelo 风格：xyz + hash 特征输入，几何初始化
+            sdf_input_dim = 3 + self.encoding.n_output_dims
+            self.sdf_net = mk_sdf_net_geometric(sdf_input_dim, sdf_bias, sdf_inside_out)
+            print(f"[GEOMETRIC-INIT] SDF net: xyz+hash input ({sdf_input_dim}D), Softplus, geometric init")
+        else:
+            # 默认：仅 hash 特征输入
+            self.sdf_net = mk_head(1)
         self.density_net = self.sdf_net  # [DENSITY-RELATED] 保留别名用于兼容性
         self.color_net     = mk_head(3)
         self.gradient_net  = mk_head(3)
@@ -326,15 +391,25 @@ class iNGPDW(nn.Module):
         if self.k_samples > 1:
             output = self._encode(x, cr)
             output = output.view(-1, self.k_samples, output.shape[-1]).mean(dim=1)
+            xyz_input = x.view(-1, self.k_samples, 3).mean(dim=1)
         else:
             output = self._encode(x, cr)
+            xyz_input = x  # [GEOMETRIC-INIT] 直接用 hash 输入坐标，范围 [0, 1]
 
         h = output.reshape(-1, self.L * self.dim).float()
 
-        # SDF网络前向传播：只接收 hash 特征
+        # SDF网络前向传播
         # 渲染时 compute_sdf=False（使用 query_vert_sdf 的顶点 SDF），跳过计算节省开销
         if compute_sdf:
-            sdf = self.sdf_net(h)
+            if self.use_geometric_init:
+                # [GEOMETRIC-INIT] xyz + hash 特征输入
+                # xyz 偏移到 [-0.5, 0.5] 范围，使几何初始化的球心在 (0.5, 0.5, 0.5)
+                xyz_centered = xyz_input - 0.5
+                sdf_input = torch.cat([xyz_centered, h], dim=-1)
+                sdf = self.sdf_net(sdf_input)
+            else:
+                # 仅 hash 特征输入
+                sdf = self.sdf_net(h)
         else:
             sdf = torch.zeros((h.shape[0], 1), device=h.device, dtype=h.dtype)
 
@@ -379,6 +454,7 @@ class Model(BaseModel):
                  scene_scaling: float,
                  density_offset=-1,  # [DENSITY-RELATED] Model类的密度偏移参数 (保留用于兼容性)
                  use_contraction=True,  # [CONTRACTION] 是否使用空间收缩
+                 ext_sdf_fixed=False,  # [EXT-SDF] 外部点SDF是否使用固定值（基于距离）
                  current_sh_deg=2,
                  max_sh_deg=2,
                  ablate_circumsphere=False,
@@ -388,6 +464,7 @@ class Model(BaseModel):
         self.device = vertices.device
         self.density_offset = density_offset  # [DENSITY-RELATED] 存储密度偏移 (保留用于兼容性)
         self.use_contraction = use_contraction  # [CONTRACTION] 存储是否使用空间收缩
+        self.ext_sdf_fixed = ext_sdf_fixed  # [EXT-SDF] 外部点SDF使用固定值
         self.max_sh_deg = max_sh_deg
         self.current_sh_deg = current_sh_deg
         self.dir_offset = torch.tensor([
@@ -740,9 +817,22 @@ class Model(BaseModel):
         Returns:
             sdf: (N,) SDF 值
         """
+        # [EXT-SDF] 如果 points=None 且开启 ext_sdf_fixed，只查询内部点
+        if points is None and self.ext_sdf_fixed:
+            # 只查询内部顶点
+            internal_sdf = self._query_sdf_impl(self.contracted_vertices)
+            # 外部点使用基于距离的固定值
+            ext_normalized = (self.ext_vertices - self.center) / self.scene_scaling
+            ext_sdf = torch.norm(ext_normalized, dim=-1)  # 距离中心的归一化距离
+            return torch.cat([internal_sdf, ext_sdf])
+
         if points is None:
             points = self.vertices
 
+        return self._query_sdf_impl(points)
+
+    def _query_sdf_impl(self, points):
+        """内部方法：实际执行 SDF 查询"""
         sdf_list = []
         for start in range(0, points.shape[0], self.chunk_size):
             end = min(start + self.chunk_size, points.shape[0])
@@ -765,8 +855,18 @@ class Model(BaseModel):
                 h = h * self.backbone._get_c2f_mask(h)
             h = h.float()
 
-            # 4. SDF 网络前向传播：只接收 hash 特征
-            sdf = self.backbone.sdf_net(h)
+            # 4. SDF 网络前向传播
+            if self.backbone.use_geometric_init:
+                # [GEOMETRIC-INIT] xyz + hash 特征输入
+                # xyz 偏移到 [-0.5, 0.5] 范围，使几何初始化的球心在 (0.5, 0.5, 0.5)
+                xyz_centered = x - 0.5
+                sdf_input = torch.cat([xyz_centered, h], dim=-1)
+                sdf_normalized = self.backbone.sdf_net(sdf_input)
+                # 将归一化空间的 SDF 转换为世界空间
+                sdf = sdf_normalized * self.scene_scaling
+            else:
+                # 仅 hash 特征输入
+                sdf = self.backbone.sdf_net(h)
             sdf_list.append(sdf.reshape(-1))
 
         return torch.cat(sdf_list)
@@ -1307,29 +1407,44 @@ class TetOptimizer:
     def update_triangulation(self, **kwargs):
         self.model.update_triangulation(**kwargs)
 
-    # [SDF-MODIFICATION] 基于SDF差异的顶点裁剪
-    def prune(self, diff_threshold, **kwargs):
-        if diff_threshold <= 0:
-            return
-        # [SDF-MODIFICATION] 计算四面体SDF
-        tet_sdf = self.model.calc_tet_sdf()
-        # === [DENSITY-RELATED] 原密度代码 (已注释) ===
-        # density = self.model.calc_tet_density()
-        # diff = density[self.pairs[:,0]] - density[self.pairs[:,1]]
-        # === [DENSITY-RELATED] 原密度代码结束 ===
-        # [SDF-MODIFICATION] 计算相邻四面体SDF差异
-        diff = tet_sdf[self.pairs[:,0]] - tet_sdf[self.pairs[:,1]]
-        tet_diff = (self.face_area * diff.abs()).reshape(-1)
-
+    # [PRUNE] 基于贡献度 + 表面距离的顶点剪枝
+    def prune(self, peak_contrib=None,
+              prune_contrib_threshold=0.01, prune_sdf_far_threshold=0.1, **kwargs):
+        """
+        剪枝策略：移除同时满足以下条件的顶点：
+        1. 贡献度低（对渲染贡献小）
+        2. 远离表面（SDF绝对值大）
+        """
         indices = self.model.indices.long()
         device = indices.device
-        vert_diff = torch.zeros((self.model.vertices.shape[0],), device=device)
+        n_verts = self.model.vertices.shape[0]
+        n_tets = indices.shape[0]
+        num_internal = self.model.num_int_verts
 
-        reduce_type = "amax"
-        vert_diff.scatter_reduce_(dim=0, index=indices[..., 0], src=tet_diff, reduce=reduce_type)
-        vert_diff.scatter_reduce_(dim=0, index=indices[..., 1], src=tet_diff, reduce=reduce_type)
-        vert_diff.scatter_reduce_(dim=0, index=indices[..., 2], src=tet_diff, reduce=reduce_type)
-        vert_diff.scatter_reduce_(dim=0, index=indices[..., 3], src=tet_diff, reduce=reduce_type)
-        keep_mask = vert_diff > diff_threshold
-        print(f"Pruned {(~keep_mask).sum()} points. VD: {vert_diff.mean()} TD: {tet_diff.mean()}")
-        self.remove_points(keep_mask)
+        # 计算顶点到表面的距离
+        vert_sdf = self.model.query_vert_sdf()
+        far_from_surface = vert_sdf.abs() > prune_sdf_far_threshold
+
+        # 计算顶点贡献度（四面体贡献度聚合到顶点）
+        if peak_contrib is not None:
+            vert_contrib = torch.zeros((n_verts,), device=device)
+            vert_contrib.scatter_reduce_(dim=0, index=indices[..., 0], src=peak_contrib, reduce="amax")
+            vert_contrib.scatter_reduce_(dim=0, index=indices[..., 1], src=peak_contrib, reduce="amax")
+            vert_contrib.scatter_reduce_(dim=0, index=indices[..., 2], src=peak_contrib, reduce="amax")
+            vert_contrib.scatter_reduce_(dim=0, index=indices[..., 3], src=peak_contrib, reduce="amax")
+            low_contrib = vert_contrib < prune_contrib_threshold
+        else:
+            low_contrib = torch.ones((n_verts,), dtype=torch.bool, device=device)
+
+        # 剪枝条件：贡献度低 且 远离表面，只剪枝内部顶点
+        prune_mask = low_contrib & far_from_surface
+        prune_mask[num_internal:] = False
+        keep_mask = ~prune_mask
+
+        n_pruned = prune_mask.sum().item()
+        print(f"Pruned {n_pruned} points. "
+              f"low_contrib: {low_contrib[:num_internal].sum().item()}, "
+              f"far_from_surface: {far_from_surface[:num_internal].sum().item()}")
+
+        if n_pruned > 0:
+            self.remove_points(keep_mask)

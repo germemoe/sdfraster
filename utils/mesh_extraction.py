@@ -30,7 +30,9 @@ def extract_mesh_from_model(model, threshold=0.0):
     sdf_shifted = vert_sdf - threshold
 
     # Run marching tetrahedra
-    mesh_verts, mesh_faces = marching_tetrahedra(vertices, tets, sdf_shifted)
+    # 排除包含外部球面采样点的四面体
+    num_internal = model.num_int_verts if hasattr(model, 'num_int_verts') else None
+    mesh_verts, mesh_faces = marching_tetrahedra(vertices, tets, sdf_shifted, num_internal=num_internal)
 
     if mesh_verts.shape[0] == 0:
         print("[Warning] No surface extracted. Check SDF values and threshold.")
@@ -59,8 +61,10 @@ def extract_mesh_with_color(model, camera=None, threshold=0.0):
     sdf_shifted = vert_sdf - threshold
 
     # Use detailed extraction to get edge information
+    # 排除包含外部球面采样点的四面体
+    num_internal = model.num_int_verts if hasattr(model, 'num_int_verts') else None
     edge_endpoints, edge_sdf, mesh_faces, edge_vertex_ids = marching_tetrahedra_with_interpolation(
-        vertices, tets, sdf_shifted
+        vertices, tets, sdf_shifted, num_internal=num_internal
     )
 
     if edge_endpoints.shape[0] == 0:

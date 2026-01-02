@@ -107,7 +107,7 @@ eps = torch.finfo(torch.float).eps
 args = Args()
 args.tile_size = 4
 args.image_folder = "images_4"
-args.eval = True
+args.eval = False
 args.dataset_path = Path("/optane/nerf_datasets/360/bonsai")
 args.output_path = Path("output/test/")
 args.iterations = 18000
@@ -122,21 +122,26 @@ args.sh_step = 1
 
 # iNGP Settings
 args.use_tcnn = True  # True: 使用 tiny-cuda-nn (更快), False: 使用 PyTorch 实现
-args.use_contraction = True  # True: 使用 Mip-NeRF 360 空间收缩, False: 仅线性归一化 (推荐关闭以正确计算 eikonal)
+args.use_contraction = False  # True: 使用 Mip-NeRF 360 空间收缩, False: 仅线性归一化 (推荐关闭以正确计算 eikonal)
+args.ext_sdf_fixed = False   # True: 外部点SDF使用固定值（基于距离），False: 通过哈希网格查询
+# [GEOMETRIC-INIT] Neuralangelo 风格的几何初始化
+args.use_geometric_init = False  # True: xyz输入+几何初始化+SDF缩放, False: 仅hash特征（默认）
+args.sdf_bias = 0.5              # 几何初始化的 SDF 偏移（控制初始球体半径）
+args.sdf_inside_out = False      # 是否反转 SDF 内外
 args.encoding_lr = 3e-3
 args.final_encoding_lr = 3e-4
 args.network_lr = 1e-3
 args.final_network_lr = 1e-4
 args.hidden_dim = 64
 args.scale_multi = 0.35 # chosen such that 96% of the distribution is within the sphere
-args.log2_hashmap_size = 21
+args.log2_hashmap_size = 22
 args.per_level_scale = 2
 args.L = 8
 args.hashmap_dim = 8
 args.base_resolution = 64
 
 # Coarse-to-Fine 策略 (参考 Neuralangelo)
-args.coarse2fine_enabled = True  # 是否启用 coarse2fine
+args.coarse2fine_enabled = False  # 是否启用 coarse2fine
 args.coarse2fine_init_level = 4   # 初始激活的 hash grid 层数
 args.coarse2fine_step = 3000      # 每隔多少 iteration 增加一层
 
@@ -165,6 +170,9 @@ args.final_freeze_lr = 1e-4
 # Distortion Settings
 args.lambda_dist = 0.0
 args.lambda_sh = 0.0
+
+# [SDF-MODIFICATION] NeuS s_var 学习率设置
+args.s_var_lr_multiplier = 1    # s_var 学习率倍率（相对于 network_lr）
 
 # [SDF-MODIFICATION] Eikonal 和 Curvature Loss 设置（参考 Neuralangelo）
 args.lambda_eikonal = 0.0 #0.1       # Eikonal loss 权重
@@ -208,15 +216,19 @@ args.mesh_depth_ratio = 1.0      # MILo: median深度的混合比例 (0.0=仅期
 args.mesh_normal_start = 5001     # 开始使用 mesh normal loss 的迭代
 args.mesh_normal_stop = 18000     # 停止使用 mesh normal loss 的迭代
 args.mesh_sdf_threshold = 0.0     # mesh 提取的 SDF 阈值
+args.mesh_normal_source = "depth_med"  # 计算 gaussian normal 的来源:
+                                   # "depth": 使用期望深度推导法线 (默认)
+                                   # "depth_med": 使用中位深度推导法线
+                                   # "rendered": 直接使用渲染的法线（跳过 depth_to_normal）
 
 # [DEPTH-NORMAL-LOSS] 深度推导法线与渲染法线一致性 Loss（参考 MILo）
 args.lambda_normal_depth = 0.0      # 渲染的normal vs 期望深度推导的normal
 args.lambda_normal_depth_med = 0.0  # 渲染的normal vs 中位深度推导的normal
-args.normal_depth_start = 5001         # 开始使用 normal-depth loss 的迭代
+args.normal_depth_start = 5000         # 开始使用 normal-depth loss 的迭代
 args.normal_depth_end = 30000       # 停止使用 normal-depth loss 的迭代
 
 # [MASK-LOSS] Mask Loss 和 Transmittance Concentration Loss（参考 SVRaster）
-args.lambda_mask = 0.0              # mask loss 权重：约束 T 与 GT mask 对齐
+args.lambda_mask = 0.1              # mask loss 权重：约束 T 与 GT mask 对齐
 args.mask_from = 0                  # 开始使用 mask loss 的迭代
 args.mask_until = 20000             # 停止使用 mask loss 的迭代
 args.lambda_T_concen = 0.0          # transmittance concentration loss：鼓励 T 二值化到 0 或 1
@@ -230,17 +242,26 @@ args.densify_start = 2000
 args.densify_end = 16000
 args.densify_interval = 500
 args.budget = 2_000_000
+args.max_split_per_iter = 50000         # 每次分裂的最大顶点数
 args.within_thresh = 0.5
 args.total_thresh = 2.0
 args.clone_min_contrib = 0.003
 args.split_min_contrib = 0.01
 
 # [SDF-DENSIFY] SDF 导向的分裂策略
-args.sdf_densify_enabled = False    # 是否启用 SDF 导向的分裂
+# 数量 = 当前顶点数 × ratio，选择表面附近外接圆最大的 TopK，分裂点为重心
+args.sdf_densify_enabled = False      # 是否启用 SDF 导向的分裂
 args.sdf_densify_threshold = 0.02     # |SDF| < 此值认为接近表面
-args.sdf_densify_radius_thresh = 0.05 # 外接圆半径 > 此值认为需要细分
-args.sdf_densify_start = 5000         # 开始使用 SDF 分裂的迭代数
-args.sdf_densify_weight = 0.3         # SDF 分裂在总预算中的权重 (0.3 = 30%)
+args.sdf_densify_ratio = 0.1          # SDF 分裂数量 = 当前顶点数 × ratio
+args.sdf_densify_start = 4000         # 开始使用 SDF 分裂的迭代数
+args.sdf_densify_end = 15000          # 停止使用 SDF 分裂的迭代数
+
+# [PRUNE] 顶点剪枝策略：移除 (贡献度低 且 远离表面) 的顶点
+args.prune_enabled = False               # 是否启用顶点剪枝
+args.prune_start = 4000                 # 开始剪枝的迭代数
+args.prune_end = 15000                  # 停止剪枝的迭代数
+args.prune_contrib_threshold = 0.01     # 贡献度阈值，低于此值认为贡献度低
+args.prune_sdf_far_threshold = 0.1      # SDF距离阈值，大于此值认为远离表面
 
 args.lambda_ssim = 0.2
 args.min_t = 0.4
@@ -250,8 +271,11 @@ args.data_device = 'cpu'
 # 保留 CDF 贡献 > ε 的四面体，例如 0.01 表示保留贡献 > 1% 的
 args.sdf_eps = 0.01
 args.alpha_threshold = 0.1
+# [CULL] 四面体剔除：contrib_threshold 控制剔除阈值
 args.contrib_threshold = 0.0
-args.threshold_start = 4500
+args.cull_enabled = False                   # 是否启用四面体剔除
+args.cull_start = 4000                  # 开始剔除的迭代数
+args.cull_end = 18000                   # 停止剔除的迭代数
 args.voxel_size = 0.01
 args.sdf_sphere_radius_scale = 1.2  # SDF球形初始化：点云半径 × scale / scene_scaling
 args.init_num = 0  # 初始点云最小数量，不足则通过扰动扩充
@@ -344,8 +368,8 @@ print("Encoding LR")
 
 densification_sampler = SimpleSampler(len(train_cameras), args.num_samples)
 
-video_writer = cv2.VideoWriter(str(args.output_path / "training.mp4"), cv2.VideoWriter_fourcc(*'mp4v'), 30,
-                               pad_hw2even(sample_camera.image_width, sample_camera.image_height))
+# video_writer = cv2.VideoWriter(str(args.output_path / "training.mp4"), cv2.VideoWriter_fourcc(*'mp4v'), 30,
+#                                pad_hw2even(sample_camera.image_width, sample_camera.image_height))
 
 # 创建渲染图保存目录
 render_save_dir = args.output_path / "renders"
@@ -372,9 +396,11 @@ for iteration in progress_bar:
 
     if do_delaunay or do_freeze:
         st = time.time()
+        # [CULL] 四面体剔除：在 cull_enabled=True 且 cull_start 到 cull_end 之间启用
+        cull_active = args.cull_enabled and args.cull_start <= iteration <= args.cull_end
         tet_optim.update_triangulation(
-            sdf_eps=args.sdf_eps if iteration > args.threshold_start else 0,
-            alpha_threshold=args.alpha_threshold if iteration > args.threshold_start else 0, high_precision=do_freeze)
+            sdf_eps=args.sdf_eps if cull_active else 0,
+            alpha_threshold=args.alpha_threshold if cull_active else 0, high_precision=do_freeze)
         if do_freeze:
             del tet_optim
             # model.eval()
@@ -496,11 +522,14 @@ for iteration in progress_bar:
         # 使用渲染的深度计算 mesh loss (MILo风格：支持期望/中位深度混合)
         gaussian_depth = render_pkg['depth']  # (H, W)
         gaussian_depth_med = render_pkg['depth_med']  # (H, W) 中位深度
+        rendered_normal_for_mesh = render_pkg['normal']  # (3, H, W) 世界空间
         mesh_reg_result = mesh_regularizer(
             model=model,
             camera=camera,
             gaussian_depth=gaussian_depth,
             gaussian_depth_med=gaussian_depth_med,  # MILo: 中位深度用于混合
+            gaussian_normal=rendered_normal_for_mesh,  # 渲染的法线（世界空间）
+            normal_source=args.mesh_normal_source,     # "depth", "depth_med", or "rendered"
             spatial_lr_scale=spatial_lr_scale,      # MILo: 使用spatial_lr_scale作为depth scale
             iteration=iteration,
             gt_mask=gt_mask,  # 传入GT alpha mask，排除背景散乱法线
@@ -519,12 +548,12 @@ for iteration in progress_bar:
     if normal_depth_active:
         rendered_normal = render_pkg['normal']  # (3, H, W) 世界坐标系
 
-        # [COORD-FIX] 将渲染法线从世界空间变换到相机空间（仿 MILo）
+        # [COORD-FIX] 将渲染法线从世界空间变换到相机空间（仿 svraster）
         # depth_to_normal 计算的法线在相机空间，需要统一坐标系
-        # world_view_transform[:3,:3] 存储的是相机旋转矩阵 R (cam-to-world)
-        # 法线从 world 变换到 view: n_view = n_world @ R^T
-        R = camera.world_view_transform[:3, :3].to(device)  # (3, 3) cam-to-world rotation
-        rendered_normal_view = rendered_normal.permute(1, 2, 0) @ R.T  # (H, W, 3) world-to-view
+        # world_view_transform = W2V.T，所以 world_view_transform[:3,:3] = R.T
+        # 法线变换（行向量）: n_view = n_world @ R.T = n_world @ world_view_transform[:3,:3]
+        R = camera.world_view_transform[:3, :3].to(device)
+        rendered_normal_view = rendered_normal.permute(1, 2, 0) @ R  # (H, W, 3) world-to-view
         rendered_normal_view = F.normalize(rendered_normal_view, dim=-1)  # 归一化
         rendered_normal_view = rendered_normal_view.permute(2, 0, 1)  # (3, H, W)
 
@@ -644,7 +673,28 @@ for iteration in progress_bar:
                 target_addition= target_addition
 
             )
-            # tet_optim.prune(**args.as_dict())
+            del stats
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    # 顶点剪枝：独立执行，需要单独收集 stats
+    # prune 在 prune_start, prune_start+interval, prune_start+2*interval... 执行
+    do_prune = (args.prune_enabled
+                and iteration >= args.prune_start
+                and iteration <= args.prune_end
+                and (iteration - args.prune_start) % args.densify_interval == 0
+                and not model.frozen)
+    if do_prune:
+        with torch.no_grad():
+            sampled_cams = [train_cameras[i] for i in densification_sampler.nextids()]
+            model.eval()
+            stats = collect_render_stats(sampled_cams, model, args, device)
+            model.train()
+            tet_optim.prune(
+                peak_contrib=stats.peak_contrib,
+                prune_contrib_threshold=args.prune_contrib_threshold,
+                prune_sdf_far_threshold=args.prune_sdf_far_threshold
+            )
             del stats
             gc.collect()
             torch.cuda.empty_cache()
@@ -718,7 +768,7 @@ for iteration in progress_bar:
             # MILo 可视化惯例: (1 - normal) / 2，而非 (normal + 1) / 2
             gauss_normal = render_pkg['normal'].permute(1, 2, 0)  # (H, W, 3) 世界空间
             R_vis = sample_camera.world_view_transform[:3, :3].to(gauss_normal.device)
-            gauss_normal_view = gauss_normal @ R_vis  # 转换到相机空间
+            gauss_normal_view = gauss_normal @ R_vis  # world->view: world_view_transform 已经是 W2V.T
             gauss_normal_view = F.normalize(gauss_normal_view, dim=-1)
             gauss_normal_vis = ((1 - gauss_normal_view.detach().cpu().numpy()) / 2 * 255).clip(0, 255).astype(np.uint8)
 
@@ -764,6 +814,8 @@ for iteration in progress_bar:
                     camera=sample_camera,
                     gaussian_depth=render_pkg['depth'],
                     gaussian_depth_med=render_pkg['depth_med'],  # MILo: 中位深度
+                    gaussian_normal=render_pkg['normal'],        # 渲染的法线（世界空间）
+                    normal_source=args.mesh_normal_source,       # "depth", "depth_med", or "rendered"
                     spatial_lr_scale=spatial_lr_scale,           # MILo: spatial_lr_scale
                     iteration=iteration,
                     gt_mask=sample_gt_mask,
@@ -807,7 +859,8 @@ for iteration in progress_bar:
             vert_sdf = model.query_vert_sdf()  # (N_verts,)
             # 使用Marching Tetrahedra提取mesh
             mesh_verts, mesh_faces = marching_tetrahedra(
-                model.vertices, model.indices, vert_sdf
+                model.vertices, model.indices, vert_sdf,
+                num_internal=model.num_int_verts  # 排除包含外部球面采样点的四面体
             )
             if mesh_faces.shape[0] > 0:
                 # 创建Meshes对象并保存
@@ -838,9 +891,12 @@ for iteration in progress_bar:
                     mesh_depth_norm = np.where(valid_mask_mesh, mesh_depth_norm, 0)
                     mesh_depth_vis = (plt.cm.turbo(mesh_depth_norm)[:, :, :3] * 255).astype(np.uint8)
 
-                    # 2. Mesh法线图
-                    mesh_normal = render_output['normals']  # (H, W, 3) 相机空间
-                    mesh_normal_vis = ((1 - mesh_normal.detach().cpu().numpy()) / 2 * 255).clip(0, 255).astype(np.uint8)
+                    # 2. Mesh法线图（从世界空间转到相机空间后可视化）
+                    mesh_normal_world = render_output['normals']  # (H, W, 3) 世界空间
+                    R_mesh = sample_camera.world_view_transform[:3, :3].to(mesh_normal_world.device)
+                    mesh_normal_view = mesh_normal_world @ R_mesh  # world->view
+                    mesh_normal_view = F.normalize(mesh_normal_view, dim=-1)
+                    mesh_normal_vis = ((1 - mesh_normal_view.detach().cpu().numpy()) / 2 * 255).clip(0, 255).astype(np.uint8)
 
                     # 3. 深度转法线图
                     mesh_depth_normal = depth_to_normal(sample_camera, mesh_depth)  # (3, H, W)
@@ -868,7 +924,7 @@ for iteration in progress_bar:
                     print(f"[Mesh] Failed to render mesh at iter {iteration}: {e}")
 
 avged_psnrs = [sum(v)/len(v) for v in psnrs if len(v) == len(train_cameras)]
-video_writer.release()
+# video_writer.release()
 
 torch.cuda.synchronize()
 torch.cuda.empty_cache()
@@ -886,16 +942,16 @@ with (args.output_path / "results.json").open("w") as f:
     )
     json.dump(all_data, f, cls=CustomEncoder)
 
-with torch.no_grad():
-    epath = cam_util.generate_cam_path(train_cameras, 400)
-    eimages = []
-    for camera in tqdm(epath):
-        render_pkg = render(camera, model, min_t=min_t, tile_size=args.tile_size)
-        image = render_pkg['render']
-        image = image.permute(1, 2, 0)
-        image = image.detach().cpu().numpy()
-        eimages.append(pad_image2even(image))
-mediapy.write_video(args.output_path / "rotating.mp4", eimages)
+# with torch.no_grad():
+#     epath = cam_util.generate_cam_path(train_cameras, 400)
+#     eimages = []
+#     for camera in tqdm(epath):
+#         render_pkg = render(camera, model, min_t=min_t, tile_size=args.tile_size)
+#         image = render_pkg['render']
+#         image = image.permute(1, 2, 0)
+#         image = image.detach().cpu().numpy()
+#         eimages.append(pad_image2even(image))
+# mediapy.write_video(args.output_path / "rotating.mp4", eimages)
 
 model.save2ply(args.output_path / "ckpt.ply")
 sd = model.state_dict()
@@ -909,7 +965,8 @@ with torch.no_grad():
     # 提取最终 mesh
     vert_sdf = model.query_vert_sdf()
     final_mesh_verts, final_mesh_faces = marching_tetrahedra(
-        model.vertices, model.indices, vert_sdf
+        model.vertices, model.indices, vert_sdf,
+        num_internal=model.num_int_verts  # 排除包含外部球面采样点的四面体
     )
     if final_mesh_faces.shape[0] > 0:
         # [COORD-FIX] 将 mesh 顶点从训练坐标系变换回原始世界坐标系
