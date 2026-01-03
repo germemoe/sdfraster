@@ -89,8 +89,8 @@ echo ""
 # run_gpu2 &
 # PID_GPU2=$!
 
-# run_gpu3 &
-# PID_GPU3=$!
+run_gpu3 &
+PID_GPU3=$!
 
 # run_gpu5 &
 # PID_GPU5=$!

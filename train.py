@@ -16,6 +16,7 @@ import time
 from tqdm import tqdm
 import numpy as np
 import torch.nn.functional as F
+import open3d as o3d
 
 # [SEED] 设置随机种子，保证可复现性
 SEED = 52
@@ -122,7 +123,7 @@ args.sh_step = 1
 
 # iNGP Settings
 args.use_tcnn = True  # True: 使用 tiny-cuda-nn (更快), False: 使用 PyTorch 实现
-args.use_contraction = False  # True: 使用 Mip-NeRF 360 空间收缩, False: 仅线性归一化 (推荐关闭以正确计算 eikonal)
+args.use_contraction = True  # True: 使用 Mip-NeRF 360 空间收缩, False: 仅线性归一化 (推荐关闭以正确计算 eikonal)
 args.ext_sdf_fixed = False   # True: 外部点SDF使用固定值（基于距离），False: 通过哈希网格查询
 # [GEOMETRIC-INIT] Neuralangelo 风格的几何初始化
 args.use_geometric_init = False  # True: xyz输入+几何初始化+SDF缩放, False: 仅hash特征（默认）
@@ -172,7 +173,7 @@ args.lambda_dist = 0.0
 args.lambda_sh = 0.0
 
 # [SDF-MODIFICATION] NeuS s_var 学习率设置
-args.s_var_lr_multiplier = 1    # s_var 学习率倍率（相对于 network_lr）
+args.s_var_lr_multiplier = 10   # s_var 学习率倍率（相对于 network_lr）
 
 # [SDF-MODIFICATION] Eikonal 和 Curvature Loss 设置（参考 Neuralangelo）
 args.lambda_eikonal = 0.0 #0.1       # Eikonal loss 权重
@@ -224,7 +225,7 @@ args.mesh_normal_source = "depth_med"  # 计算 gaussian normal 的来源:
 # [DEPTH-NORMAL-LOSS] 深度推导法线与渲染法线一致性 Loss（参考 MILo）
 args.lambda_normal_depth = 0.0      # 渲染的normal vs 期望深度推导的normal
 args.lambda_normal_depth_med = 0.0  # 渲染的normal vs 中位深度推导的normal
-args.normal_depth_start = 5000         # 开始使用 normal-depth loss 的迭代
+args.normal_depth_start = 5001         # 开始使用 normal-depth loss 的迭代
 args.normal_depth_end = 30000       # 停止使用 normal-depth loss 的迭代
 
 # [MASK-LOSS] Mask Loss 和 Transmittance Concentration Loss（参考 SVRaster）
@@ -252,9 +253,9 @@ args.split_min_contrib = 0.01
 # 数量 = 当前顶点数 × ratio，选择表面附近外接圆最大的 TopK，分裂点为重心
 args.sdf_densify_enabled = False      # 是否启用 SDF 导向的分裂
 args.sdf_densify_threshold = 0.02     # |SDF| < 此值认为接近表面
-args.sdf_densify_ratio = 0.1          # SDF 分裂数量 = 当前顶点数 × ratio
+args.sdf_densify_ratio = 0.2          # SDF 分裂数量 = 当前顶点数 × ratio
 args.sdf_densify_start = 4000         # 开始使用 SDF 分裂的迭代数
-args.sdf_densify_end = 15000          # 停止使用 SDF 分裂的迭代数
+args.sdf_densify_end = 10000          # 停止使用 SDF 分裂的迭代数
 
 # [PRUNE] 顶点剪枝策略：移除 (贡献度低 且 远离表面) 的顶点
 args.prune_enabled = False               # 是否启用顶点剪枝
@@ -273,9 +274,7 @@ args.sdf_eps = 0.01
 args.alpha_threshold = 0.1
 # [CULL] 四面体剔除：contrib_threshold 控制剔除阈值
 args.contrib_threshold = 0.0
-args.cull_enabled = False                   # 是否启用四面体剔除
-args.cull_start = 4000                  # 开始剔除的迭代数
-args.cull_end = 18000                   # 停止剔除的迭代数
+args.threshold_start = 4500             # 开始剔除的迭代数（iteration > threshold_start 时启用）
 args.voxel_size = 0.01
 args.sdf_sphere_radius_scale = 1.2  # SDF球形初始化：点云半径 × scale / scene_scaling
 args.init_num = 0  # 初始点云最小数量，不足则通过扰动扩充
@@ -288,8 +287,27 @@ args.ablate_downweighing = False
 args.save_render_interval = 500  # 每k次迭代保存渲染图，0表示不保存
 args.save_mesh_interval = 1000   # 每k次迭代用MT提取mesh并保存，0表示不保存
 
-# [MESH-EVAL] DTU Mesh 评估设置（参考 svraster）
+# [MESH-EVAL] Mesh 提取与评估设置（复用 MILo 评估代码）
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │ 路径1: MT提取 → cull → 相机位置对齐 → 评估                          │
+# │ 路径2: TSDF提取 → cull → 相机位置对齐 → 评估                        │
+# │                                                                     │
+# │ DTU: 使用 transform.txt + scale_mat 对齐                           │
+# │ TNT: 使用 transform.txt + 轨迹对齐 (RANSAC + ICP)                   │
+# └─────────────────────────────────────────────────────────────────────┘
 args.eval_dtu = True            # 是否进行 DTU 评估（仅对 DTU 数据集有效）
+args.eval_tnt = True            # 是否进行 TNT 评估（仅对 TNT 数据集有效）
+args.eval_mt = True             # 是否评估 MT 提取的 mesh
+args.extract_tsdf = True        # 是否使用 TSDF Fusion 提取并评估 mesh
+args.cull_dilation_radius = 6   # cull_mesh 时 mask 膨胀半径（MILo 默认 6）
+args.tnt_min_visible_views = 20 # TNT cull_mesh 时最少可见视图数
+
+# [TSDF-FUSION] TSDF Fusion 参数（参考 MILo DTU 配置）
+args.tsdf_depth_ratio = 0.0     # 深度混合比例: 0.0 = 仅中位深度, 1.0 = 仅期望深度
+args.tsdf_voxel_size = 0.002    # 体素大小
+args.tsdf_depth_trunc = 8.0     # 深度截断
+args.tsdf_sdf_trunc = 0.01      # SDF 截断
+args.tsdf_num_cluster = 50      # 后处理保留的最大 cluster 数
 
 
 args = Args.from_namespace(args.get_parser().parse_args())
@@ -396,11 +414,10 @@ for iteration in progress_bar:
 
     if do_delaunay or do_freeze:
         st = time.time()
-        # [CULL] 四面体剔除：在 cull_enabled=True 且 cull_start 到 cull_end 之间启用
-        cull_active = args.cull_enabled and args.cull_start <= iteration <= args.cull_end
+        # [CULL] 四面体剔除：iteration > threshold_start 时启用
         tet_optim.update_triangulation(
-            sdf_eps=args.sdf_eps if cull_active else 0,
-            alpha_threshold=args.alpha_threshold if cull_active else 0, high_precision=do_freeze)
+            sdf_eps=args.sdf_eps if iteration > args.threshold_start else 0,
+            alpha_threshold=args.alpha_threshold if iteration > args.threshold_start else 0, high_precision=do_freeze)
         if do_freeze:
             del tet_optim
             # model.eval()
@@ -959,79 +976,234 @@ sd['indices'] = model.indices
 sd['empty_indices'] = model.empty_indices
 torch.save(sd, args.output_path / "ckpt.pth")
 
-# [MESH-EVAL] 提取最终 mesh 并保存（参考 svraster）
-import subprocess
-with torch.no_grad():
-    # 提取最终 mesh
-    vert_sdf = model.query_vert_sdf()
-    final_mesh_verts, final_mesh_faces = marching_tetrahedra(
-        model.vertices, model.indices, vert_sdf,
-        num_internal=model.num_int_verts  # 排除包含外部球面采样点的四面体
-    )
-    if final_mesh_faces.shape[0] > 0:
-        # [COORD-FIX] 将 mesh 顶点从训练坐标系变换回原始世界坐标系
-        # 训练时做了 PCA 变换: 原始坐标 → pca_transform → 训练坐标
-        # 现在需要逆变换: 训练坐标 → inv(pca_transform) → 原始坐标（COLMAP坐标系）
-        inv_transform = np.linalg.inv(scene_info.transform)
-        verts_np = final_mesh_verts.cpu().numpy()
-        verts_hom = np.hstack([verts_np, np.ones((verts_np.shape[0], 1))])
-        verts_colmap = (inv_transform @ verts_hom.T).T[:, :3]
+# ============================================================================
+# [MESH-EVAL] Mesh 提取与评估（复用 MILo 评估代码）
+# ============================================================================
 
-        # [DTU-COORD] 如果存在 cameras.npz（DTU 格式），应用 scale_mat 变换到 DTU 世界坐标系
-        # COLMAP 坐标系 ≈ DTU 归一化坐标系，需要应用 scale_mat 变换
-        cameras_npz_path = args.dataset_path / 'cameras.npz'
-        if cameras_npz_path.exists():
-            print(f"[Mesh] Found cameras.npz, applying scale_mat transform to DTU world coords")
-            camera_dict = np.load(str(cameras_npz_path))
-            scale_mat = camera_dict['scale_mat_0'].astype(np.float32)
-            # scale_mat 是 4x4 仿射变换矩阵，对角线是 scale，最后一列是 translation
-            verts_hom = np.hstack([verts_colmap, np.ones((verts_colmap.shape[0], 1))])
-            verts_world = (scale_mat @ verts_hom.T).T[:, :3]
-            print(f"    scale = {scale_mat[0, 0]:.4f}, translation = {scale_mat[:3, 3]}")
-        else:
-            verts_world = verts_colmap
+def get_dtu_info(dataset_path):
+    """从数据集路径提取 DTU 信息"""
+    src_path = os.path.normpath(str(dataset_path))
+    scan_folder = os.path.basename(src_path)
+    dtu_root = os.path.dirname(src_path)
+    scan_digits = ''.join([c for c in scan_folder if c.isdigit()])
+    scan_id = int(scan_digits) if scan_digits else 37
 
-        final_mesh_verts_world = torch.from_numpy(verts_world).float().to(final_mesh_verts.device)
+    # 检查是否为 DTU 数据集
+    obs_mask_path = os.path.join(dtu_root, 'ObsMask', f'ObsMask{scan_id}_10.mat')
+    calibration_path = os.path.join(dtu_root, 'Calibration', 'cal18')
+    is_dtu = os.path.exists(obs_mask_path) or os.path.exists(calibration_path)
 
-        final_mesh = Meshes(final_mesh_verts_world, final_mesh_faces)
-        final_mesh_path = args.output_path / "final_mesh.ply"
-        save_mesh_as_ply(str(final_mesh_path), final_mesh)
-        print(f"[Mesh] Saved final mesh: {final_mesh_verts.shape[0]} verts, {final_mesh_faces.shape[0]} faces (transformed to world coords)")
+    return dtu_root, scan_id, is_dtu
 
-        # [DTU-EVAL] DTU 评估（参考 svraster）
-        if args.eval_dtu:
-            try:
-                src_path = os.path.normpath(str(args.dataset_path))
-                scan_folder = os.path.basename(src_path)
-                dataset_root = os.path.dirname(src_path)
 
-                # 从文件夹名提取 scan_id（例如 scan37 -> 37）
-                scan_digits = ''.join([c for c in scan_folder if c.isdigit()])
-                scan_id = scan_digits if scan_digits else '37'
+def get_tnt_info(dataset_path):
+    """从数据集路径提取 TNT 信息"""
+    from eval.tnt.config import SCENES_TAU_DICT
 
-                # 检查是否为 DTU 数据集（需要 ObsMask 和 cameras.npz）
-                obs_mask_path = os.path.join(dataset_root, 'ObsMask', f'ObsMask{scan_id}_10.mat')
-                cameras_path = os.path.join(src_path, 'cameras.npz')
-                is_dtu = os.path.exists(obs_mask_path) or os.path.exists(cameras_path)
+    src_path = os.path.normpath(str(dataset_path))
+    scene_folder = os.path.basename(src_path)
+    tnt_root = os.path.dirname(src_path)
 
-                if not is_dtu:
-                    print(f"[EVAL-DTU] Skipping: not a DTU dataset (no ObsMask or cameras.npz found)")
-                    print(f"           Checked: {obs_mask_path}")
-                else:
-                    script_path = os.path.join(os.path.dirname(__file__), 'eval_dtu_vanilla', 'evaluate_single_scene.py')
-                    eval_outdir = os.path.join(str(args.output_path), 'eval_dtu_vanilla')
-                    os.makedirs(eval_outdir, exist_ok=True)
-                    cmd = [
-                        sys.executable, script_path,
-                        '--input_mesh', str(final_mesh_path),
-                        '--scan_id', str(scan_id),
-                        '--output_dir', eval_outdir,
-                        '--mask_dir', dataset_root,
-                        '--DTU', dataset_root,
-                    ]
-                    print('[EVAL-DTU] mesh eval cmd:', ' '.join(cmd))
-                    subprocess.run(cmd, check=False)
-            except Exception as e:
-                print(f"[EVAL-DTU] eval failed: {e}")
+    # 场景名称可能是目录名（如 Barn, Truck）
+    scene_name = scene_folder
+
+    # 检查是否为 TNT 数据集
+    # 方法1: 场景名在 TNT 场景列表中
+    # 方法2: 存在 GT 点云和 COLMAP log 文件
+    gt_ply = os.path.join(tnt_root, f"{scene_name}.ply")
+    colmap_log = os.path.join(tnt_root, f"{scene_name}_COLMAP_SfM.log")
+
+    is_tnt = scene_name in SCENES_TAU_DICT or (os.path.exists(gt_ply) and os.path.exists(colmap_log))
+
+    return tnt_root, scene_name, is_tnt
+
+
+def post_process_mesh(verts, faces, num_cluster=50):
+    """后处理：移除小的 cluster"""
+    mesh_o3d = o3d.geometry.TriangleMesh()
+    mesh_o3d.vertices = o3d.utility.Vector3dVector(verts)
+    mesh_o3d.triangles = o3d.utility.Vector3iVector(faces)
+
+    with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Warning):
+        triangle_clusters, cluster_n_triangles, _ = mesh_o3d.cluster_connected_triangles()
+
+    triangle_clusters = np.asarray(triangle_clusters)
+    cluster_n_triangles = np.asarray(cluster_n_triangles)
+
+    if len(cluster_n_triangles) == 0:
+        return verts, faces
+
+    threshold = max(np.sort(cluster_n_triangles)[-num_cluster] if len(cluster_n_triangles) >= num_cluster else 0, 50)
+    triangles_to_remove = cluster_n_triangles[triangle_clusters] < threshold
+    mesh_o3d.remove_triangles_by_mask(triangles_to_remove)
+    mesh_o3d.remove_unreferenced_vertices()
+    mesh_o3d.remove_degenerate_triangles()
+
+    return np.asarray(mesh_o3d.vertices), np.asarray(mesh_o3d.triangles)
+
+
+# 获取 DTU 信息
+dtu_root, scan_id, is_dtu = get_dtu_info(args.dataset_path)
+if is_dtu:
+    print(f"\n[EVAL] DTU dataset detected: scan {scan_id}")
+    print(f"       DTU root: {dtu_root}")
+
+# 获取 TNT 信息
+tnt_root, scene_name, is_tnt = get_tnt_info(args.dataset_path)
+if is_tnt:
+    print(f"\n[EVAL] TNT dataset detected: {scene_name}")
+    print(f"       TNT root: {tnt_root}")
+
+if not is_dtu and not is_tnt:
+    print(f"\n[EVAL] Not a DTU or TNT dataset, skipping mesh evaluation")
+
+# --------------------------------------------------------------------------
+# 路径1: MT 提取
+# --------------------------------------------------------------------------
+if args.eval_mt:
+    print("\n" + "="*60)
+    print("[MT] Extracting mesh with Marching Tetrahedra...")
+    print("="*60)
+
+    with torch.no_grad():
+        vert_sdf = model.query_vert_sdf()
+        mt_verts, mt_faces = marching_tetrahedra(
+            model.vertices, model.indices, vert_sdf,
+            num_internal=model.num_int_verts
+        )
+
+    if mt_faces.shape[0] > 0:
+        verts_np = mt_verts.cpu().numpy()
+        faces_np = mt_faces.cpu().numpy()
+        print(f"[MT] Raw mesh: {verts_np.shape[0]} verts, {faces_np.shape[0]} faces")
+
+        # 后处理
+        verts_np, faces_np = post_process_mesh(verts_np, faces_np, num_cluster=50)
+        print(f"[MT] After post-process: {verts_np.shape[0]} verts, {faces_np.shape[0]} faces")
+
+        # 保存训练坐标系的 mesh
+        mt_mesh_path = args.output_path / "mesh_mt.ply"
+        mt_mesh = o3d.geometry.TriangleMesh()
+        mt_mesh.vertices = o3d.utility.Vector3dVector(verts_np)
+        mt_mesh.triangles = o3d.utility.Vector3iVector(faces_np)
+        o3d.io.write_triangle_mesh(str(mt_mesh_path), mt_mesh)
+        print(f"[MT] Saved: {mt_mesh_path}")
+
+        # DTU 评估
+        if args.eval_dtu and is_dtu:
+            from eval.dtu.evaluate import evaluate_dtu_mesh
+            print(f"\n[MT-EVAL] Running DTU evaluation...")
+            results = evaluate_dtu_mesh(
+                mesh_path=str(mt_mesh_path),
+                train_cameras=train_cameras,
+                dtu_path=dtu_root,
+                scan_id=scan_id,
+                output_dir=str(args.output_path / 'eval_dtu_mt'),
+                cull=True,
+                dilation_radius=args.cull_dilation_radius,
+                dataset_path=str(args.dataset_path),  # 用于 scale_mat
+                model_output_path=str(args.output_path),  # 用于 PCA 变换 (transform.txt)
+            )
+            if results:
+                print(f"[MT-EVAL] Results: d2s={results['mean_d2s']:.4f}, s2d={results['mean_s2d']:.4f}, overall={results['overall']:.4f}")
+
+        # TNT 评估
+        if args.eval_tnt and is_tnt:
+            from eval.tnt.evaluate import evaluate_tnt_mesh
+            print(f"\n[MT-EVAL] Running TNT evaluation...")
+            results = evaluate_tnt_mesh(
+                mesh_path=str(mt_mesh_path),
+                train_cameras=train_cameras,
+                tnt_path=tnt_root,
+                scene_name=scene_name,
+                output_dir=str(args.output_path / 'eval_tnt_mt'),
+                model_output_path=str(args.output_path),  # 用于 PCA 变换 (transform.txt)
+                cull=False,  # TNT 使用基于深度渲染的 cull，可选
+                min_visible_views=args.tnt_min_visible_views,
+            )
+            if results:
+                print(f"[MT-EVAL] Results: precision={results['precision']:.4f}, recall={results['recall']:.4f}, fscore={results['fscore']:.4f}")
     else:
-        print("[Mesh] No faces extracted, skipping mesh evaluation")
+        print("[MT] No faces extracted")
+
+# --------------------------------------------------------------------------
+# 路径2: TSDF Fusion 提取
+# --------------------------------------------------------------------------
+if args.extract_tsdf:
+    print("\n" + "="*60)
+    print("[TSDF] Extracting mesh with TSDF Fusion...")
+    print("="*60)
+
+    from scripts.extract_mesh_tsdf import TSDFExtractor, post_process_mesh as tsdf_post_process
+
+    with torch.no_grad():
+        tsdf_extractor = TSDFExtractor(
+            model,
+            depth_ratio=args.tsdf_depth_ratio,
+            tile_size=args.tile_size,
+            min_t=args.min_t
+        )
+
+        print("[TSDF] Rendering depth maps...")
+        tsdf_extractor.reconstruction(train_cameras)
+
+        print(f"[TSDF] Fusing (voxel={args.tsdf_voxel_size}, trunc={args.tsdf_depth_trunc})...")
+        tsdf_mesh = tsdf_extractor.extract_mesh(
+            voxel_size=args.tsdf_voxel_size,
+            sdf_trunc=args.tsdf_sdf_trunc,
+            depth_trunc=args.tsdf_depth_trunc
+        )
+
+        verts_np = np.asarray(tsdf_mesh.vertices)
+        faces_np = np.asarray(tsdf_mesh.triangles)
+        print(f"[TSDF] Raw mesh: {verts_np.shape[0]} verts, {faces_np.shape[0]} faces")
+
+        # 后处理
+        tsdf_mesh = tsdf_post_process(tsdf_mesh, cluster_to_keep=args.tsdf_num_cluster)
+        verts_np = np.asarray(tsdf_mesh.vertices)
+        faces_np = np.asarray(tsdf_mesh.triangles)
+        print(f"[TSDF] After post-process: {verts_np.shape[0]} verts, {faces_np.shape[0]} faces")
+
+        # 保存训练坐标系的 mesh
+        tsdf_mesh_path = args.output_path / "mesh_tsdf.ply"
+        o3d.io.write_triangle_mesh(str(tsdf_mesh_path), tsdf_mesh)
+        print(f"[TSDF] Saved: {tsdf_mesh_path}")
+
+        # DTU 评估
+        if args.eval_dtu and is_dtu:
+            from eval.dtu.evaluate import evaluate_dtu_mesh
+            print(f"\n[TSDF-EVAL] Running DTU evaluation...")
+            results = evaluate_dtu_mesh(
+                mesh_path=str(tsdf_mesh_path),
+                train_cameras=train_cameras,
+                dtu_path=dtu_root,
+                scan_id=scan_id,
+                output_dir=str(args.output_path / 'eval_dtu_tsdf'),
+                cull=True,
+                dilation_radius=args.cull_dilation_radius,
+                dataset_path=str(args.dataset_path),  # 用于 scale_mat
+                model_output_path=str(args.output_path),  # 用于 PCA 变换 (transform.txt)
+            )
+            if results:
+                print(f"[TSDF-EVAL] Results: d2s={results['mean_d2s']:.4f}, s2d={results['mean_s2d']:.4f}, overall={results['overall']:.4f}")
+
+        # TNT 评估
+        if args.eval_tnt and is_tnt:
+            from eval.tnt.evaluate import evaluate_tnt_mesh
+            print(f"\n[TSDF-EVAL] Running TNT evaluation...")
+            results = evaluate_tnt_mesh(
+                mesh_path=str(tsdf_mesh_path),
+                train_cameras=train_cameras,
+                tnt_path=tnt_root,
+                scene_name=scene_name,
+                output_dir=str(args.output_path / 'eval_tnt_tsdf'),
+                model_output_path=str(args.output_path),  # 用于 PCA 变换 (transform.txt)
+                cull=False,  # TNT 使用基于深度渲染的 cull，可选
+                min_visible_views=args.tnt_min_visible_views,
+            )
+            if results:
+                print(f"[TSDF-EVAL] Results: precision={results['precision']:.4f}, recall={results['recall']:.4f}, fscore={results['fscore']:.4f}")
+
+print("\n" + "="*60)
+print("[DONE] Training and evaluation completed.")
+print("="*60)
