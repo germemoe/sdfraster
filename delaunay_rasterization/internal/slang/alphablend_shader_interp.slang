@@ -80,6 +80,20 @@ float read_inv_s(DiffTensorView inv_s_tensor) {
     return inv_s_tensor[uint(0)];
 }
 
+// [DEPTH-FIX] 计算正确的 rd_norm_inv（t → z 深度转换因子）
+// 仿 svraster: 使用相机空间未归一化射线的长度
+// rd_norm_inv = 1 / ||cam_rd||，其中 cam_rd = (p_x, p_y, 1)
+float compute_rd_norm_inv(Camera cam, float2 center_pix_coord) {
+    float fx = cam.K[0][0];
+    float fy = cam.K[1][1];
+    float cx = cam.K[0][2];
+    float cy = cam.K[1][2];
+    float p_x = (center_pix_coord.x - cx) / fx;
+    float p_y = (center_pix_coord.y - cy) / fy;
+    float cam_rd_len_sq = p_x * p_x + p_y * p_y + 1.0f;
+    return 1.0f / sqrt(cam_rd_len_sq);
+}
+
 // [Differentiable]
 // float moment_0_int(float a, float b, float s1, float T) {
 //     return T * safe_div((-safe_expm1(s1*(a - b))),s1);
@@ -361,12 +375,38 @@ AlphaOut alpha_blend(TensorView<int32_t> sorted_gauss_idx,
                     AlphaOut new_ao = update_alpha_out(ao, tetra_ctrl);  // [T-TO-Z-SVRASTER] 去掉 ray.d.z
 
                     // [DEPTH-MED] 追踪中位深度：当 T 从 >0.5 变为 <=0.5 时记录
+                    // 使用 NeuS 解析解精确定位 T=0.5 的位置
                     if (!found_med) {
-                        float alpha_seg = 1.0f - exp(-tetra_ctrl.rgba.a);
+                        float alpha_seg = 1.0f - safe_exp(-tetra_ctrl.rgba.a);
                         float new_T_med = T_med * (1.0f - alpha_seg);
                         if (T_med > 0.5f && new_T_med <= 0.5f) {
-                            float t_mid = (tetra_ctrl.dist.x + tetra_ctrl.dist.y) * 0.5f;
-                            depth_med = t_mid;  // [T-TO-Z-SVRASTER] 保持 t 空间，最后才转换
+                            // 计算入射出射点的 SDF
+                            float t_enter = tetra_ctrl.dist.x;
+                            float t_exit = tetra_ctrl.dist.y;
+                            float3 p_enter = t_enter * ray.d + ray.o;
+                            float3 p_exit  = t_exit  * ray.d + ray.o;
+                            float4 bary_enter = compute_barycentric(p_enter, g.tet.verts[0], g.tet.verts[1], g.tet.verts[2], g.tet.verts[3]);
+                            float4 bary_exit  = compute_barycentric(p_exit,  g.tet.verts[0], g.tet.verts[1], g.tet.verts[2], g.tet.verts[3]);
+                            float sdf0 = interpolate_sdf(bary_enter, g.vert_sdf);
+                            float sdf1 = interpolate_sdf(bary_exit,  g.vert_sdf);
+
+                            // NeuS 解析解: 求 T(t*) = 0.5 的精确位置
+                            // Φ(u*) = 0.5 * Φ(u0) / T_med
+                            // u* = ln(p* / (1 - p*))
+                            // sdf* = u* / inv_s
+                            // λ* = (sdf* - sdf0) / (sdf1 - sdf0)
+                            float u0 = inv_s * sdf0;
+                            float phi_u0 = safe_sigmoid(u0);
+                            float p_star = 0.5f * safe_div(phi_u0, T_med);
+                            p_star = safe_clip(p_star, 1e-6f, 1.0f - 1e-6f);
+
+                            float u_star = safe_log(safe_div(p_star, 1.0f - p_star));
+                            float sdf_star = safe_div(u_star, inv_s);
+
+                            float lambda = safe_div(sdf_star - sdf0, sdf1 - sdf0);
+                            lambda = safe_clip(lambda, 0.0f, 1.0f);
+
+                            depth_med = t_enter + lambda * (t_exit - t_enter);
                             found_med = true;
                         }
                         T_med = new_T_med;
@@ -386,9 +426,10 @@ AlphaOut alpha_blend(TensorView<int32_t> sorted_gauss_idx,
 
     if (is_inside) {
         n_contributors[uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 0)] = local_n_contrib;
-        // [DEPTH-MED] [T-TO-Z-SVRASTER] 写入中位深度时才除 ||d||，仿 svraster
-        float rd_norm_inv = 1.0f / length(ray.d);
-        depth_med_img[uint2(uint32_t(pix_coord.y), uint32_t(pix_coord.x))] = depth_med * rd_norm_inv;
+        // [DEPTH-MED] [T-TO-Z-SVRASTER] [DEPTH-FIX] 使用正确的 rd_norm_inv 转换 t→z
+        // [DEPTH-FIX] 加上 min_t，因为 ray.o = cam.position + ray.d * min_t
+        float rd_norm_inv = compute_rd_norm_inv(cam, center_pix_coord);
+        depth_med_img[uint2(uint32_t(pix_coord.y), uint32_t(pix_coord.x))] = (depth_med + cam.min_t) * rd_norm_inv;
     }
 
     return ao;
@@ -450,13 +491,13 @@ void bwd_alpha_blend(TensorView<int32_t> sorted_gauss_idx,
         n_contrib_fwd = n_contributors[uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 0)];
     }
 
-    Ray ray = get_ray(cam, center_pix_coord);  // 普通函数，不需要 no_diff
-    int exit_face;
+    Ray ray = get_ray(cam, center_pix_coord);  // 用于后续的 evaluate_tetra_interp
 
     // [DEPTH-FIX] 将 z-space 深度转回 t-space
-    // 前向 splat_tiled 存储时乘了 rd_norm_inv，这里需要乘回 ray.d 长度
+    // 前向 splat_tiled 存储时乘了 rd_norm_inv，这里需要除回 rd_norm_inv（即乘 cam_rd_len）
+    float rd_norm_inv = compute_rd_norm_inv(cam, center_pix_coord);
     if (is_inside) {
-        curr_depth_state = curr_depth_state * length(ray.d);
+        curr_depth_state = curr_depth_state / rd_norm_inv;  // z → t
     }
     AlphaOut ao = {current_pixel_state, curr_distortion_state, curr_normal_state, curr_depth_state};
 
@@ -588,10 +629,9 @@ void splat_tiled(TensorView<int32_t> sorted_gauss_idx,
         tile_idx_start,
         tile_idx_end);
 
-    // [T-TO-Z-SVRASTER] 获取 ray 用于深度 t→z 转换
+    // [T-TO-Z-SVRASTER] [DEPTH-FIX] 使用正确的 rd_norm_inv 转换 t→z
     float2 center_pix_coord = {pix_coord.x+rjx, pix_coord.y+rjy};
-    Ray ray = no_diff get_ray(cam, center_pix_coord);  // no_diff: 此调用不需要梯度
-    float rd_norm_inv = 1.0f / length(ray.d);  // 仿 svraster: z = t / ||d||
+    float rd_norm_inv = no_diff compute_rd_norm_inv(cam, center_pix_coord);
 
     if (is_inside) {
       output_img.storeOnce(uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 0), pixel_states.rgba.r);
@@ -610,7 +650,8 @@ void splat_tiled(TensorView<int32_t> sorted_gauss_idx,
       normal_img.storeOnce(uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 1), pixel_states.normal_state.y);
       normal_img.storeOnce(uint3(uint32_t(pix_coord.y), uint32_t(pix_coord.x), 2), pixel_states.normal_state.z);
       // [DEPTH-OUTPUT] [T-TO-Z-SVRASTER] 写入深度时才除 ||d||，仿 svraster
-      depth_img.storeOnce(uint2(uint32_t(pix_coord.y), uint32_t(pix_coord.x)), pixel_states.depth_state * rd_norm_inv);
+      // [DEPTH-FIX] 加上 min_t，因为 ray.o = cam.position + ray.d * min_t，深度是相对于偏移后的起点
+      depth_img.storeOnce(uint2(uint32_t(pix_coord.y), uint32_t(pix_coord.x)), (pixel_states.depth_state + cam.min_t) * rd_norm_inv);
     }
 }
 

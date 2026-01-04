@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""
+TNT Mesh 评估脚本
+
+用法:
+    python scripts/eval_tnt_mesh.py \
+        --mesh_path /path/to/mesh.ply \
+        --model_path /path/to/model_output \
+        --gt_path /path/to/GT_TNT/Scene \
+        --scene Scene \
+        --output_dir /path/to/output
+"""
+
+import os
+import sys
+import argparse
+import json
+import numpy as np
+import torch
+
+# 添加项目根目录到 path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from eval.tnt.evaluate import evaluate_tnt_mesh
+from eval.tnt.registration import read_trajectory, CameraPose
+
+
+def load_cameras_from_model(model_path: str):
+    """
+    从模型输出目录加载相机参数。
+
+    TNT 评估需要训练相机的轨迹来做轨迹对齐。
+    """
+    # 尝试加载 cameras.json（如果存在）
+    cameras_json = os.path.join(model_path, 'cameras.json')
+    if os.path.exists(cameras_json):
+        print(f"Loading cameras from {cameras_json}")
+        with open(cameras_json, 'r') as f:
+            data = json.load(f)
+        return data
+
+    # 否则尝试从 checkpoint 重建
+    # 这需要加载完整的场景，比较复杂
+    return None
+
+
+def load_trajectory_from_model(model_path: str, pca_transform: np.ndarray = None):
+    """
+    从模型输出目录加载相机轨迹（用于 TNT 评估）。
+
+    Args:
+        model_path: 模型输出目录
+        pca_transform: PCA 变换矩阵
+
+    Returns:
+        CameraPose 列表
+    """
+    # 尝试加载 poses.npy
+    poses_npy = os.path.join(model_path, 'poses.npy')
+    if os.path.exists(poses_npy):
+        print(f"Loading poses from {poses_npy}")
+        poses = np.load(poses_npy)
+        trajectory = []
+        for i in range(len(poses)):
+            c2w = poses[i]
+            if pca_transform is not None:
+                pca_inv = np.linalg.inv(pca_transform)
+                c2w = pca_inv @ c2w
+            trajectory.append(CameraPose(meta=None, mat=c2w))
+        return trajectory
+
+    # 尝试加载 trajectory.log
+    traj_log = os.path.join(model_path, 'trajectory.log')
+    if os.path.exists(traj_log):
+        print(f"Loading trajectory from {traj_log}")
+        return read_trajectory(traj_log)
+
+    return None
+
+
+def main():
+    parser = argparse.ArgumentParser(description='TNT Mesh Evaluation')
+    parser.add_argument('--mesh_path', type=str, required=True,
+                        help='Path to the mesh file')
+    parser.add_argument('--model_path', type=str, required=True,
+                        help='Path to model output directory')
+    parser.add_argument('--gt_path', type=str, required=True,
+                        help='Path to GT_TNT scene directory')
+    parser.add_argument('--scene', type=str, required=True,
+                        help='Scene name (e.g., Barn, Truck)')
+    parser.add_argument('--output_dir', type=str, default=None,
+                        help='Output directory for evaluation results')
+    parser.add_argument('--cull', action='store_true',
+                        help='Whether to cull mesh with camera visibility')
+    args = parser.parse_args()
+
+    if args.output_dir is None:
+        args.output_dir = os.path.join(args.model_path, 'eval_tnt')
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    print(f"\n{'='*60}")
+    print(f"TNT Mesh Evaluation")
+    print(f"{'='*60}")
+    print(f"Mesh: {args.mesh_path}")
+    print(f"Model: {args.model_path}")
+    print(f"GT: {args.gt_path}")
+    print(f"Scene: {args.scene}")
+    print(f"Output: {args.output_dir}")
+
+    # 加载 PCA 变换
+    transform_path = os.path.join(args.model_path, 'transform.txt')
+    pca_transform = None
+    if os.path.exists(transform_path):
+        pca_transform = np.loadtxt(transform_path).astype(np.float64)
+        print(f"Loaded PCA transform from {transform_path}")
+
+    # 加载训练相机轨迹
+    # 首先尝试从保存的轨迹文件加载
+    trajectory = load_trajectory_from_model(args.model_path, pca_transform)
+
+    if trajectory is None:
+        # 如果没有保存轨迹，需要重新加载场景来获取相机
+        print("Warning: No saved trajectory found, trying to load from scene...")
+
+        # 尝试从数据集加载相机
+        dataset_path = None
+        # 从 args 推断数据集路径
+        possible_dataset_paths = [
+            os.path.join(os.path.dirname(args.gt_path), args.scene),
+            os.path.join('/storage/jk2/dataset/TNT', args.scene),
+        ]
+        for p in possible_dataset_paths:
+            if os.path.exists(p):
+                dataset_path = p
+                break
+
+        if dataset_path is not None:
+            print(f"Loading cameras from dataset: {dataset_path}")
+            try:
+                from data.colmap import ColmapDataset
+                dataset = ColmapDataset(
+                    src_path=dataset_path,
+                    image_folder='images',
+                    resolution=[1, 1],
+                    white_background=False
+                )
+                train_cameras = dataset.train_cameras
+
+                # 转换为轨迹
+                trajectory = []
+                pca_inv = np.linalg.inv(pca_transform) if pca_transform is not None else np.eye(4)
+                for cam in train_cameras:
+                    # 获取 c2w
+                    w2c = cam.world_view_transform.T.cpu().numpy()
+                    c2w = np.linalg.inv(w2c)
+                    # 应用 PCA 逆变换
+                    c2w = pca_inv @ c2w
+                    trajectory.append(CameraPose(meta=None, mat=c2w))
+                print(f"Loaded {len(trajectory)} cameras from dataset")
+
+                # 保存轨迹供后续使用
+                poses = np.array([t.pose for t in trajectory])
+                np.save(os.path.join(args.model_path, 'poses.npy'), poses)
+                print(f"Saved poses to {args.model_path}/poses.npy")
+
+            except Exception as e:
+                print(f"Error loading cameras: {e}")
+                trajectory = None
+
+    if trajectory is None:
+        print("Error: Cannot load camera trajectory for evaluation")
+        print("TNT evaluation requires camera trajectory for alignment")
+        sys.exit(1)
+
+    # 运行评估
+    # 注意：evaluate_tnt_mesh 期望 train_cameras 是 Camera 对象列表
+    # 但我们这里直接用 trajectory 做轨迹对齐
+
+    # 直接调用底层评估函数
+    from eval.tnt.evaluate import (
+        align_mesh_to_tnt,
+        mesh_to_pointcloud,
+    )
+    from eval.tnt.registration import (
+        trajectory_alignment,
+        refine_registration,
+        read_trajectory as read_gt_trajectory,
+    )
+    from eval.tnt.eval_core import evaluate_point_clouds
+    from eval.tnt.config import get_scene_tau, SCENES_TAU_DICT
+    import trimesh
+    import open3d as o3d
+
+    scene_name = args.scene
+    tau = SCENES_TAU_DICT.get(scene_name, 0.01)
+    print(f"Tau (threshold): {tau}")
+
+    # 加载 mesh
+    print(f"\nLoading mesh: {args.mesh_path}")
+    mesh = trimesh.load(args.mesh_path)
+    print(f"Vertices: {len(mesh.vertices)}, Faces: {len(mesh.faces)}")
+
+    # 应用 PCA 逆变换
+    if pca_transform is not None:
+        print("Applying PCA inverse transform to mesh...")
+        mesh.vertices = align_mesh_to_tnt(np.asarray(mesh.vertices), pca_transform)
+
+    # 转换为点云
+    print("Converting mesh to point cloud...")
+    face_centers = mesh.vertices[mesh.faces].mean(axis=1)
+    vertices = np.concatenate([mesh.vertices, face_centers], axis=0)
+    recon_pcd = o3d.geometry.PointCloud()
+    recon_pcd.points = o3d.utility.Vector3dVector(vertices)
+    print(f"Point cloud: {len(recon_pcd.points)} points")
+
+    # 加载 GT
+    gt_ply_path = os.path.join(args.gt_path, f"{scene_name}.ply")
+    print(f"Loading GT: {gt_ply_path}")
+    gt_pcd = o3d.io.read_point_cloud(gt_ply_path)
+    print(f"GT points: {len(gt_pcd.points)}")
+
+    # 加载 GT 变换
+    trans_path = os.path.join(args.gt_path, f"{scene_name}_trans.txt")
+    gt_trans = np.loadtxt(trans_path) if os.path.exists(trans_path) else None
+
+    # 加载 GT 轨迹
+    colmap_log_path = os.path.join(args.gt_path, f"{scene_name}_COLMAP_SfM.log")
+    print(f"Loading GT trajectory: {colmap_log_path}")
+    gt_traj = read_gt_trajectory(colmap_log_path)
+    print(f"GT trajectory: {len(gt_traj)} poses")
+
+    # 轨迹对齐
+    print(f"Train trajectory: {len(trajectory)} poses")
+    print("Aligning trajectories (RANSAC)...")
+    init_trans = trajectory_alignment(None, trajectory, gt_traj, gt_trans, scene_name)
+
+    # 加载裁剪区域
+    crop_json_path = os.path.join(args.gt_path, f"{scene_name}.json")
+    if os.path.exists(crop_json_path):
+        crop_volume = o3d.visualization.read_selection_polygon_volume(crop_json_path)
+        print(f"Loaded crop volume from {crop_json_path}")
+    else:
+        crop_volume = None
+        print("No crop volume found")
+
+    # ICP 精细配准
+    print("Refining registration (ICP)...")
+    final_trans = refine_registration(recon_pcd, gt_pcd, init_trans, crop_volume, tau)
+
+    # 保存对齐后的点云
+    aligned_pcd = o3d.geometry.PointCloud(recon_pcd)
+    aligned_pcd.transform(final_trans)
+    aligned_path = os.path.join(args.output_dir, "pcd_aligned.ply")
+    o3d.io.write_point_cloud(aligned_path, aligned_pcd)
+    print(f"Saved aligned point cloud: {aligned_path}")
+
+    # 评估
+    print("Computing metrics...")
+    results = evaluate_point_clouds(
+        source_pcd=recon_pcd,
+        target_pcd=gt_pcd,
+        trans=final_trans,
+        crop_volume=crop_volume,
+        voxel_size=tau / 2.0,
+        threshold=tau,
+        output_dir=args.output_dir,
+        scene_name=scene_name,
+    )
+
+    # 保存结果
+    results_to_save = {
+        "scene": scene_name,
+        "precision": results["precision"],
+        "recall": results["recall"],
+        "fscore": results["fscore"],
+        "threshold": tau,
+        "num_source_points": results["num_source_points"],
+        "num_target_points": results["num_target_points"],
+    }
+    results_path = os.path.join(args.output_dir, "results.json")
+    with open(results_path, 'w') as f:
+        json.dump(results_to_save, f, indent=2)
+
+    print(f"\n{'='*60}")
+    print(f"Results for {scene_name}")
+    print(f"{'='*60}")
+    print(f"Threshold (tau): {tau}")
+    print(f"Precision: {results['precision']:.4f}")
+    print(f"Recall: {results['recall']:.4f}")
+    print(f"F-score: {results['fscore']:.4f}")
+    print(f"{'='*60}")
+    print(f"Results saved: {results_path}")
+
+
+if __name__ == '__main__':
+    main()

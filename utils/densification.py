@@ -327,7 +327,7 @@ def apply_densification(
 
     # [SDF-DENSIFY] 基于 SDF 的分裂策略
     # 数量 = 当前顶点数 × ratio
-    # 选择表面附近外接圆最大的 TopK 四面体
+    # 选择跨越表面（异号SDF）且外接圆最大的 TopK 四面体
     # 分裂点 = 四面体重心
     sdf_driven_mask = torch.zeros_like(error_driven_mask, dtype=torch.bool)
     sdf_split_points = None  # 单独存储 SDF 分裂的点位置
@@ -351,16 +351,16 @@ def apply_densification(
             vert_sdf = model.query_vert_sdf()  # (N_verts,)
             tet_sdf = vert_sdf[model.indices]  # (N_tets, 4)
 
-            # 判断是否接近表面：四面体中至少有一个顶点接近表面
-            sdf_threshold = getattr(args, 'sdf_densify_threshold', 0.02)
-            min_abs_sdf = tet_sdf.abs().min(dim=1).values  # (N_tets,)
-            surface_mask = min_abs_sdf < sdf_threshold
+            # 判断是否跨越表面：四面体中有异号 SDF 值（比 threshold 更稳健）
+            tet_sdf_max = tet_sdf.max(dim=1).values  # (N_tets,)
+            tet_sdf_min = tet_sdf.min(dim=1).values  # (N_tets,)
+            surface_mask = (tet_sdf_max > 0) & (tet_sdf_min < 0)  # 有正有负 = 跨越零等值面
 
             # 排除已经被误差驱动分裂选中的（避免重复）
             surface_mask = surface_mask & (~error_driven_mask)
 
             if surface_mask.sum() > 0:
-                # 从表面附近的四面体中，选择外接圆最大的 TopK
+                # 从跨越表面的四面体中，选择外接圆最大的 TopK
                 surface_radii = circumradii.clone()
                 surface_radii[~surface_mask] = -1  # 非表面四面体设为 -1
 

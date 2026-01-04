@@ -44,6 +44,11 @@ from utils import test_util
 import termplotlib as tpl
 import matplotlib.pyplot as plt
 
+# [DEBUG-MEMORY] 显存调试开关
+DEBUG_MEMORY = False  # 设为 True 开启显存监控
+if DEBUG_MEMORY:
+    from utils.memory_monitor import MemoryMonitor, print_gpu_memory, print_large_tensors
+
 def viz_tensordepth(x, alpha_mass=None, mode='log'):
     """深度图可视化函数，参考 svraster 实现"""
     # [DEBUG] 打印 depth tensor 的统计信息
@@ -326,6 +331,21 @@ print(f"[MILo] spatial_lr_scale: {spatial_lr_scale:.4f}")
 
 np.savetxt(str(args.output_path / "transform.txt"), scene_info.transform)
 
+# 保存相机轨迹（用于 TNT 评估）
+# 保存原始坐标系下的 c2w 矩阵（PCA 变换前）
+pca_inv = np.linalg.inv(scene_info.transform)
+poses = []
+for cam in train_cameras:
+    # 获取 PCA 变换后的 c2w
+    w2c = cam.world_view_transform.T.cpu().numpy()
+    c2w = np.linalg.inv(w2c)
+    # 逆 PCA 变换回原始坐标系
+    c2w_orig = pca_inv @ c2w
+    poses.append(c2w_orig)
+poses = np.array(poses)
+np.save(str(args.output_path / "poses.npy"), poses)
+print(f"[MILo] Saved camera poses: {poses.shape}")
+
 args.num_samples = min(len(train_cameras), args.num_samples)
 
 with (args.output_path / "config.json").open("w") as f:
@@ -354,6 +374,14 @@ mesh_regularizer = MeshRegularizer(
     sdf_threshold=args.mesh_sdf_threshold,
     use_opengl=True,
 )
+
+# [DEBUG-MEMORY] 初始化显存监控
+if DEBUG_MEMORY:
+    memory_monitor = MemoryMonitor(
+        log_path=args.output_path / "memory.log",
+        print_interval=500  # 每500次迭代打印一次
+    )
+    print_gpu_memory("[Init] After model creation:")
 
 if args.eval:
     sample_camera = test_cameras[args.sample_cam]
@@ -440,10 +468,32 @@ for iteration in progress_bar:
     target = camera.original_image.cuda()
     gt_mask = camera.gt_alpha_mask.cuda()
 
+    # [DEBUG-MEMORY] 渲染前
+    if DEBUG_MEMORY:
+        memory_monitor.log(iteration, "before_render", model)
+
     st = time.time()
     ray_jitter = torch.rand((camera.image_height, camera.image_width, 2), device=device)
-    render_pkg = render(camera, model, scene_scaling=model.scene_scaling, ray_jitter=ray_jitter, **args.as_dict())
+
+    # [DEBUG-MEMORY] 捕获 OOM 异常并打印详细信息
+    try:
+        render_pkg = render(camera, model, scene_scaling=model.scene_scaling, ray_jitter=ray_jitter, **args.as_dict())
+    except RuntimeError as e:
+        if "out of memory" in str(e) and DEBUG_MEMORY:
+            print(f"\n{'='*60}")
+            print(f"[OOM] Out of memory at iteration {iteration}")
+            print(f"{'='*60}")
+            print_gpu_memory("Current state:")
+            print_large_tensors(min_size_mb=5)
+            print(f"\nModel stats: #V={model.vertices.shape[0]}, #T={model.indices.shape[0]}")
+            memory_monitor.summary()
+        raise  # 重新抛出异常
+
     image = render_pkg['render']
+
+    # [DEBUG-MEMORY] 渲染后
+    if DEBUG_MEMORY:
+        memory_monitor.log_delta(iteration, "after_render", model)
 
     l1_loss = ((target - image).abs() * gt_mask).mean()
     l2_loss = ((target - image)**2 * gt_mask).mean()
@@ -634,6 +684,10 @@ for iteration in progress_bar:
 
     loss.backward()
 
+    # [DEBUG-MEMORY] backward 后
+    if DEBUG_MEMORY:
+        memory_monitor.log_delta(iteration, "after_backward", model)
+
     tet_optim.main_step()
     tet_optim.main_zero_grad()
 
@@ -660,6 +714,10 @@ for iteration in progress_bar:
     #         video_writer.write(pad_image2even(sample_image))
 
     if do_cloning and not model.frozen:
+        # [DEBUG-MEMORY] densification 前
+        if DEBUG_MEMORY:
+            memory_monitor.log(iteration, "before_densify", model, print_now=True)
+
         with torch.no_grad():
             sampled_cams = [train_cameras[i] for i in densification_sampler.nextids()]
 
@@ -672,9 +730,19 @@ for iteration in progress_bar:
 
             gc.collect()
             torch.cuda.empty_cache()
+
+            # [DEBUG-MEMORY] collect_render_stats 前
+            if DEBUG_MEMORY:
+                memory_monitor.log(iteration, "before_collect_stats", model, print_now=True)
+
             model.eval()
             stats = collect_render_stats(sampled_cams, model, args, device)
             model.train()
+
+            # [DEBUG-MEMORY] collect_render_stats 后
+            if DEBUG_MEMORY:
+                memory_monitor.log_delta(iteration, "after_collect_stats", model)
+
             # target_addition = targets[dschedule.index(iteration)] - model.vertices.shape[0]
             target_addition = args.budget - model.vertices.shape[0]
 
@@ -693,6 +761,10 @@ for iteration in progress_bar:
             del stats
             gc.collect()
             torch.cuda.empty_cache()
+
+            # [DEBUG-MEMORY] densification 后
+            if DEBUG_MEMORY:
+                memory_monitor.log_delta(iteration, "after_densify", model)
 
     # 顶点剪枝：独立执行，需要单独收集 stats
     # prune 在 prune_start, prune_start+interval, prune_start+2*interval... 执行
@@ -1010,8 +1082,20 @@ def get_tnt_info(dataset_path):
     # 检查是否为 TNT 数据集
     # 方法1: 场景名在 TNT 场景列表中
     # 方法2: 存在 GT 点云和 COLMAP log 文件
+
+    # 检查两种可能的 GT 路径：
+    # 1. {tnt_root}/{scene_name}.ply（标准路径）
+    # 2. {tnt_root}/GT_TNT/{scene_name}/{scene_name}.ply（用户的路径结构）
     gt_ply = os.path.join(tnt_root, f"{scene_name}.ply")
+    gt_ply_alt = os.path.join(tnt_root, "GT_TNT", scene_name, f"{scene_name}.ply")
     colmap_log = os.path.join(tnt_root, f"{scene_name}_COLMAP_SfM.log")
+    colmap_log_alt = os.path.join(tnt_root, "GT_TNT", scene_name, f"{scene_name}_COLMAP_SfM.log")
+
+    # 如果 GT 在 GT_TNT 子目录，更新 tnt_root
+    if os.path.exists(gt_ply_alt) and os.path.exists(colmap_log_alt):
+        tnt_root = os.path.join(tnt_root, "GT_TNT", scene_name)
+        gt_ply = gt_ply_alt
+        colmap_log = colmap_log_alt
 
     is_tnt = scene_name in SCENES_TAU_DICT or (os.path.exists(gt_ply) and os.path.exists(colmap_log))
 
@@ -1203,6 +1287,10 @@ if args.extract_tsdf:
             )
             if results:
                 print(f"[TSDF-EVAL] Results: precision={results['precision']:.4f}, recall={results['recall']:.4f}, fscore={results['fscore']:.4f}")
+
+# [DEBUG-MEMORY] 输出显存使用汇总
+if DEBUG_MEMORY:
+    memory_monitor.summary()
 
 print("\n" + "="*60)
 print("[DONE] Training and evaluation completed.")

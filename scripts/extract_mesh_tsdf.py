@@ -37,28 +37,35 @@ def focus_point_fn(poses: np.ndarray) -> np.ndarray:
 
 
 def to_cam_open3d(viewpoint_stack):
-    """Convert cameras to Open3D format."""
+    """
+    Convert cameras to Open3D format.
+
+    Reference: MILo/milo/eval/dtu/mesh_extract_dtu.py
+
+    关键点：
+    - 直接从 FoV 计算内参（与 MILo 完全一致）
+    - 主点使用 W/2, H/2
+    """
     camera_traj = []
     for viewpoint_cam in viewpoint_stack:
         W = viewpoint_cam.image_width
         H = viewpoint_cam.image_height
 
-        # 从 FOV 计算内参
+        # [MILO-STYLE] 直接从 FoV 计算内参（与 MILo 完全一致）
         fx = W / (2 * math.tan(viewpoint_cam.fovx / 2.))
         fy = H / (2 * math.tan(viewpoint_cam.fovy / 2.))
-        cx = W / 2.0
-        cy = H / 2.0
 
         intrinsic = o3d.camera.PinholeCameraIntrinsic(
             width=W,
             height=H,
-            cx=cx,
-            cy=cy,
+            cx=float(W) / 2,
+            cy=float(H) / 2,
             fx=fx,
             fy=fy
         )
 
-        # world_view_transform 是 W2V 的转置，需要转置回来得到 W2V
+        # [VERIFIED] Open3D TSDF integrate 期望 extrinsic 是 W2C（world-to-camera）
+        # world_view_transform 存储的是 W2C 的转置，所以 .T 得到 W2C
         extrinsic = viewpoint_cam.world_view_transform.T.cpu().numpy()
 
         camera = o3d.camera.PinholeCameraParameters()
@@ -127,10 +134,11 @@ class TSDFExtractor:
             )
 
             rgb = render_pkg['render']  # (3, H, W)
-            expected_depth = render_pkg['depth']  # (H, W)
-            median_depth = render_pkg['depth_med']  # (H, W)
+            expected_depth = render_pkg['depth']  # (H, W) - 已经是 z-depth
+            median_depth = render_pkg['depth_med']  # (H, W) - 已经是 z-depth
 
             # MILo 风格：混合期望深度和中位深度
+            # 注意：slang 已经输出 z-depth（乘了 rd_norm_inv），并已加上 min_t 偏移
             surface_depth = self.depth_ratio * expected_depth + (1.0 - self.depth_ratio) * median_depth
 
             self.rgbmaps.append(rgb.cpu())

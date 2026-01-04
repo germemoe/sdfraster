@@ -5,7 +5,7 @@
 set -e
 
 # 配置
-OUTPUT_BASE="/storage/jk/project/output/lambda_ablation"
+OUTPUT_BASE="/home/jk/jk2/project/output/lambda_ablation"
 DATASET_BASE="/storage/jk2/dataset/DTU"
 GPUS=(4 5 6 7)
 NUM_GPUS=${#GPUS[@]}
@@ -14,7 +14,7 @@ NUM_GPUS=${#GPUS[@]}
 SCENES=(scan24 scan37 scan40 scan55 scan63 scan65 scan69 scan83 scan97 scan105 scan106 scan110 scan114 scan118 scan122)
 
 # Lambda参数搜索值
-LAMBDA_EDGE_SDF_VALUES=(0 0.01 0.05)
+LAMBDA_EDGE_SDF_VALUES=(0 1e-4 1e-3)
 LAMBDA_NORMAL_DEPTH_MED_VALUES=(0 0.01 0.05)
 LAMBDA_MESH_DEPTH_VALUES=(0 0.01 0.05)
 LAMBDA_MESH_NORMAL_VALUES=(0 0.01 0.05)
@@ -23,27 +23,64 @@ LAMBDA_MESH_NORMAL_VALUES=(0 0.01 0.05)
 mkdir -p "$OUTPUT_BASE"
 
 # 生成所有任务
+# 顺序：外层是 ablation 组合，内层是场景
+# 优先级：1. lambda 都为 0.01  2. normal_depth 关闭的  3. 其他
 declare -a TASKS
 task_idx=0
 
+# 添加任务的辅助函数
+add_task() {
+    local edge_sdf=$1
+    local normal_depth_med=$2
+    local mesh_depth=$3
+    local mesh_normal=$4
+
+    for scene in "${SCENES[@]}"; do
+        exp_name="es${edge_sdf}_ndm${normal_depth_med}_md${mesh_depth}_mn${mesh_normal}"
+        output_path="${OUTPUT_BASE}/${scene}/${exp_name}"
+
+        # 跳过已完成的实验
+        if [ -f "${output_path}/done.txt" ]; then
+            echo "跳过已完成: ${scene}/${exp_name}"
+            continue
+        fi
+
+        TASKS[$task_idx]="${scene}|${edge_sdf}|${normal_depth_med}|${mesh_depth}|${mesh_normal}|${output_path}"
+        task_idx=$((task_idx + 1))
+    done
+}
+
 echo "生成任务列表..."
-for scene in "${SCENES[@]}"; do
-    for edge_sdf in "${LAMBDA_EDGE_SDF_VALUES[@]}"; do
-        for normal_depth_med in "${LAMBDA_NORMAL_DEPTH_MED_VALUES[@]}"; do
-            for mesh_depth in "${LAMBDA_MESH_DEPTH_VALUES[@]}"; do
-                for mesh_normal in "${LAMBDA_MESH_NORMAL_VALUES[@]}"; do
-                    exp_name="es${edge_sdf}_ndm${normal_depth_med}_md${mesh_depth}_mn${mesh_normal}"
-                    output_path="${OUTPUT_BASE}/${scene}/${exp_name}"
 
-                    # 跳过已完成的实验
-                    if [ -f "${output_path}/done.txt" ]; then
-                        echo "跳过已完成: ${scene}/${exp_name}"
-                        continue
-                    fi
+# 优先级1: lambda 都为 1e-4
+add_task 1e-4 0.01 0.01 0.01
 
-                    TASKS[$task_idx]="${scene}|${edge_sdf}|${normal_depth_med}|${mesh_depth}|${mesh_normal}|${output_path}"
-                    task_idx=$((task_idx + 1))
-                done
+# 优先级2: normal_depth 关闭的 (ndm=0)
+for edge_sdf in "${LAMBDA_EDGE_SDF_VALUES[@]}"; do
+    for mesh_depth in "${LAMBDA_MESH_DEPTH_VALUES[@]}"; do
+        for mesh_normal in "${LAMBDA_MESH_NORMAL_VALUES[@]}"; do
+            # 跳过已添加的组合
+            if [ "$edge_sdf" = "1e-4" ] && [ "$mesh_depth" = "0.01" ] && [ "$mesh_normal" = "0.01" ]; then
+                continue
+            fi
+            add_task "$edge_sdf" 0 "$mesh_depth" "$mesh_normal"
+        done
+    done
+done
+
+# 优先级3: 其他组合
+for edge_sdf in "${LAMBDA_EDGE_SDF_VALUES[@]}"; do
+    for normal_depth_med in "${LAMBDA_NORMAL_DEPTH_MED_VALUES[@]}"; do
+        for mesh_depth in "${LAMBDA_MESH_DEPTH_VALUES[@]}"; do
+            for mesh_normal in "${LAMBDA_MESH_NORMAL_VALUES[@]}"; do
+                # 跳过已添加的组合 (1e-4/0.01/0.01/0.01 和 ndm=0 的)
+                if [ "$edge_sdf" = "1e-4" ] && [ "$normal_depth_med" = "0.01" ] && [ "$mesh_depth" = "0.01" ] && [ "$mesh_normal" = "0.01" ]; then
+                    continue
+                fi
+                if [ "$normal_depth_med" = "0" ]; then
+                    continue
+                fi
+                add_task "$edge_sdf" "$normal_depth_med" "$mesh_depth" "$mesh_normal"
             done
         done
     done
