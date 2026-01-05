@@ -210,7 +210,7 @@ args.edge_sdf_target = None       # 目标值：None=平滑模式(最小化), 1.
 args.lambda_gradient_tv = 0.0     # Gradient TV loss 权重，0 表示关闭
 args.gradient_tv_start = 0        # 开始使用 gradient TV loss 的迭代
 args.gradient_tv_end = 30000      # 停止使用 gradient TV loss 的迭代
-# gradient_tv_sdf_threshold 已移除，现在只计算穿过表面的边（两端点 SDF 异号）
+args.gradient_tv_surface_only = False   # True=只计算穿过表面的边（SDF异号），False=计算所有边
 args.gradient_tv_normalize = True      # 是否用边长归一化梯度差异
 
 # [MESH-NORMAL-LOSS] Mesh 法线一致性 Loss 设置（参考 MILo）
@@ -572,13 +572,37 @@ for iteration in progress_bar:
 
     # [GRADIENT-TV-LOSS] 计算穿过表面的边（两端点 SDF 异号）的梯度变化
     if grad_tv_active:
-        grad_tv_loss, grad_tv_num_edges = gradient_tv_loss_surface_edges(
-            model,
-            normalize_by_edge_length=args.gradient_tv_normalize,
-            gradient_mode=args.gradient_mode,
-            gradient_taps=args.gradient_taps,
-            gradient_eps=args.gradient_eps
-        )
+        # 优先复用 Eikonal 已计算的梯度
+        if eik_gradients is not None and eik_vertex_indices is not None:
+            grad_tv_vertex_indices = eik_vertex_indices
+            grad_tv_gradients = eik_gradients
+        else:
+            # 独立采样并计算梯度（使用所有内部顶点）
+            grad_tv_points, grad_tv_vertex_indices, _, _ = sample_eikonal_points(
+                model,
+                num_samples=args.num_eikonal_samples,
+                band=None,  # 使用所有内部顶点
+                use_tet_sampling=False
+            )
+            if grad_tv_points.shape[0] > 0:
+                _, grad_tv_gradients, _ = model.compute_sdf_gradients(
+                    points=grad_tv_points,
+                    mode=args.gradient_mode,
+                    taps=args.gradient_taps,
+                    eps=args.gradient_eps
+                )
+            else:
+                grad_tv_gradients = None
+                grad_tv_vertex_indices = None
+
+        if grad_tv_gradients is not None and grad_tv_vertex_indices is not None:
+            grad_tv_loss, grad_tv_num_edges = gradient_tv_loss_from_sampled(
+                model,
+                vertex_indices=grad_tv_vertex_indices,
+                vert_gradients=grad_tv_gradients,
+                surface_only=args.gradient_tv_surface_only,
+                normalize_by_edge_length=args.gradient_tv_normalize
+            )
 
     # [MESH-LOSS] Mesh 正则化 Loss (normal + depth + occupancy)
     mesh_loss = torch.tensor(0.0, device=device)
