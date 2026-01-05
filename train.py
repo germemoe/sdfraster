@@ -29,7 +29,7 @@ torch.cuda.manual_seed_all(SEED)
 
 from utils import cam_util
 from utils.train_util import *
-from utils.model_util import eikonal_loss, curvature_loss, sample_eikonal_points, edge_sdf_loss, gradient_tv_loss, gradient_tv_loss_from_sampled
+from utils.model_util import eikonal_loss, curvature_loss, sample_eikonal_points, edge_sdf_loss, gradient_tv_loss, gradient_tv_loss_from_sampled, gradient_tv_loss_surface_edges
 # from models.vertex_color import Model, TetOptimizer
 from models.ingp_color import Model, TetOptimizer
 from models.frozen import freeze_model
@@ -189,10 +189,10 @@ args.curvature_start = 0         # 开始使用 curvature loss 的迭代
 args.curvature_end = 18000        # 停止使用 curvature loss 的迭代
 args.curvature_warmup = 2000      # curvature loss warmup 迭代数（从 curvature_start 开始）
 args.curvature_decay_enabled = True  # 是否启用 curvature 权重衰减
-args.gradient_mode = "numerical"  # "analytical" 或 "numerical"
+args.gradient_mode = "analytical"  # "analytical" 或 "numerical"
 args.gradient_taps = 4            # 数值梯度采样点数：4 或 6
 args.gradient_eps = 1e-3          # 数值梯度步长
-args.num_eikonal_samples = 100000  # Eikonal loss 采样点数
+args.num_eikonal_samples = 100000000  # Eikonal loss 采样点数
 args.eikonal_band_threshold = None # SDF band 阈值：仅计算 |SDF| < threshold 的顶点的 loss
                                    # 设为 None 则计算所有内部顶点
 args.eikonal_tet_sampling = False  # 是否在 band 内顶点邻域额外采样
@@ -210,7 +210,7 @@ args.edge_sdf_target = None       # 目标值：None=平滑模式(最小化), 1.
 args.lambda_gradient_tv = 0.0     # Gradient TV loss 权重，0 表示关闭
 args.gradient_tv_start = 0        # 开始使用 gradient TV loss 的迭代
 args.gradient_tv_end = 30000      # 停止使用 gradient TV loss 的迭代
-args.gradient_tv_sdf_threshold = 0.1   # SDF band 阈值：只计算表面附近的边
+# gradient_tv_sdf_threshold 已移除，现在只计算穿过表面的边（两端点 SDF 异号）
 args.gradient_tv_normalize = True      # 是否用边长归一化梯度差异
 
 # [MESH-NORMAL-LOSS] Mesh 法线一致性 Loss 设置（参考 MILo）
@@ -570,13 +570,14 @@ for iteration in progress_bar:
             target=args.edge_sdf_target
         )
 
-    # [GRADIENT-TV-LOSS] 使用 Eikonal 采样点的梯度，避免重复计算
-    if grad_tv_active and eik_gradients is not None and eik_vertex_indices is not None:
-        grad_tv_loss, grad_tv_num_edges = gradient_tv_loss_from_sampled(
+    # [GRADIENT-TV-LOSS] 计算穿过表面的边（两端点 SDF 异号）的梯度变化
+    if grad_tv_active:
+        grad_tv_loss, grad_tv_num_edges = gradient_tv_loss_surface_edges(
             model,
-            vertex_indices=eik_vertex_indices,
-            vert_gradients=eik_gradients,
-            normalize_by_edge_length=args.gradient_tv_normalize
+            normalize_by_edge_length=args.gradient_tv_normalize,
+            gradient_mode=args.gradient_mode,
+            gradient_taps=args.gradient_taps,
+            gradient_eps=args.gradient_eps
         )
 
     # [MESH-LOSS] Mesh 正则化 Loss (normal + depth + occupancy)
@@ -809,6 +810,9 @@ for iteration in progress_bar:
     # Coarse-to-Fine: 显示当前激活层数
     if args.coarse2fine_enabled:
         postfix_dict["C2F"] = f"{model.backbone.active_levels}/{model.backbone.L}"
+    # [GRADIENT-TV-LOSS] 显示 gradient tv loss（仅当激活时）
+    if grad_tv_active:
+        postfix_dict["GTV"] = repr(f"{grad_tv_loss.item():.3f}")
     # [MESH-LOSS] 显示 mesh loss（仅当激活时）
     if mesh_loss_active:
         postfix_dict["Mesh"] = repr(f"{mesh_loss.item():.3f}")

@@ -7,7 +7,7 @@ set -e
 # 配置
 OUTPUT_BASE="/home/jk/jk2/project/output/lambda_ablation"
 DATASET_BASE="/storage/jk2/dataset/DTU"
-GPUS=(4 5 6 7)
+GPUS=(0 1 2 3 4 5 6 7)
 NUM_GPUS=${#GPUS[@]}
 
 # DTU场景列表

@@ -7,10 +7,10 @@ set -e
 # 配置
 OUTPUT_BASE="/home/jk/jk2/project/output/tnt"
 DATASET_BASE="/storage/jk2/dataset/TNT"
-GPU=0
+GPU=2
 
 # TNT 场景列表
-SCENES=(Barn Caterpillar Courthouse Ignatius Meetingroom Truck)
+SCENES=(Caterpillar Courthouse Ignatius Meetingroom Truck)
 
 mkdir -p "$OUTPUT_BASE"
 
@@ -40,7 +40,10 @@ for scene in "${SCENES[@]}"; do
         --image_folder images \
         --output_path "$output_path" \
         --s_var_lr_multiplier 1 \
-        --log2_hashmap_size 18 \
+        --log2_hashmap_size 19 \
+        --budget 1800000 \
+        --sdf_eps 0.0 \
+        --extract_tsdf \
         > "${output_path}/train.log" 2>&1
 
     if [ $? -eq 0 ]; then

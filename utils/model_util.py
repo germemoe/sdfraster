@@ -432,6 +432,91 @@ def gradient_tv_loss(
     return loss, num_edges
 
 
+def gradient_tv_loss_surface_edges(
+    model,
+    normalize_by_edge_length: bool = True,
+    gradient_mode: str = "analytical",
+    gradient_taps: int = 4,
+    gradient_eps: float = 1e-3
+):
+    """
+    Gradient TV Loss（穿过表面的边版本）
+
+    只计算穿过表面的边（两端点 SDF 异号）的梯度变化。
+
+    Args:
+        model: Model 实例
+        normalize_by_edge_length: 是否用边长归一化梯度差异
+        gradient_mode: 梯度计算模式 ("analytical" 或 "numerical")
+        gradient_taps: 数值梯度采样点数
+        gradient_eps: 数值梯度步长
+
+    Returns:
+        loss: scalar
+        num_edges: 参与计算的边数
+    """
+    device = model.device
+    num_internal = model.num_int_verts
+
+    # 1. 获取内部边
+    edges = model.get_internal_edges()  # (E, 2)
+    if edges.shape[0] == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True), 0
+
+    # 2. 计算内部顶点的 SDF
+    internal_verts = model.vertices[:num_internal]
+    with torch.no_grad():
+        vert_sdf = model.query_vert_sdf(internal_verts)  # (num_internal,)
+
+    # 3. 筛选穿过表面的边（两端点 SDF 异号）
+    sdf_a = vert_sdf[edges[:, 0]]
+    sdf_b = vert_sdf[edges[:, 1]]
+    surface_mask = (sdf_a * sdf_b) < 0  # 异号
+
+    surface_edges = edges[surface_mask]  # (E', 2)
+    num_edges = surface_edges.shape[0]
+
+    if num_edges == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True), 0
+
+    # 4. 获取这些边的端点（需要梯度）
+    edge_vert_indices = torch.unique(surface_edges.flatten())  # 去重
+    edge_verts = model.vertices[edge_vert_indices]  # (K, 3)
+
+    # 5. 计算这些顶点的 SDF 梯度
+    _, gradients, _ = model.compute_sdf_gradients(
+        points=edge_verts,
+        mode=gradient_mode,
+        taps=gradient_taps,
+        eps=gradient_eps
+    )  # (K, 3)
+
+    # 6. 构建索引映射
+    max_idx = num_internal
+    global_to_local = torch.full((max_idx,), -1, dtype=torch.long, device=device)
+    global_to_local[edge_vert_indices] = torch.arange(edge_vert_indices.shape[0], device=device)
+
+    local_a = global_to_local[surface_edges[:, 0]]
+    local_b = global_to_local[surface_edges[:, 1]]
+
+    # 7. 计算边长
+    v0, v1 = model.vertices[surface_edges[:, 0]], model.vertices[surface_edges[:, 1]]
+    edge_length = (v0 - v1).norm(dim=-1).detach()
+
+    # 8. 获取梯度并计算差异
+    grad_a = gradients[local_a]
+    grad_b = gradients[local_b]
+    grad_diff = (grad_a - grad_b).norm(dim=-1)
+
+    # 9. 计算 loss
+    if normalize_by_edge_length:
+        loss = (grad_diff / (edge_length + 1e-8)).mean()
+    else:
+        loss = grad_diff.mean()
+
+    return loss, num_edges
+
+
 def gradient_tv_loss_from_sampled(
     model,
     vertex_indices: torch.Tensor,

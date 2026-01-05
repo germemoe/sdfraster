@@ -1130,7 +1130,7 @@ class Model(BaseModel):
                 tet_min_abs_sdf = tet_vert_sdf.abs().min(dim=1)[0]  # (N,)
                 sdf_mask = tet_min_abs_sdf < sdf_threshold  # 保留靠近表面的
             else:
-                sdf_mask = torch.ones(indices.shape[0], dtype=torch.bool, device=indices.device)
+                sdf_mask = torch.zeros(indices.shape[0], dtype=torch.bool, device=indices.device)
 
             # 条件2: NeuS alpha 阈值
             if alpha_threshold > 0:
