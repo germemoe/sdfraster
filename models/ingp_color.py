@@ -403,8 +403,8 @@ class iNGPDW(nn.Module):
         if compute_sdf:
             if self.use_geometric_init:
                 # [GEOMETRIC-INIT] xyz + hash 特征输入
-                # xyz 偏移到 [-0.5, 0.5] 范围，使几何初始化的球心在 (0.5, 0.5, 0.5)
-                xyz_centered = xyz_input - 0.5
+                # xyz 转换到 [-1, 1] 范围（与旧版本一致）
+                xyz_centered = xyz_input * 2 - 1
                 sdf_input = torch.cat([xyz_centered, h], dim=-1)
                 sdf = self.sdf_net(sdf_input)
             else:
@@ -858,14 +858,59 @@ class Model(BaseModel):
             # 4. SDF 网络前向传播
             if self.backbone.use_geometric_init:
                 # [GEOMETRIC-INIT] xyz + hash 特征输入
-                # xyz 偏移到 [-0.5, 0.5] 范围，使几何初始化的球心在 (0.5, 0.5, 0.5)
-                xyz_centered = x - 0.5
+                # xyz 转换到 [-1, 1] 范围（与旧版本一致）
+                xyz_centered = x * 2 - 1
                 sdf_input = torch.cat([xyz_centered, h], dim=-1)
                 sdf_normalized = self.backbone.sdf_net(sdf_input)
                 # 将归一化空间的 SDF 转换为世界空间
                 sdf = sdf_normalized * self.scene_scaling
             else:
                 # 仅 hash 特征输入
+                sdf = self.backbone.sdf_net(h)
+            sdf_list.append(sdf.reshape(-1))
+
+        return torch.cat(sdf_list)
+
+    def _query_sdf_normalized(self, points):
+        """
+        在归一化空间查询 SDF（用于 Eikonal Loss）
+
+        当使用几何初始化时，返回未缩放的 SDF（归一化空间），
+        使得梯度范数在归一化空间中约为 1。
+
+        Args:
+            points: (N, 3) 世界坐标
+        Returns:
+            sdf_normalized: (N,) 归一化空间的 SDF 值
+        """
+        sdf_list = []
+        for start in range(0, points.shape[0], self.chunk_size):
+            end = min(start + self.chunk_size, points.shape[0])
+            pts = points[start:end]
+
+            # 1. 坐标归一化
+            normalized = (pts - self.center) / self.scene_scaling
+
+            # 2. [CONTRACTION] 根据 use_contraction 决定是否使用空间收缩
+            if self.use_contraction:
+                cv, _ = contract_mean_std(normalized, torch.zeros(pts.shape[0], device=pts.device))
+                x = (cv / 2 + 1) / 2  # [0, 1] 范围
+            else:
+                # 不使用收缩：直接线性归一化到 [0, 1]
+                x = (normalized + 1) / 2
+
+            # 3. Hash Grid 编码 + C2F
+            h = self.backbone.encoding(x)
+            if self.backbone.coarse2fine_enabled and self.backbone.active_levels < self.backbone.L:
+                h = h * self.backbone._get_c2f_mask(h)
+            h = h.float()
+
+            # 4. SDF 网络前向传播（不缩放）
+            if self.backbone.use_geometric_init:
+                xyz_centered = x * 2 - 1
+                sdf_input = torch.cat([xyz_centered, h], dim=-1)
+                sdf = self.backbone.sdf_net(sdf_input)
+            else:
                 sdf = self.backbone.sdf_net(h)
             sdf_list.append(sdf.reshape(-1))
 
@@ -891,19 +936,14 @@ class Model(BaseModel):
         if points is None:
             points = self.vertices
 
-        # [SDF-MODIFICATION] 自动计算 eps (参考 Neuralangelo)
+        # 自动计算 eps (参考 Neuralangelo)
         # Neuralangelo: eps = 1/resolution 在归一化空间
-        # 我们需要转换到世界坐标：eps_world = eps_normalized * scene_scaling
+        # 转换到世界坐标：eps_world = eps_normalized * scene_scaling
         if eps is None:
-            # 获取最细分辨率
             finest_resolution = self.backbone.base_resolution * (
                 self.backbone.per_level_scale ** (self.backbone.L - 1)
             )
-            # eps 在归一化 [0,1] 空间为 1/resolution
-            # 转换到世界坐标：乘以 scene_scaling
             eps = float(self.scene_scaling) / finest_resolution
-            # [CONTRACTION] 注意：如果启用 contraction，实际步长在远离中心处会有偏差
-            # 关闭 contraction 后，这个近似是精确的
 
         if mode == "analytical":
             return self._compute_gradients_analytical(points)

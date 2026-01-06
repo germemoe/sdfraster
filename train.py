@@ -192,7 +192,7 @@ args.curvature_decay_enabled = True  # 是否启用 curvature 权重衰减
 args.gradient_mode = "analytical"  # "analytical" 或 "numerical"
 args.gradient_taps = 4            # 数值梯度采样点数：4 或 6
 args.gradient_eps = 1e-3          # 数值梯度步长
-args.num_eikonal_samples = 100000000  # Eikonal loss 采样点数
+args.num_eikonal_samples = 500000  # Eikonal loss 采样点数
 args.eikonal_band_threshold = None # SDF band 阈值：仅计算 |SDF| < threshold 的顶点的 loss
                                    # 设为 None 则计算所有内部顶点
 args.eikonal_tet_sampling = False  # 是否在 band 内顶点邻域额外采样
@@ -316,6 +316,12 @@ args.tsdf_num_cluster = 50      # 后处理保留的最大 cluster 数
 
 
 args = Args.from_namespace(args.get_parser().parse_args())
+
+# [EIKONAL-FIX] 几何初始化时自动禁用 contraction
+# contraction 是非线性变换，会破坏 eikonal loss 的梯度缩放
+if args.use_geometric_init and args.use_contraction:
+    print("[EIKONAL-FIX] use_geometric_init=True, 自动禁用 contraction")
+    args.use_contraction = False
 
 args.output_path.mkdir(exist_ok=True, parents=True)
 
