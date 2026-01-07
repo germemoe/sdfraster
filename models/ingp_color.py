@@ -1181,6 +1181,16 @@ class Model(BaseModel):
 
             # 两个条件取并集 (只要满足其一就保留)
             mask = sdf_mask | alpha_mask
+
+            # [CULL-STATS] 输出裁剪统计
+            n_total = indices.shape[0]
+            n_sdf_keep = sdf_mask.sum().item()
+            n_alpha_keep = alpha_mask.sum().item()
+            n_final_keep = mask.sum().item()
+            print(f"  [CULL] total={n_total}, sdf_keep={n_sdf_keep}({100*n_sdf_keep/n_total:.1f}%), "
+                  f"alpha_keep={n_alpha_keep}({100*n_alpha_keep/n_total:.1f}%), "
+                  f"final_keep={n_final_keep}({100*n_final_keep/n_total:.1f}%)")
+
             self.empty_indices = self.indices[~mask]
             self.indices = self.indices[mask]
             self.mask = mask
