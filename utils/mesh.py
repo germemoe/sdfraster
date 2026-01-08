@@ -17,7 +17,9 @@ except ImportError:
 
 __all__ = [
     'Meshes', 'MeshRasterizer', 'MeshRenderer', 'ScalableMeshRenderer',
-    'nvdiff_rasterization', 'combine_meshes', 'save_mesh_as_ply'
+    'nvdiff_rasterization', 'combine_meshes', 'save_mesh_as_ply',
+    'transform_points_world_to_view', 'transform_points_to_pixel_space',
+    'evaluate_vertex_occupancy'
 ]
 
 
@@ -529,6 +531,166 @@ class ScalableMeshRenderer(nn.Module):
             output_pkg["pix_to_face"] = fragments.pix_to_face
 
         return output_pkg
+
+
+def transform_points_to_pixel_space(
+    points: torch.Tensor,
+    cameras,
+    points_are_already_in_view_space: bool = False,
+    keep_float: bool = False,
+):
+    """Transform points from world/view space to pixel space.
+
+    Args:
+        points: (n_cameras, N, 3) point positions
+        cameras: List[Camera]
+        points_are_already_in_view_space: If True, skip world->view transform
+        keep_float: If True, return float coordinates; else return int
+
+    Returns:
+        torch.Tensor: (n_cameras, N, 2) pixel coordinates
+    """
+    if not isinstance(cameras, list):
+        cameras = [cameras]
+
+    device = points.device
+
+    if points_are_already_in_view_space:
+        full_proj_transforms = torch.stack(
+            [camera.projection_matrix.to(device) for camera in cameras]
+        )
+    else:
+        full_proj_transforms = torch.stack(
+            [camera.full_proj_transform.to(device) for camera in cameras]
+        )
+
+    points_h = torch.cat([points, torch.ones_like(points[..., :1])], dim=-1)
+    proj_points = points_h @ full_proj_transforms
+    proj_points = proj_points[..., :2] / proj_points[..., 3:4].clamp_min(1e-6)
+
+    # Convert from NDC [-1, 1] to pixel space
+    height, width = cameras[0].image_height, cameras[0].image_width
+    image_size = torch.tensor([[width, height]], device=device, dtype=torch.float32)
+    proj_points = (1. + proj_points) / 2 * image_size - 0.5
+
+    if keep_float:
+        return proj_points
+    else:
+        return torch.round(proj_points).long()
+
+
+def evaluate_vertex_occupancy(
+    points: torch.Tensor,
+    mesh: Meshes,
+    cameras,
+    mesh_renderer: MeshRenderer = None,
+    use_scalable_renderer: bool = False,
+    eps: float = 1e-4,
+    verbose: bool = True,
+) -> torch.Tensor:
+    """Evaluate occupancy labels for points based on mesh visibility.
+
+    For each point, determine if it's inside (occupied) or outside the mesh
+    by comparing its depth with the rendered mesh depth from multiple views.
+    If a point is behind the mesh surface in any view, it's marked as inside.
+
+    Args:
+        points: (N, 3) points to evaluate
+        mesh: Mesh object for depth rendering
+        cameras: List of Camera objects (training views)
+        mesh_renderer: Optional pre-initialized MeshRenderer
+        use_scalable_renderer: Use ScalableMeshRenderer for large meshes
+        eps: Depth tolerance for inside/outside determination
+        verbose: Print progress
+
+    Returns:
+        torch.Tensor: (N,) occupancy labels
+            - 0.0 = inside (point is behind mesh in at least one view, SDF should be < 0)
+            - 1.0 = outside (point is in front of mesh in all views, SDF should be > 0)
+    """
+    from tqdm import tqdm
+
+    if not isinstance(cameras, list):
+        cameras = [cameras]
+
+    device = points.device
+    n_points = points.shape[0]
+
+    # Initialize labels as 1.0 (outside)
+    labels = torch.ones(n_points, device=device)
+
+    # Create renderer if not provided
+    if mesh_renderer is None:
+        rasterizer = MeshRasterizer(cameras=cameras)
+        if use_scalable_renderer:
+            mesh_renderer = ScalableMeshRenderer(rasterizer)
+        else:
+            mesh_renderer = MeshRenderer(rasterizer)
+
+    # Iterate over all views
+    iterator = tqdm(enumerate(cameras), total=len(cameras), desc="Computing occupancy labels") if verbose else enumerate(cameras)
+
+    for cam_idx, camera in iterator:
+        H, W = camera.image_height, camera.image_width
+
+        # Render mesh depth for this view
+        render_pkg = mesh_renderer(
+            mesh,
+            cameras=cameras,
+            cam_idx=cam_idx,
+            return_depth=True,
+            return_normals=False,
+            use_antialiasing=False,
+        )
+        mesh_depth = render_pkg["depth"]  # (H, W)
+
+        # Transform points to view space to get their depths
+        points_view = transform_points_world_to_view(points, [camera])[0]  # (N, 3)
+        point_depths = points_view[..., 2]  # (N,) - z coordinate is depth
+
+        # Project points to pixel space
+        pix_coords = transform_points_to_pixel_space(
+            points_view[None], [camera],
+            points_are_already_in_view_space=True,
+            keep_float=True,
+        )[0]  # (N, 2)
+
+        pix_x = pix_coords[..., 0]
+        pix_y = pix_coords[..., 1]
+
+        # Valid mask: points within image bounds and in front of camera
+        valid_mask = (
+            (pix_x >= 0) & (pix_x <= W - 1) &
+            (pix_y >= 0) & (pix_y <= H - 1) &
+            (point_depths > 0)
+        )
+
+        if valid_mask.sum() == 0:
+            continue
+
+        # Sample mesh depth at point pixel locations (bilinear interpolation)
+        # Normalize coordinates to [-1, 1] for grid_sample
+        grid_x = (pix_x / (W - 1) * 2 - 1).clamp(-1, 1)
+        grid_y = (pix_y / (H - 1) * 2 - 1).clamp(-1, 1)
+        grid = torch.stack([grid_x, grid_y], dim=-1)[None, :, None, :]  # (1, N, 1, 2)
+
+        sampled_mesh_depth = torch.nn.functional.grid_sample(
+            mesh_depth[None, None],  # (1, 1, H, W)
+            grid,
+            mode='bilinear',
+            padding_mode='border',
+            align_corners=True,
+        ).squeeze()  # (N,)
+
+        # Update valid mask: also need valid mesh depth
+        valid_mask = valid_mask & (sampled_mesh_depth > 0)
+
+        # Points behind mesh surface (point_depth > mesh_depth) are inside
+        # Use minimum to aggregate: if inside in any view, final label is 0 (inside)
+        behind_mask = (point_depths > sampled_mesh_depth + eps) & valid_mask
+        labels = torch.minimum(labels, (~behind_mask).float())
+
+    return labels
 
 
 def save_mesh_as_ply(filepath: str, mesh: Meshes):

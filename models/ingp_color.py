@@ -685,6 +685,23 @@ class Model(BaseModel):
 
         vertices = torch.as_tensor(point_cloud.points).float()
 
+        # [GEOMETRIC-INIT] 如果使用几何初始化，计算合适的 sdf_bias
+        use_geometric_init = kwargs.get('use_geometric_init', False)
+        if use_geometric_init:
+            # 计算点云中心和半径（在归一化空间中）
+            pcd_center = vertices.mean(dim=0).to(device)
+            pcd_center_normalized = (pcd_center - center) / scaling
+            pcd_radius_world = torch.linalg.norm(vertices.to(device) - pcd_center.reshape(1, 3), dim=1).max()
+            pcd_radius_normalized = pcd_radius_world / scaling
+
+            # 更新 sdf_bias 为点云在归一化空间的半径
+            # 同时记录点云中心偏移（用于调试）
+            kwargs['sdf_bias'] = float(pcd_radius_normalized)
+            print(f"[GEOMETRIC-INIT] PCD center (world): {pcd_center}")
+            print(f"[GEOMETRIC-INIT] PCD center (normalized): {pcd_center_normalized}")
+            print(f"[GEOMETRIC-INIT] PCD radius (world): {pcd_radius_world:.4f}")
+            print(f"[GEOMETRIC-INIT] PCD radius (normalized) = sdf_bias: {pcd_radius_normalized:.4f}")
+
 
         # vertices = vertices.reshape(-1, 1, 3).expand(-1, init_repeat, 3)
         # vertices = vertices + torch.randn(*vertices.shape) * dist.reshape(-1, 1, 1).clip(min=0.01)
@@ -968,12 +985,16 @@ class Model(BaseModel):
             gradients = torch.autograd.grad(
                 sdf.sum(), points, create_graph=self.training
             )[0]
+            # 处理 nan/inf，防止传播
+            gradients = gradients.nan_to_num(nan=0.0, posinf=1e6, neginf=-1e6)
 
             # 二阶梯度 (Hessian 对角元素)
             if self.training:
                 hessian_diag = torch.autograd.grad(
                     gradients.sum(), points, create_graph=True
                 )[0]
+                # 处理 nan/inf，防止传播
+                hessian_diag = hessian_diag.nan_to_num(nan=0.0, posinf=1e6, neginf=-1e6)
             else:
                 hessian_diag = None
                 gradients = gradients.detach()

@@ -131,7 +131,6 @@ def eikonal_loss(gradients: torch.Tensor, mask: torch.Tensor = None) -> torch.Te
     """
     # ||∇SDF|| - 1 的平方
     gradient_error = (gradients.norm(dim=-1) - 1.0) ** 2  # (N,)
-    gradient_error = gradient_error.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
 
     if mask is not None:
         return (gradient_error * mask.float()).sum() / (mask.float().sum() + 1e-8)
@@ -142,6 +141,7 @@ def eikonal_loss(gradients: torch.Tensor, mask: torch.Tensor = None) -> torch.Te
 def curvature_loss(hessian_diag: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
     """
     Curvature Loss: 最小化 SDF 的拉普拉斯量（促进光滑表面）
+    参考 Neuralangelo 实现
 
     Args:
         hessian_diag: (N, 3) Hessian 对角元素 [∂²f/∂x², ∂²f/∂y², ∂²f/∂z²]
@@ -152,6 +152,7 @@ def curvature_loss(hessian_diag: torch.Tensor, mask: torch.Tensor = None) -> tor
     """
     # Laplacian = ∂²f/∂x² + ∂²f/∂y² + ∂²f/∂z²
     laplacian = hessian_diag.sum(dim=-1).abs()  # (N,)
+    # 参考 Neuralangelo: 用 nan_to_num 处理 nan 和 inf
     laplacian = laplacian.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
 
     if mask is not None:

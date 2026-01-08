@@ -23,7 +23,7 @@ static const uint TILE_WIDTH = PYTHON_TILE_WIDTH;
 // [DEPTH-MODE] 深度渲染模式开关
 // true  = 使用 upstream 风格的密度加权积分深度 (compute_integral1D)
 // false = 使用当前的期望深度 (T * alpha * t_mid)
-static const bool USE_INTEGRAL_DEPTH = false;
+static const bool USE_INTEGRAL_DEPTH = true;
 
 // [DEPTH-MODE] phi 函数，用于 compute_integral1D
 [Differentiable]

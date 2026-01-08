@@ -9,7 +9,7 @@ set -e
 
 OUTPUT_BASE="/home/jk/jk2/project/output/eikonal_curv_ablation"
 DATASET_BASE="/storage/jk2/dataset/DTU"
-GPUS=(3 6)
+GPUS=(2 3 5)
 NUM_GPUS=${#GPUS[@]}
 
 # 全部场景

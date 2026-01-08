@@ -217,6 +217,8 @@ args.gradient_tv_normalize = True      # 是否用边长归一化梯度差异
 args.lambda_mesh_normal = 0.0   # mesh normal loss 权重
 args.lambda_mesh_depth = 0.0     # mesh depth loss 权重
 args.lambda_mesh_occupancy = 0.0 # surface occupancy loss 权重
+args.lambda_occupancy_labels = 0.0  # [NEW] occupancy labels loss 权重（MILo风格：约束内部点SDF为负）
+args.occupancy_labels_reset_interval = 1000  # [NEW] 重新计算 occupancy labels 的间隔
 args.mesh_depth_scale = None     # depth loss 的 scale 参数 (None则使用spatial_lr_scale)
 args.mesh_depth_ratio = 1.0      # MILo: median深度的混合比例 (0.0=仅期望深度, 1.0=仅中位深度)
 args.mesh_normal_start = 5001     # 开始使用 mesh normal loss 的迭代
@@ -375,6 +377,8 @@ mesh_regularizer = MeshRegularizer(
     normal_weight=args.lambda_mesh_normal,
     depth_weight=args.lambda_mesh_depth,
     occupancy_weight=args.lambda_mesh_occupancy,
+    occupancy_labels_weight=args.lambda_occupancy_labels,  # [NEW]
+    occupancy_labels_reset_interval=args.occupancy_labels_reset_interval,  # [NEW]
     depth_scale=args.mesh_depth_scale,
     depth_ratio=args.mesh_depth_ratio,  # MILo: 期望/中位深度混合比例
     sdf_threshold=args.mesh_sdf_threshold,
@@ -481,6 +485,15 @@ for iteration in progress_bar:
     st = time.time()
     ray_jitter = torch.rand((camera.image_height, camera.image_width, 2), device=device)
 
+    # [NAN-GUARD] 检查并修复顶点位置中的 NaN/inf
+    with torch.no_grad():
+        verts = model.contracted_vertices.data
+        nan_mask = torch.isnan(verts) | torch.isinf(verts)
+        if nan_mask.any():
+            num_nan = nan_mask.sum().item()
+            print(f"[NAN-GUARD] iter={iteration}: Found {num_nan} NaN/inf in vertices, replacing with 0")
+            verts[nan_mask] = 0.0
+
     # [DEBUG-MEMORY] 捕获 OOM 异常并打印详细信息
     try:
         render_pkg = render(camera, model, scene_scaling=model.scene_scaling, ray_jitter=ray_jitter, **args.as_dict())
@@ -531,7 +544,7 @@ for iteration in progress_bar:
         # 如果采样点为空，跳过 loss 计算
         if sampled_points.shape[0] > 0:
             # 在采样点上计算 SDF 梯度
-            _, gradients, hessian_diag = model.compute_sdf_gradients(
+            sdf_values, gradients, hessian_diag = model.compute_sdf_gradients(
                 points=sampled_points,
                 mode=args.gradient_mode,
                 taps=args.gradient_taps,
@@ -541,6 +554,7 @@ for iteration in progress_bar:
 
             if eikonal_active:
                 eik_loss = eikonal_loss(gradients)
+
             if curvature_active and hessian_diag is not None:
                 curv_loss = curvature_loss(hessian_diag)
                 # [Neuralangelo] curvature 权重调度
@@ -610,12 +624,13 @@ for iteration in progress_bar:
                 normalize_by_edge_length=args.gradient_tv_normalize
             )
 
-    # [MESH-LOSS] Mesh 正则化 Loss (normal + depth + occupancy)
+    # [MESH-LOSS] Mesh 正则化 Loss (normal + depth + occupancy + occupancy_labels)
     mesh_loss = torch.tensor(0.0, device=device)
     mesh_loss_active = False
     mesh_has_any_weight = (args.lambda_mesh_normal > 0 or
                            args.lambda_mesh_depth > 0 or
-                           args.lambda_mesh_occupancy > 0)
+                           args.lambda_mesh_occupancy > 0 or
+                           args.lambda_occupancy_labels > 0)  # [NEW]
     if mesh_has_any_weight and mesh_regularizer.should_apply(iteration):
         # 使用渲染的深度计算 mesh loss (MILo风格：支持期望/中位深度混合)
         gaussian_depth = render_pkg['depth']  # (H, W)
@@ -631,6 +646,7 @@ for iteration in progress_bar:
             spatial_lr_scale=spatial_lr_scale,      # MILo: 使用spatial_lr_scale作为depth scale
             iteration=iteration,
             gt_mask=gt_mask,  # 传入GT alpha mask，排除背景散乱法线
+            train_cameras=train_cameras,  # [NEW] 用于计算 occupancy labels
         )
         mesh_loss = mesh_reg_result['loss']
         mesh_loss_active = mesh_reg_result['active']
@@ -727,6 +743,13 @@ for iteration in progress_bar:
         tet_optim.sh_optim.zero_grad()
 
     if do_delaunay:
+        # [NAN-GUARD] 处理顶点梯度中的 NaN/inf 并裁剪
+        if model.contracted_vertices.grad is not None:
+            grad = model.contracted_vertices.grad.data
+            nan_mask = torch.isnan(grad) | torch.isinf(grad)
+            if nan_mask.any():
+                grad[nan_mask] = 0.0
+            torch.nn.utils.clip_grad_norm_([model.contracted_vertices], max_norm=1.0)
         tet_optim.vertex_optim.step()
         tet_optim.vertex_optim.zero_grad()
 

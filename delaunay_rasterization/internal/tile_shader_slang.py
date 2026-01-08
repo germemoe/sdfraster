@@ -36,11 +36,11 @@ def vertex_and_tile_shader(indices,
         index_buffer_offset = torch.cumsum(tiles_touched, dim=0, dtype=tiles_touched.dtype)
         max_mask = (tiles_touched == cam['grid_width']*cam['grid_height'])
         total_size_index_buffer = index_buffer_offset[-1]
-        unsorted_keys = torch.zeros((total_size_index_buffer,), 
-                                    device="cuda", 
+        unsorted_keys = torch.zeros((total_size_index_buffer,),
+                                    device="cuda",
                                     dtype=torch.int64)
-        unsorted_tetra_idx = torch.zeros((total_size_index_buffer,), 
-                                         device="cuda", 
+        unsorted_tetra_idx = torch.zeros((total_size_index_buffer,),
+                                         device="cuda",
                                          dtype=torch.int32)
 
         slang_modules.tile_shader.generate_keys(xyz_vs=vs_tetra,
