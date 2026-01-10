@@ -217,6 +217,8 @@ args.gradient_tv_normalize = True      # 是否用边长归一化梯度差异
 args.lambda_mesh_normal = 0.0   # mesh normal loss 权重
 args.lambda_mesh_depth = 0.0     # mesh depth loss 权重
 args.lambda_mesh_occupancy = 0.0 # surface occupancy loss 权重
+args.lambda_mesh_occupancy_labels = 0.0  # occupancy labels loss 权重
+args.mesh_occupancy_labels_reset_interval = 200  # 重新计算 occupancy labels 的间隔
 args.mesh_depth_scale = None     # depth loss 的 scale 参数 (None则使用spatial_lr_scale)
 args.mesh_depth_ratio = 1.0      # MILo: median深度的混合比例 (0.0=仅期望深度, 1.0=仅中位深度)
 args.mesh_normal_start = 5001     # 开始使用 mesh normal loss 的迭代
@@ -375,6 +377,8 @@ mesh_regularizer = MeshRegularizer(
     normal_weight=args.lambda_mesh_normal,
     depth_weight=args.lambda_mesh_depth,
     occupancy_weight=args.lambda_mesh_occupancy,
+    occupancy_labels_weight=args.lambda_mesh_occupancy_labels,
+    occupancy_labels_reset_interval=args.mesh_occupancy_labels_reset_interval,
     depth_scale=args.mesh_depth_scale,
     depth_ratio=args.mesh_depth_ratio,  # MILo: 期望/中位深度混合比例
     sdf_threshold=args.mesh_sdf_threshold,
@@ -615,7 +619,8 @@ for iteration in progress_bar:
     mesh_loss_active = False
     mesh_has_any_weight = (args.lambda_mesh_normal > 0 or
                            args.lambda_mesh_depth > 0 or
-                           args.lambda_mesh_occupancy > 0)
+                           args.lambda_mesh_occupancy > 0 or
+                           args.lambda_mesh_occupancy_labels > 0)
     if mesh_has_any_weight and mesh_regularizer.should_apply(iteration):
         # 使用渲染的深度计算 mesh loss (MILo风格：支持期望/中位深度混合)
         gaussian_depth = render_pkg['depth']  # (H, W)
@@ -631,6 +636,7 @@ for iteration in progress_bar:
             spatial_lr_scale=spatial_lr_scale,      # MILo: 使用spatial_lr_scale作为depth scale
             iteration=iteration,
             gt_mask=gt_mask,  # 传入GT alpha mask，排除背景散乱法线
+            train_cameras=train_cameras,
         )
         mesh_loss = mesh_reg_result['loss']
         mesh_loss_active = mesh_reg_result['active']
@@ -942,6 +948,7 @@ for iteration in progress_bar:
                     spatial_lr_scale=spatial_lr_scale,           # MILo: spatial_lr_scale
                     iteration=iteration,
                     gt_mask=sample_gt_mask,
+                    train_cameras=train_cameras,
                 )
                 if mesh_reg_vis['active'] and mesh_reg_vis['mesh_normal'] is not None:
                     # Mesh 法线图 (MILo 可视化惯例: fix_normal_map + (1 - normal) / 2)

@@ -64,3 +64,4 @@ newoutput/*
 nv_profiles/*
 *.pkl
 *.ply
+/paper/*

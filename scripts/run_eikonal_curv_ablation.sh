@@ -9,7 +9,7 @@ set -e
 
 OUTPUT_BASE="/home/jk/jk2/project/output/eikonal_curv_ablation"
 DATASET_BASE="/storage/jk2/dataset/DTU"
-GPUS=(3 6)
+GPUS=(1 2 3 4 5 6 7)
 NUM_GPUS=${#GPUS[@]}
 
 # 全部场景
@@ -34,10 +34,10 @@ declare -A S_VAR_LRS
 S_VAR_LRS[37]=100
 S_VAR_LRS[40]=100
 S_VAR_LRS[63]=100
-S_VAR_LRS[65]=500
+S_VAR_LRS[65]=200
 S_VAR_LRS[69]=100
-S_VAR_LRS[83]=500
-S_VAR_LRS[97]=500
+S_VAR_LRS[83]=200
+S_VAR_LRS[97]=200
 S_VAR_LRS[110]=100
 
 mkdir -p "$OUTPUT_BASE"
@@ -104,10 +104,11 @@ task_idx=0
 # 定义实验组合
 # 格式: eikonal|curvature|scenes (scenes 用逗号分隔)
 EXPERIMENTS=(
-    "0.1|5e-5|all"
+    "0.1|5e-5|37,40,63,65,69,83,110"
     "0.1|5e-6|69,83"
     "0.01|5e-5|all"
-    "0.01|5e-6|all"
+    "0.01|5e-6|37,40,65,69,83,97"
+    "0.01|5e-4|65,69"
 )
 
 for exp in "${EXPERIMENTS[@]}"; do

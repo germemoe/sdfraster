@@ -5,6 +5,7 @@ Computes:
 - Normal consistency loss between mesh and Gaussian normals
 - Depth consistency loss between mesh and Gaussian depths
 - Surface occupancy loss (SDF at surface points should be ~0)
+- Occupancy labels loss (enforce outside points to have positive SDF)
 
 Reference: MILo project regularization/regularizer/mesh.py
 """
@@ -15,7 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from utils.tetmesh import marching_tetrahedra
-from utils.mesh import Meshes, MeshRasterizer, MeshRenderer, transform_points_world_to_view
+from utils.mesh import Meshes, MeshRasterizer, MeshRenderer, transform_points_world_to_view, evaluate_vertex_occupancy
 from utils.geometry_utils import depth_to_normal, transform_normal_world_to_view
 
 
@@ -85,6 +86,8 @@ class MeshRegularizer(nn.Module):
         normal_weight: float = 0.05,
         depth_weight: float = 0.0,
         occupancy_weight: float = 0.0,
+        occupancy_labels_weight: float = 0.0,
+        occupancy_labels_reset_interval: int = 1000,
         depth_scale: float = 0.1,
         depth_ratio: float = 0.5,  # MILo: ratio of median depth (not expected!)
         sdf_threshold: float = 0.0,
@@ -98,11 +101,13 @@ class MeshRegularizer(nn.Module):
             normal_weight: Weight for normal consistency loss
             depth_weight: Weight for depth consistency loss
             occupancy_weight: Weight for surface occupancy loss
+            occupancy_labels_weight: Weight for occupancy labels loss (MILo-style)
+            occupancy_labels_reset_interval: How often to recompute occupancy labels
             depth_scale: Scale factor for depth loss (controls sensitivity)
                          If None, will use model.scene_scaling in forward()
             depth_ratio: Ratio for median depth in mixing (MILo convention)
                          Final depth = (1 - depth_ratio) * expected + depth_ratio * median
-                         Set to 0.0 to use only expected depth
+            Set to 0.0 to use only expected depth
             sdf_threshold: SDF threshold for mesh extraction (default 0.0 = surface)
             use_opengl: Use OpenGL context for rasterization (vs CUDA)
         """
@@ -112,6 +117,8 @@ class MeshRegularizer(nn.Module):
         self.normal_weight = normal_weight
         self.depth_weight = depth_weight
         self.occupancy_weight = occupancy_weight
+        self.occupancy_labels_weight = occupancy_labels_weight
+        self.occupancy_labels_reset_interval = occupancy_labels_reset_interval
         self.depth_scale = depth_scale
         self.depth_ratio = depth_ratio
         self.sdf_threshold = sdf_threshold
@@ -121,6 +128,10 @@ class MeshRegularizer(nn.Module):
         self._renderer = None
         self._cached_mesh = None
         self._last_camera_size = None
+
+        self._cached_occupancy_labels = None
+        self._occupancy_labels_last_reset_iter = -1
+        self._occupancy_labels_num_verts = 0
 
     def should_apply(self, iteration: int) -> bool:
         """Check if regularization should be applied at this iteration."""
@@ -348,7 +359,7 @@ class MeshRegularizer(nn.Module):
         Loss = mean(|SDF(surface_points)|^2)
 
         Args:
-            model: TetModel with query_sdf method
+            model: TetModel with query_vert_sdf method
             gaussian_depth: (H, W) Gaussian depth map
             camera: Camera object
             mask: Optional (H, W) boolean mask for valid pixels
@@ -409,10 +420,99 @@ class MeshRegularizer(nn.Module):
 
         # Query SDF at surface points
         surface_points = surface_points.detach().requires_grad_(False)
-        sdf_values = model.query_sdf(surface_points)  # (N,)
+        sdf_values = model.query_vert_sdf(surface_points)  # (N,)
 
         # Surface occupancy loss: SDF should be ~0 at surface
         loss = (sdf_values ** 2).mean()
+
+        return loss
+
+    def update_occupancy_labels(
+        self,
+        model,
+        mesh: Meshes,
+        train_cameras,
+        iteration: int,
+        force_reset: bool = False,
+    ) -> torch.Tensor:
+        """Update cached occupancy labels if needed.
+
+        Args:
+            model: TetModel with vertices
+            mesh: Extracted mesh for depth rendering
+            train_cameras: List of all training cameras
+            iteration: Current iteration
+            force_reset: Force recomputation even if interval not reached
+
+        Returns:
+            torch.Tensor: (N,) occupancy labels for internal vertices
+        """
+        num_verts = model.num_int_verts if hasattr(model, 'num_int_verts') else model.vertices.shape[0]
+
+        need_reset = (
+            force_reset or
+            self._cached_occupancy_labels is None or
+            self._occupancy_labels_num_verts != num_verts or
+            (iteration - self._occupancy_labels_last_reset_iter) >= self.occupancy_labels_reset_interval
+        )
+
+        if need_reset:
+            print(f"[MeshRegularizer] Recomputing occupancy labels at iteration {iteration}")
+            internal_verts = model.vertices[:num_verts]
+
+            mesh_renderer = MeshRenderer(
+                MeshRasterizer(cameras=train_cameras, use_opengl=self.use_opengl)
+            )
+            labels = evaluate_vertex_occupancy(
+                points=internal_verts,
+                mesh=mesh,
+                cameras=train_cameras,
+                mesh_renderer=mesh_renderer,
+                use_scalable_renderer=False,
+                eps=1e-4,
+                verbose=True,
+            )
+
+            self._cached_occupancy_labels = labels.detach()
+            self._occupancy_labels_last_reset_iter = iteration
+            self._occupancy_labels_num_verts = num_verts
+
+            inside_ratio = (labels < 0.5).float().mean().item()
+            print(f"[MeshRegularizer] Occupancy labels: {inside_ratio*100:.1f}% inside, {(1-inside_ratio)*100:.1f}% outside")
+
+        return self._cached_occupancy_labels
+
+    def compute_occupancy_labels_loss(
+        self,
+        model,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute occupancy labels loss using BCE (MILo-style).
+
+        This loss encourages the SDF to be positive (outside) for points
+        labeled as outside. Following MILo, we ONLY compute loss for outside
+        points (label > 0.5) because inside labels may be inaccurate due to occlusion.
+
+        Args:
+            model: TetModel with query_vert_sdf method
+            labels: (N,) occupancy labels (0=inside, 1=outside)
+
+        Returns:
+            torch.Tensor: Scalar BCE loss (only for outside points)
+        """
+        num_verts = model.num_int_verts if hasattr(model, 'num_int_verts') else model.vertices.shape[0]
+        vert_sdf = model.query_vert_sdf()[:num_verts]  # (N,)
+
+        scale = 10.0
+        per_element_loss = F.binary_cross_entropy_with_logits(
+            vert_sdf * scale,
+            labels,
+            reduction='none'
+        )
+
+        outside_mask = (labels > 0.5).float()
+        masked_loss = per_element_loss * outside_mask
+        loss = masked_loss.sum() / (outside_mask.sum() + 1e-8)
 
         return loss
 
@@ -427,11 +527,12 @@ class MeshRegularizer(nn.Module):
         spatial_lr_scale: float = None,  # MILo: spatial_lr_scale for depth loss
         iteration: int = None,
         gt_mask: torch.Tensor = None,  # GT alpha mask，排除背景散乱法线
+        train_cameras = None,
     ) -> dict:
         """Compute mesh regularization losses.
 
         Args:
-            model: TetModel with vertices, indices, query_vert_sdf, query_sdf
+            model: TetModel with vertices, indices, query_vert_sdf
             camera: Camera object for rendering
             gaussian_depth: (H, W) expected depth from Gaussian rendering
             gaussian_depth_med: (H, W) median depth from Gaussian rendering (MILo style)
@@ -443,6 +544,7 @@ class MeshRegularizer(nn.Module):
             spatial_lr_scale: MILo-style spatial scale for depth loss (camera radius * 1.1)
             iteration: Current training iteration (for scheduling)
             gt_mask: (H, W) or (1, H, W) GT alpha mask，背景为0前景为1
+            train_cameras: List of all training cameras (for occupancy labels loss)
 
         Returns:
             dict with:
@@ -450,6 +552,7 @@ class MeshRegularizer(nn.Module):
                 - 'normal_loss_raw': Unweighted normal loss
                 - 'depth_loss_raw': Unweighted depth loss
                 - 'occupancy_loss_raw': Unweighted occupancy loss
+                - 'occupancy_labels_loss_raw': Unweighted occupancy labels loss
                 - 'mesh_normal': (H, W, 3) mesh normal map
                 - 'mesh_depth': (H, W) mesh depth map
                 - 'gaussian_normal': (3, H, W) Gaussian normal map
@@ -461,6 +564,7 @@ class MeshRegularizer(nn.Module):
             'normal_loss_raw': torch.tensor(0.0, device=device),
             'depth_loss_raw': torch.tensor(0.0, device=device),
             'occupancy_loss_raw': torch.tensor(0.0, device=device),
+            'occupancy_labels_loss_raw': torch.tensor(0.0, device=device),
             'mesh_normal': None,
             'mesh_depth': None,
             'gaussian_normal': None,
@@ -550,6 +654,14 @@ class MeshRegularizer(nn.Module):
             result['occupancy_loss_raw'] = occupancy_loss
             total_loss = total_loss + self.occupancy_weight * occupancy_loss
 
+        if self.occupancy_labels_weight > 0 and train_cameras is not None and iteration is not None:
+            labels = self.update_occupancy_labels(
+                model, mesh, train_cameras, iteration
+            )
+            occupancy_labels_loss = self.compute_occupancy_labels_loss(model, labels)
+            result['occupancy_labels_loss_raw'] = occupancy_labels_loss
+            total_loss = total_loss + self.occupancy_labels_weight * occupancy_labels_loss
+
         result['loss'] = total_loss
         result['mesh_normal'] = mesh_normal
         result['mesh_depth'] = mesh_depth
@@ -567,6 +679,10 @@ def create_mesh_regularizer(config: dict = None) -> MeshRegularizer:
             - start_iter: int (default 8001)
             - stop_iter: int (default 18000)
             - normal_weight: float (default 0.05)
+            - depth_weight: float (default 0.0)
+            - occupancy_weight: float (default 0.0)
+            - occupancy_labels_weight: float (default 0.0)
+            - occupancy_labels_reset_interval: int (default 1000)
             - sdf_threshold: float (default 0.0)
             - use_opengl: bool (default True)
 
@@ -580,6 +696,10 @@ def create_mesh_regularizer(config: dict = None) -> MeshRegularizer:
         start_iter=config.get('start_iter', 8001),
         stop_iter=config.get('stop_iter', 18000),
         normal_weight=config.get('normal_weight', 0.05),
+        depth_weight=config.get('depth_weight', 0.0),
+        occupancy_weight=config.get('occupancy_weight', 0.0),
+        occupancy_labels_weight=config.get('occupancy_labels_weight', 0.0),
+        occupancy_labels_reset_interval=config.get('occupancy_labels_reset_interval', 1000),
         sdf_threshold=config.get('sdf_threshold', 0.0),
         use_opengl=config.get('use_opengl', True),
     )
