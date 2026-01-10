@@ -120,6 +120,7 @@ args.iterations = 18000
 args.ckpt = ""
 args.resolution = 1
 args.render_train = False
+args.eval_mt_no_cluster = True  # MT 不做 cluster 的额外评估
 
 # Light Settings
 args.max_sh_deg = 3
@@ -217,6 +218,8 @@ args.gradient_tv_normalize = True      # 是否用边长归一化梯度差异
 args.lambda_mesh_normal = 0.0   # mesh normal loss 权重
 args.lambda_mesh_depth = 0.0     # mesh depth loss 权重
 args.lambda_mesh_occupancy = 0.0 # surface occupancy loss 权重
+args.lambda_mesh_occupancy_labels = 0.0  # occupancy labels loss 权重
+args.mesh_occupancy_labels_reset_interval = 1000  # 重新计算 occupancy labels 的间隔
 args.mesh_depth_scale = None     # depth loss 的 scale 参数 (None则使用spatial_lr_scale)
 args.mesh_depth_ratio = 1.0      # MILo: median深度的混合比例 (0.0=仅期望深度, 1.0=仅中位深度)
 args.mesh_normal_start = 5001     # 开始使用 mesh normal loss 的迭代
@@ -304,6 +307,7 @@ args.eval_dtu = True            # 是否进行 DTU 评估（仅对 DTU 数据集
 args.eval_tnt = True            # 是否进行 TNT 评估（仅对 TNT 数据集有效）
 args.eval_mt = True             # 是否评估 MT 提取的 mesh
 args.extract_tsdf = True        # 是否使用 TSDF Fusion 提取并评估 mesh
+args.eval_no_cluster = False    # 额外评估不做 cluster 后处理的原始 mesh
 args.cull_dilation_radius = 6   # cull_mesh 时 mask 膨胀半径（MILo 默认 6）
 args.tnt_min_visible_views = 20 # TNT cull_mesh 时最少可见视图数
 
@@ -375,6 +379,8 @@ mesh_regularizer = MeshRegularizer(
     normal_weight=args.lambda_mesh_normal,
     depth_weight=args.lambda_mesh_depth,
     occupancy_weight=args.lambda_mesh_occupancy,
+    occupancy_labels_weight=args.lambda_mesh_occupancy_labels,
+    occupancy_labels_reset_interval=args.mesh_occupancy_labels_reset_interval,
     depth_scale=args.mesh_depth_scale,
     depth_ratio=args.mesh_depth_ratio,  # MILo: 期望/中位深度混合比例
     sdf_threshold=args.mesh_sdf_threshold,
@@ -613,9 +619,12 @@ for iteration in progress_bar:
     # [MESH-LOSS] Mesh 正则化 Loss (normal + depth + occupancy)
     mesh_loss = torch.tensor(0.0, device=device)
     mesh_loss_active = False
+    occupancy_loss = torch.tensor(0.0, device=device)
+    occupancy_labels_loss = torch.tensor(0.0, device=device)
     mesh_has_any_weight = (args.lambda_mesh_normal > 0 or
                            args.lambda_mesh_depth > 0 or
-                           args.lambda_mesh_occupancy > 0)
+                           args.lambda_mesh_occupancy > 0 or
+                           args.lambda_mesh_occupancy_labels > 0)
     if mesh_has_any_weight and mesh_regularizer.should_apply(iteration):
         # 使用渲染的深度计算 mesh loss (MILo风格：支持期望/中位深度混合)
         gaussian_depth = render_pkg['depth']  # (H, W)
@@ -631,9 +640,12 @@ for iteration in progress_bar:
             spatial_lr_scale=spatial_lr_scale,      # MILo: 使用spatial_lr_scale作为depth scale
             iteration=iteration,
             gt_mask=gt_mask,  # 传入GT alpha mask，排除背景散乱法线
+            train_cameras=train_cameras,
         )
         mesh_loss = mesh_reg_result['loss']
         mesh_loss_active = mesh_reg_result['active']
+        occupancy_loss = mesh_reg_result['occupancy_loss_raw']
+        occupancy_labels_loss = mesh_reg_result['occupancy_labels_loss_raw']
 
     # [DEPTH-NORMAL-LOSS] 深度推导法线与渲染法线一致性 Loss
     normal_depth_loss = torch.tensor(0.0, device=device)
@@ -837,6 +849,8 @@ for iteration in progress_bar:
         "Eik": repr(f"{eik_loss.item():.3f}"),
         "Curv": repr(f"{curv_loss.item():.1e}"),
     }
+    if args.lambda_dist > 0:
+        postfix_dict["Dist"] = repr(f"{dl_loss.item():.3f}")
     # Coarse-to-Fine: 显示当前激活层数
     if args.coarse2fine_enabled:
         postfix_dict["C2F"] = f"{model.backbone.active_levels}/{model.backbone.L}"
@@ -846,6 +860,10 @@ for iteration in progress_bar:
     # [MESH-LOSS] 显示 mesh loss（仅当激活时）
     if mesh_loss_active:
         postfix_dict["Mesh"] = repr(f"{mesh_loss.item():.3f}")
+    if mesh_loss_active and args.lambda_mesh_occupancy > 0:
+        postfix_dict["Occ"] = repr(f"{occupancy_loss.item():.3f}")
+    if mesh_loss_active and args.lambda_mesh_occupancy_labels > 0:
+        postfix_dict["OccL"] = repr(f"{occupancy_labels_loss.item():.3f}")
     # [DEPTH-NORMAL-LOSS] 显示 depth normal loss（仅当激活时）
     if args.lambda_normal_depth > 0:
         postfix_dict["ND"] = repr(f"{normal_depth_loss.item():.3f}")
@@ -942,6 +960,7 @@ for iteration in progress_bar:
                     spatial_lr_scale=spatial_lr_scale,           # MILo: spatial_lr_scale
                     iteration=iteration,
                     gt_mask=sample_gt_mask,
+                    train_cameras=train_cameras,
                 )
                 if mesh_reg_vis['active'] and mesh_reg_vis['mesh_normal'] is not None:
                     # Mesh 法线图 (MILo 可视化惯例: fix_normal_map + (1 - normal) / 2)
@@ -1175,6 +1194,42 @@ if is_tnt:
 if not is_dtu and not is_tnt:
     print(f"\n[EVAL] Not a DTU or TNT dataset, skipping mesh evaluation")
 
+def run_mesh_eval(mesh_path: Path, tag: str):
+    label = tag.replace('_', '-').upper()
+
+    if args.eval_dtu and is_dtu:
+        from eval.dtu.evaluate import evaluate_dtu_mesh
+        print(f"\n[{label}-EVAL] Running DTU evaluation...")
+        results = evaluate_dtu_mesh(
+            mesh_path=str(mesh_path),
+            train_cameras=train_cameras,
+            dtu_path=dtu_root,
+            scan_id=scan_id,
+            output_dir=str(args.output_path / f'eval_dtu_{tag}'),
+            cull=True,
+            dilation_radius=args.cull_dilation_radius,
+            dataset_path=str(args.dataset_path),  # 用于 scale_mat
+            model_output_path=str(args.output_path),  # 用于 PCA 变换 (transform.txt)
+        )
+        if results:
+            print(f"[{label}-EVAL] Results: d2s={results['mean_d2s']:.4f}, s2d={results['mean_s2d']:.4f}, overall={results['overall']:.4f}")
+
+    if args.eval_tnt and is_tnt:
+        from eval.tnt.evaluate import evaluate_tnt_mesh
+        print(f"\n[{label}-EVAL] Running TNT evaluation...")
+        results = evaluate_tnt_mesh(
+            mesh_path=str(mesh_path),
+            train_cameras=train_cameras,
+            tnt_path=tnt_root,
+            scene_name=scene_name,
+            output_dir=str(args.output_path / f'eval_tnt_{tag}'),
+            model_output_path=str(args.output_path),  # 用于 PCA 变换 (transform.txt)
+            cull=False,  # TNT 使用基于深度渲染的 cull，可选
+            min_visible_views=args.tnt_min_visible_views,
+        )
+        if results:
+            print(f"[{label}-EVAL] Results: precision={results['precision']:.4f}, recall={results['recall']:.4f}, fscore={results['fscore']:.4f}")
+
 # --------------------------------------------------------------------------
 # 路径1: MT 提取
 # --------------------------------------------------------------------------
@@ -1194,6 +1249,48 @@ if args.eval_mt:
         verts_np = mt_verts.cpu().numpy()
         faces_np = mt_faces.cpu().numpy()
         print(f"[MT] Raw mesh: {verts_np.shape[0]} verts, {faces_np.shape[0]} faces")
+
+        # 额外：不做 cluster 的 mesh 与评估
+        if args.eval_mt_no_cluster:
+            mt_raw_path = args.output_path / "mesh_mt_no_cluster.ply"
+            mt_raw_mesh = o3d.geometry.TriangleMesh()
+            mt_raw_mesh.vertices = o3d.utility.Vector3dVector(verts_np)
+            mt_raw_mesh.triangles = o3d.utility.Vector3iVector(faces_np)
+            o3d.io.write_triangle_mesh(str(mt_raw_path), mt_raw_mesh)
+            print(f"[MT] Saved (no cluster): {mt_raw_path}")
+
+            if args.eval_dtu and is_dtu:
+                from eval.dtu.evaluate import evaluate_dtu_mesh
+                print(f"\n[MT-EVAL] Running DTU evaluation (no cluster)...")
+                results = evaluate_dtu_mesh(
+                    mesh_path=str(mt_raw_path),
+                    train_cameras=train_cameras,
+                    dtu_path=dtu_root,
+                    scan_id=scan_id,
+                    output_dir=str(args.output_path / 'eval_dtu_mt_no_cluster'),
+                    cull=True,
+                    dilation_radius=args.cull_dilation_radius,
+                    dataset_path=str(args.dataset_path),
+                    model_output_path=str(args.output_path),
+                )
+                if results:
+                    print(f"[MT-EVAL] Results (no cluster): d2s={results['mean_d2s']:.4f}, s2d={results['mean_s2d']:.4f}, overall={results['overall']:.4f}")
+
+            if args.eval_tnt and is_tnt:
+                from eval.tnt.evaluate import evaluate_tnt_mesh
+                print(f"\n[MT-EVAL] Running TNT evaluation (no cluster)...")
+                results = evaluate_tnt_mesh(
+                    mesh_path=str(mt_raw_path),
+                    train_cameras=train_cameras,
+                    tnt_path=tnt_root,
+                    scene_name=scene_name,
+                    output_dir=str(args.output_path / 'eval_tnt_mt_no_cluster'),
+                    model_output_path=str(args.output_path),
+                    cull=False,
+                    min_visible_views=args.tnt_min_visible_views,
+                )
+                if results:
+                    print(f"[MT-EVAL] Results (no cluster): precision={results['precision']:.4f}, recall={results['recall']:.4f}, fscore={results['fscore']:.4f}")
 
         # 后处理
         verts_np, faces_np = post_process_mesh(verts_np, faces_np, num_cluster=50)

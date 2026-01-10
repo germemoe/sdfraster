@@ -1,0 +1,101 @@
+Fri Jan  9 18:53:29 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.95.05              Driver Version: 580.95.05      CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA A800-SXM4-80GB          On  |   00000000:3D:00.0 Off |                    0 |
+| N/A   30C    P0             62W /  400W |       0MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA A800-SXM4-80GB          On  |   00000000:42:00.0 Off |                    0 |
+| N/A   27C    P0             59W /  400W |       0MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA A800-SXM4-80GB          On  |   00000000:61:00.0 Off |                    0 |
+| N/A   27C    P0             63W /  400W |       0MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA A800-SXM4-80GB          On  |   00000000:67:00.0 Off |                    0 |
+| N/A   29C    P0             63W /  400W |       0MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   4  NVIDIA A800-SXM4-80GB          On  |   00000000:AD:00.0 Off |                    0 |
+| N/A   31C    P0             63W /  400W |       0MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   5  NVIDIA A800-SXM4-80GB          On  |   00000000:B1:00.0 Off |                    0 |
+| N/A   27C    P0             65W /  400W |       0MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   6  NVIDIA A800-SXM4-80GB          On  |   00000000:D0:00.0 Off |                    0 |
+| N/A   26C    P0             58W /  400W |       0MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   7  NVIDIA A800-SXM4-80GB          On  |   00000000:D3:00.0 Off |                    0 |
+| N/A   29C    P0             64W /  400W |       0MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+CUDA_VISIBLE_DEVICES=0
+CPUS=16
+========================================
+Eikonal + Curvature Ablation - Continue (Parallel)
+========================================
+GPUs: 0
+
+Experiment: eik0.1_curv5e-5, scenes: 37 97
+  [eik0.1_curv5e-5/scan97] Already done, skipping...
+Experiment: eik0.1_curv5e-6, scenes: 69
+Experiment: eik0.01_curv5e-5, scenes: 40 63 65 69 83 97 110
+Experiment: eik0.01_curv5e-6, scenes: 63 83 110
+  [eik0.01_curv5e-6/scan63] Already done, skipping...
+  [eik0.01_curv5e-6/scan110] Already done, skipping...
+Experiment: eik0.01_curv5e-4, scenes: 37 40 63 65 69 83 97 110
+  [eik0.01_curv5e-4/scan37] Already done, skipping...
+  [eik0.01_curv5e-4/scan40] Already done, skipping...
+  [eik0.01_curv5e-4/scan63] Already done, skipping...
+  [eik0.01_curv5e-4/scan83] Already done, skipping...
+  [eik0.01_curv5e-4/scan97] Already done, skipping...
+  [eik0.01_curv5e-4/scan110] Already done, skipping...
+
+Total tasks to run: 12
+
+[GPU 0] Starting eik0.1_curv5e-5/scan37...
+Progress: 1/12 (failed: 1)
+[GPU 0] Starting eik0.1_curv5e-6/scan69...
+Progress: 2/12 (failed: 2)
+[GPU 0] Starting eik0.01_curv5e-5/scan40...
+Progress: 3/12 (failed: 3)
+[GPU 0] Starting eik0.01_curv5e-5/scan63...
+Progress: 4/12 (failed: 4)
+[GPU 0] Starting eik0.01_curv5e-5/scan65...
+Progress: 5/12 (failed: 5)
+[GPU 0] Starting eik0.01_curv5e-5/scan69...
+Progress: 6/12 (failed: 6)
+[GPU 0] Starting eik0.01_curv5e-5/scan83...
+Progress: 7/12 (failed: 7)
+[GPU 0] Starting eik0.01_curv5e-5/scan97...
+Progress: 8/12 (failed: 8)
+[GPU 0] Starting eik0.01_curv5e-5/scan110...
+Progress: 9/12 (failed: 9)
+[GPU 0] Starting eik0.01_curv5e-6/scan83...
+Progress: 10/12 (failed: 10)
+[GPU 0] Starting eik0.01_curv5e-4/scan65...
+Progress: 11/12 (failed: 11)
+[GPU 0] Starting eik0.01_curv5e-4/scan69...
+Progress: 12/12 (failed: 12)
+
+========================================
+All completed! Success: 0, Failed: 12
+========================================
+Job finished

@@ -1,0 +1,75 @@
+Wed Jan  7 19:24:54 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 590.44.01              Driver Version: 590.44.01      CUDA Version: 13.1     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA A100-SXM4-80GB          On  |   00000000:27:00.0 Off |                    0 |
+| N/A   28C    P0             58W /  400W |       0MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA A100-SXM4-80GB          On  |   00000000:2A:00.0 Off |                    0 |
+| N/A   27C    P0             61W /  400W |       0MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA A100-SXM4-80GB          On  |   00000000:51:00.0 Off |                    0 |
+| N/A   26C    P0             59W /  400W |       0MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA A100-SXM4-80GB          On  |   00000000:57:00.0 Off |                    0 |
+| N/A   28C    P0             61W /  400W |       0MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   4  NVIDIA A100-SXM4-80GB          On  |   00000000:9E:00.0 Off |                    0 |
+| N/A   29C    P0             63W /  400W |       0MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   5  NVIDIA A100-SXM4-80GB          On  |   00000000:A4:00.0 Off |                    0 |
+| N/A   26C    P0             62W /  400W |       0MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   6  NVIDIA A100-SXM4-80GB          On  |   00000000:C7:00.0 Off |                    0 |
+| N/A   26C    P0             60W /  400W |       0MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   7  NVIDIA A100-SXM4-80GB          On  |   00000000:CA:00.0 Off |                    0 |
+| N/A   29C    P0             63W /  400W |       0MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5
+CPUS=96
+========================================
+TNT Dataset Training (Parallel)
+========================================
+Scenes: Barn Caterpillar Courthouse Ignatius Meetingroom Truck
+GPUs: 0 1 2 3 4 5 6 7
+
+Tasks to run: 6
+
+[GPU 1] Starting Caterpillar...
+[GPU 0] Starting Barn...
+[GPU 2] Starting Courthouse...
+[GPU 3] Starting Ignatius...
+[GPU 4] Starting Meetingroom...
+[GPU 5] Starting Truck...
+Progress: 1/6 (failed: 1)
+Progress: 2/6 (failed: 2)
+Progress: 3/6 (failed: 3)
+Progress: 4/6 (failed: 4)
+Progress: 5/6 (failed: 5)
+Progress: 6/6 (failed: 6)
+
+========================================
+All scenes completed! Success: 0, Failed: 6
+========================================
+Job finished
