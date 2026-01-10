@@ -1,0 +1,67 @@
+/bin/bash: /home/yuhuimu/.conda/envs/jk/lib/libtinfo.so.6: no version information available (required by /bin/bash)
+Sat Jan 10 15:27:08 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.65.06              Driver Version: 580.65.06      CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 4090        On  |   00000000:2D:00.0 Off |                  Off |
+| 30%   29C    P8             19W /  450W |       1MiB /  24564MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA GeForce RTX 4090        On  |   00000000:2E:00.0 Off |                  Off |
+| 30%   28C    P8             25W /  450W |       1MiB /  24564MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA GeForce RTX 4090        On  |   00000000:31:00.0 Off |                  Off |
+| 30%   29C    P8             12W /  450W |       1MiB /  24564MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA GeForce RTX 4090        On  |   00000000:36:00.0 Off |                  Off |
+| 30%   28C    P8             13W /  450W |       1MiB /  24564MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   4  NVIDIA GeForce RTX 4090        On  |   00000000:AD:00.0 Off |                  Off |
+| 30%   26C    P8             21W /  450W |       1MiB /  24564MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   5  NVIDIA GeForce RTX 4090        On  |   00000000:AE:00.0 Off |                  Off |
+| 30%   30C    P8             13W /  450W |       1MiB /  24564MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   6  NVIDIA GeForce RTX 4090        On  |   00000000:B1:00.0 Off |                  Off |
+| 30%   27C    P8             11W /  450W |       1MiB /  24564MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   7  NVIDIA GeForce RTX 4090        On  |   00000000:B6:00.0 Off |                  Off |
+| 30%   27C    P8             15W /  450W |       1MiB /  24564MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7
+CPUS=56
+bash: /home/yuhuimu/.conda/envs/jk/lib/libtinfo.so.6: no version information available (required by bash)
+Detected allocated GPUs from Slurm/System: 1 2 3 4 5 6 7
+Using logical IDs for training: 0 1 2 3 4 5 6
+Total tasks to process: 48
+[GPU 0] Scan 37 nd0_mn0_md0 ALREADY DONE.
+[GPU 1] Scan 37 nd0_mn0_md0.01 ALREADY DONE.
+[GPU 0] Scan 37 nd0_mn0.01_md0 ALREADY DONE.
+[GPU 0] Scan 37 nd0_mn0.01_md0.01 ALREADY DONE.
+[GPU 0] RUNNING: Scan 37 nd0.01_mn0_md0
+[GPU 0] RUNNING: Scan 37 nd0.01_mn0_md0.01
+[GPU 0] RUNNING: Scan 37 nd0.01_mn0.01_md0
+[GPU 0] RUNNING: Scan 37 nd0.01_mn0.01_md0.01
+[GPU 0] RUNNING: Scan 63 nd0_mn0_md0
+[GPU 0] RUNNING: Scan 63 nd0_mn0_md0.01
+[GPU 0] RUNNING: Scan 63 nd0_mn0.01_md0
+[2026-01-10T15:28:53.650] error: *** JOB 6936 ON gpu7 CANCELLED AT 2026-01-10T15:28:53 DUE to SIGNAL Terminated ***

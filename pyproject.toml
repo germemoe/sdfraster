@@ -22,6 +22,10 @@ dependencies = [
     "torch",
     "torchaudio",
     "torchvision",
+    "trimesh",
+    "pyrender",
+    "scikit-image",
+    "PyMcubes",
     "tqdm>=4.67.1",
     "fused-ssim",
     "termplotlib>=0.3.9",
@@ -30,14 +34,14 @@ dependencies = [
 
 [tool.uv]
 # 保留你原来需要 no-build-isolation 的包，比如 fused-ssim（如果你有）
-no-build-isolation-package = ["fused-ssim"]
+no-build-isolation-package = ["fused-ssim", "gdel3d", "nvdiffrast", "tinycudann"]
 
 extra-build-dependencies = { fused-ssim = ["setuptools"], tinycudann = ["setuptools", "torch"]}
 [tool.uv.sources]
-tinyplypy = { git = "https://github.com/half-potato/tinyplypy" }
-muon-optimizer = { git = "https://github.com/KellerJordan/Muon" }
+tinyplypy = { git = "https://github.com/half-potato/tinyplypy"}
+muon-optimizer = { git = "https://github.com/KellerJordan/Muon"}
 fused-ssim = { git = "https://github.com/rahul-goel/fused-ssim/" }
-gdel3d = { git = "https://github.com/half-potato/pyGDel3D.git" }
+gdel3d = { git = "https://github.com/half-potato/pyGDel3D.git"}
 nvdiffrast = { git = "https://github.com/NVlabs/nvdiffrast" }
 tinycudann = { git = "https://github.com/NVlabs/tiny-cuda-nn/", subdirectory = "bindings/torch" }
 
