@@ -1,0 +1,29 @@
+--- a/GDelFlipping/src/gDel3D/CommonTypes.h
++++ b/GDelFlipping/src/gDel3D/CommonTypes.h
+@@ -73,12 +73,11 @@
+ #include <thrust/transform_scan.h>
+ #include <thrust/unique.h>
+ 
+-// #ifdef REAL_TYPE_FP32
+-// typedef float RealType;
+-// #else
+-// typedef double RealType;
+-// #endif
++#ifdef REAL_TYPE_FP32
+ typedef float RealType;
++#else
++typedef double RealType;
++#endif
+ 
+ typedef unsigned char uchar;
+ 
+--- a/GDelFlipping/src/bindings.cpp
++++ b/GDelFlipping/src/bindings.cpp
+@@ -192,6 +192,7 @@
+ 
+ PYBIND11_MODULE(gdel3d, m) {
+     m.doc() = "Python bindings for gdel3d";
++    m.def("get_dtype", []() { return sizeof(RealType) == 8 ? "float64" : "float32"; });
+     py::class_<PyGDelOutput>(m, "DelOutput")
+         .def("check_correctness", &PyGDelOutput::checkCorrectness)
+         .def("get_boundary_tets", &PyGDelOutput::getBoundaryTets);

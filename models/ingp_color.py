@@ -2,7 +2,6 @@ import torch
 import math
 from data.camera import Camera
 from utils import optim
-from gdel3d import Del
 from torch import nn
 from icecream import ic
 
@@ -11,12 +10,16 @@ from utils import topo_utils
 from utils.contraction import contract_mean_std
 
 from utils.train_util import get_expon_lr_func, SpikingLR
+from utils.training_clocks import resolve_optimizer_lr
 from utils.graphics_utils import l2_normalize_th
 from torch.utils.checkpoint import checkpoint
 from pathlib import Path
 import numpy as np
 from utils.args import Args
-from scipy.spatial import  Delaunay, ConvexHull
+from utils.encoding_precision import validate_encoding_precision
+from utils.matmul_precision import configure_float32_matmul_precision
+from scipy.spatial import ConvexHull
+from utils.triangulation_backend import TriangulationBackend
 import open3d as o3d
 from utils.model_util import *
 from models.base_model import BaseModel
@@ -133,8 +136,14 @@ class iNGPDW(nn.Module):
                  coarse2fine_enabled=False,
                  coarse2fine_init_level=4,
                  coarse2fine_step=5000,
+                 encoding_precision="float16",  # TCNN only; PyTorch encoding stays unchanged
+                 float32_matmul_precision="high",  # Process-global FP32 GEMM math mode
                  **kwargs):
         super().__init__()
+        self.encoding_precision = validate_encoding_precision(encoding_precision)
+        self.float32_matmul_precision = configure_float32_matmul_precision(
+            float32_matmul_precision)["float32_matmul_precision"]
+        self.encoding_backend = "tcnn" if use_tcnn else "pytorch"
         self.scale_multi = scale_multi
         self.L = L
         self.dim = hashmap_dim
@@ -184,7 +193,8 @@ class iNGPDW(nn.Module):
             log2_hashmap_size=log2_hashmap_size,
         )
         if use_tcnn:
-            self.encoding = tcnn.Encoding(3, self.config)
+            encoding_dtype = {"float16": torch.float16, "float32": torch.float32}[self.encoding_precision]
+            self.encoding = tcnn.Encoding(3, self.config, dtype=encoding_dtype)
             print("Using TCNN")
             self.compile = False
         else:
@@ -361,7 +371,7 @@ class iNGPDW(nn.Module):
 
         # 模式 1: C2F 开启，使用 Neuralangelo 逻辑
         if self.coarse2fine_enabled:
-            if iteration <= warmup_end:
+            if warmup_end > 0 and iteration <= warmup_end:
                 return iteration / warmup_end
             else:
                 if self.active_levels > 1:
@@ -375,10 +385,10 @@ class iNGPDW(nn.Module):
             return 1.0
 
         # 模式 2: 启用衰减，warmup + 线性衰减到 final_weight
-        if iteration <= warmup_end:
+        if warmup_end > 0 and iteration <= warmup_end:
             # Warmup: 0 → 1
             return iteration / warmup_end
-        elif iteration <= decay_end:
+        elif decay_end > warmup_end and iteration <= decay_end:
             # 线性衰减: 1 → final_weight
             progress = (iteration - warmup_end) / (decay_end - warmup_end)
             return 1.0 - progress * (1.0 - final_weight)
@@ -459,6 +469,11 @@ class Model(BaseModel):
                  max_sh_deg=2,
                  ablate_circumsphere=False,
                  ablate_gradient=False,
+                 encoding_precision="float16",
+                 float32_matmul_precision="high",
+                 triangulation_backend="isolated_native",
+                 triangulation_timeout_seconds=120.0,
+                 initialize_triangulation=True,
                  **kwargs):
         super().__init__()
         self.device = vertices.device
@@ -474,7 +489,8 @@ class Model(BaseModel):
         ], device=self.device)
         sh_dim = ((1+max_sh_deg)**2-1)*3
 
-        module = iNGPDW(sh_dim, **kwargs)
+        module = iNGPDW(sh_dim, encoding_precision=encoding_precision,
+                        float32_matmul_precision=float32_matmul_precision, **kwargs)
         self.compile = module.compile
         if module.compile:
             self.backbone = torch.compile(module).to(self.device)
@@ -547,7 +563,27 @@ class Model(BaseModel):
         self.register_buffer('center', center.reshape(1, 3))
         self.register_buffer('scene_scaling', torch.tensor(float(scene_scaling), device=self.device))
         self.contracted_vertices = nn.Parameter(vertices.detach())
-        self.update_triangulation()
+        self.triangulation_context = {"event": "initialization"}
+        self.configure_triangulation(triangulation_backend, triangulation_timeout_seconds,
+                                     kwargs.get("output_path"))
+        if initialize_triangulation:
+            self.update_triangulation()
+
+    def configure_triangulation(self, backend, timeout_seconds, output_path=None):
+        old = getattr(self, "_triangulation", None)
+        if old is not None:
+            old.close()
+        if output_path is None:
+            import tempfile
+            failure_dir = Path(tempfile.mkdtemp(prefix="sdfraster-triangulation-"))
+        else:
+            failure_dir = Path(output_path) / "triangulation_diagnostics"
+        self.triangulation_backend = backend
+        self.triangulation_timeout_seconds = float(timeout_seconds)
+        self._triangulation = TriangulationBackend(failure_dir, backend, timeout_seconds)
+
+    def close_triangulation(self):
+        self._triangulation.close()
 
     @property
     def num_int_verts(self):
@@ -676,7 +712,7 @@ class Model(BaseModel):
     def init_from_pcd(point_cloud, cameras, device, max_sh_deg,
                       voxel_size=0.00, **kwargs):
         init_num = kwargs.pop('init_num', 0)  # 初始点云最小数量
-        torch.manual_seed(2)
+        torch.manual_seed(kwargs.get("seed", 2))
 
         ccenters = torch.stack([c.camera_center.reshape(3) for c in cameras], dim=0).to(device)
         center = ccenters.mean(dim=0)
@@ -756,6 +792,11 @@ class Model(BaseModel):
         ckpt_path = path / "ckpt.pth"
         config_path = path / "config.json"
         config = Args.load_from_json(str(config_path))
+        runtime_path = path / "runtime_state.json"
+        if runtime_path.exists():
+            import json
+            if json.loads(runtime_path.read_text()).get("frozen"):
+                raise ValueError("Frozen-model checkpoint requires its matching model loader")
         ckpt = torch.load(ckpt_path)
         print(ckpt.keys())
         vertices = ckpt['contracted_vertices']
@@ -768,12 +809,16 @@ class Model(BaseModel):
             empty_indices = torch.empty((0, 4), dtype=indices.dtype, device=indices.device)
         print(f"Loaded {vertices.shape[0]} vertices")
         ext_vertices = ckpt['ext_vertices']
-        model = Model(vertices.to(device), ext_vertices, ckpt['center'], ckpt['scene_scaling'], **config.as_dict())
+        model = Model(vertices.to(device), ext_vertices, ckpt['center'], ckpt['scene_scaling'],
+                      initialize_triangulation=False, **config.as_dict())
         model.load_state_dict(ckpt)
         base_min_t = getattr(config, "base_min_t", getattr(config, "min_t", 0.4))
         model.min_t = model.scene_scaling * base_min_t
-        model.indices = torch.as_tensor(indices).cuda()
-        model.empty_indices = torch.as_tensor(empty_indices).cuda()
+        model.indices = torch.as_tensor(indices, device=device)
+        model.empty_indices = torch.as_tensor(empty_indices, device=device)
+        model.tet_normal_mode = getattr(config, "tet_normal_mode", "raw")
+        from utils.checkpoint_util import restore_runtime_state
+        restore_runtime_state(model, path / "runtime_state.json")
         return model
 
     # [SDF-MODIFICATION] 重命名为 calc_tet_sdf，返回SDF值
@@ -916,72 +961,100 @@ class Model(BaseModel):
 
         return torch.cat(sdf_list)
 
-    def compute_sdf_gradients(self, points=None, mode="numerical", taps=4, eps=None):
-        """
-        计算 SDF 的梯度和 Hessian 对角元素（用于 Eikonal 和 Curvature Loss）
+    def compute_sdf_gradients(
+        self, points=None, mode="numerical", taps=4, eps=None,
+        compute_hessian=True, hessian_mode="diagonal",
+    ):
+        """Compute pointwise SDF gradients and optional second derivatives.
 
-        Args:
-            points: (N, 3) 查询点坐标，如果为 None 则使用所有顶点
-            mode: "analytical" 使用 autograd，"numerical" 使用数值差分
-            taps: 数值差分的采样点数，4 或 6（仅 mode="numerical" 时有效）
-            eps: 数值差分的步长（世界坐标）
-                 如果为 None，自动计算：eps = scene_scaling / finest_resolution
-                 (参考 Neuralangelo: eps = 1/resolution 在归一化空间)
-
-        Returns:
-            sdf: (N,) SDF 值
-            gradients: (N, 3) 一阶梯度
-            hessian_diag: (N, 3) Hessian 对角元素 [∂²f/∂x², ∂²f/∂y², ∂²f/∂z²]
+        Analytical diagonal returns [f_xx, f_yy, f_zz].
+        legacy_row_sum reproduces Neuralangelo's analytical H @ ones
+        for controlled ablations; it is not a Hessian diagonal.
+        Numerical formulas and world-space epsilon retain their old behavior:
+        six taps returns the diagonal, four taps returns trace / 3 repeated.
+        compute_hessian=False skips second derivatives for Eikonal-only
+        callers. Analytical evaluation continues to return detached gradients
+        and no Hessian, as before.
         """
         if points is None:
             points = self.vertices
 
-        # 自动计算 eps (参考 Neuralangelo)
-        # Neuralangelo: eps = 1/resolution 在归一化空间
-        # 转换到世界坐标：eps_world = eps_normalized * scene_scaling
+        if hessian_mode not in ("diagonal", "legacy_row_sum"):
+            raise ValueError(f"unknown hessian_mode: {hessian_mode}")
+        if mode == "analytical":
+            return self._compute_gradients_analytical(
+                points, compute_hessian=compute_hessian, hessian_mode=hessian_mode
+            )
+
+        # Preserve the existing world-space finite-difference scale.
         if eps is None:
             finest_resolution = self.backbone.base_resolution * (
                 self.backbone.per_level_scale ** (self.backbone.L - 1)
             )
             eps = float(self.scene_scaling) / finest_resolution
 
-        if mode == "analytical":
-            return self._compute_gradients_analytical(points)
-        elif mode == "numerical":
+        if mode == "numerical":
             if taps == 6:
-                return self._compute_gradients_numerical_6(points, eps)
-            elif taps == 4:
-                return self._compute_gradients_numerical_4(points, eps)
-            else:
-                raise ValueError(f"taps must be 4 or 6, got {taps}")
-        else:
-            raise ValueError(f"mode must be 'analytical' or 'numerical', got {mode}")
+                return self._compute_gradients_numerical_6(
+                    points, eps, compute_hessian=compute_hessian
+                )
+            if taps == 4:
+                return self._compute_gradients_numerical_4(
+                    points, eps, compute_hessian=compute_hessian
+                )
+            raise ValueError(f"taps must be 4 or 6, got {taps}")
+        raise ValueError(f"mode must be 'analytical' or 'numerical', got {mode}")
 
-    def _compute_gradients_analytical(self, points):
-        """解析梯度：使用 autograd"""
-        requires_grad = points.requires_grad
+    def _compute_gradients_analytical(
+        self, points, compute_hessian=True, hessian_mode="diagonal",
+    ):
+        """Differentiate each first derivative along its matching coordinate."""
+        if hessian_mode not in ("diagonal", "legacy_row_sum"):
+            raise ValueError(f"unknown hessian_mode: {hessian_mode}")
         with torch.enable_grad():
-            points = points.detach().requires_grad_(True)
-            sdf = self.query_vert_sdf(points)
-
-            # 一阶梯度
-            gradients = torch.autograd.grad(
-                sdf.sum(), points, create_graph=self.training
-            )[0]
-
-            # 二阶梯度 (Hessian 对角元素)
-            if self.training:
-                hessian_diag = torch.autograd.grad(
-                    gradients.sum(), points, create_graph=True
+            # Do not change the caller's requires_grad flag or vertex graph.
+            query_points = points.detach().requires_grad_(True)
+            sdf = self.query_vert_sdf(query_points)
+            if sdf.requires_grad:
+                gradients = torch.autograd.grad(
+                    sdf.sum(), query_points, create_graph=self.training,
+                    allow_unused=True,
                 )[0]
             else:
-                hessian_diag = None
-                gradients = gradients.detach()
+                gradients = None
+            if gradients is None:
+                gradients = query_points * 0.0 + sdf.unsqueeze(-1) * 0.0
 
-        points.requires_grad_(requires_grad)
-        return sdf.detach() if not self.training else sdf, gradients, hessian_diag
+            hessian_diag = None
+            if self.training and compute_hessian:
+                # Zero curvature for affine/constant components must also be
+                # safe to backpropagate through when parameters are present.
+                zero = gradients * 0.0 + sdf.unsqueeze(-1) * 0.0
 
-    def _compute_gradients_numerical_6(self, points, eps):
+                def second_derivative(component):
+                    if not component.requires_grad:
+                        return None
+                    return torch.autograd.grad(
+                        component.sum(), query_points, create_graph=True,
+                        retain_graph=True, allow_unused=True,
+                    )[0]
+
+                if hessian_mode == "legacy_row_sum":
+                    row_sum = second_derivative(gradients.sum(dim=-1))
+                    hessian_diag = zero if row_sum is None else row_sum + zero
+                else:
+                    diagonal = []
+                    for axis in range(query_points.shape[-1]):
+                        row = second_derivative(gradients[..., axis])
+                        entry = zero[..., axis] if row is None else row[..., axis] + zero[..., axis]
+                        diagonal.append(entry)
+                    hessian_diag = torch.stack(diagonal, dim=-1)
+
+            if not self.training:
+                return sdf.detach(), gradients.detach(), None
+            return sdf, gradients, hessian_diag
+
+    def _compute_gradients_numerical_6(self, points, eps, compute_hessian=True):
         """数值梯度：6点采样（中心差分）"""
         device = points.device
         dtype = points.dtype
@@ -1008,15 +1081,17 @@ class Model(BaseModel):
         gradient_z = (sdf_z_pos - sdf_z_neg) / (2 * eps)
         gradients = torch.stack([gradient_x, gradient_y, gradient_z], dim=-1)  # (N, 3)
 
-        # 二阶梯度（Hessian 对角元素）
-        hessian_xx = (sdf_x_pos + sdf_x_neg - 2 * sdf) / (eps ** 2)
-        hessian_yy = (sdf_y_pos + sdf_y_neg - 2 * sdf) / (eps ** 2)
-        hessian_zz = (sdf_z_pos + sdf_z_neg - 2 * sdf) / (eps ** 2)
-        hessian_diag = torch.stack([hessian_xx, hessian_yy, hessian_zz], dim=-1)  # (N, 3)
+        hessian_diag = None
+        if compute_hessian:
+            # Six taps estimates each diagonal element independently.
+            hessian_xx = (sdf_x_pos + sdf_x_neg - 2 * sdf) / (eps ** 2)
+            hessian_yy = (sdf_y_pos + sdf_y_neg - 2 * sdf) / (eps ** 2)
+            hessian_zz = (sdf_z_pos + sdf_z_neg - 2 * sdf) / (eps ** 2)
+            hessian_diag = torch.stack([hessian_xx, hessian_yy, hessian_zz], dim=-1)
 
         return sdf, gradients, hessian_diag
 
-    def _compute_gradients_numerical_4(self, points, eps):
+    def _compute_gradients_numerical_4(self, points, eps, compute_hessian=True):
         """数值梯度：4点采样（四面体采样）"""
         device = points.device
         dtype = points.dtype
@@ -1049,10 +1124,12 @@ class Model(BaseModel):
                      k3_norm * sdf3.unsqueeze(-1) +
                      k4_norm * sdf4.unsqueeze(-1)) / (4.0 * eps_adj)  # (N, 3)
 
-        # 二阶梯度（Hessian 对角元素的近似）
-        # 4点采样只能得到 Laplacian 的近似，假设各向同性
-        hessian_trace = ((sdf1 + sdf2 + sdf3 + sdf4) / 2.0 - 2 * sdf) / (eps_adj ** 2)
-        hessian_diag = torch.stack([hessian_trace, hessian_trace, hessian_trace], dim=-1) / 3.0  # (N, 3)
+        hessian_diag = None
+        if compute_hessian:
+            # Four taps only estimates the trace; these are not individual
+            # diagonal entries. Preserve Neuralangelo's trace / 3 convention.
+            hessian_trace = ((sdf1 + sdf2 + sdf3 + sdf4) / 2.0 - 2 * sdf) / (eps_adj ** 2)
+            hessian_diag = torch.stack([hessian_trace, hessian_trace, hessian_trace], dim=-1) / 3.0
 
         return sdf, gradients, hessian_diag
 
@@ -1131,62 +1208,44 @@ class Model(BaseModel):
             alpha_threshold: NeuS alpha 阈值，如果四面体最大可能 alpha < threshold，则裁剪
                             设为 0 禁用此裁剪
         """
-        # [EDGE-CACHE] 清除边缓存
-        self._cached_internal_edges = None
+        if not 0 <= sdf_eps < 0.5 or not 0 <= alpha_threshold <= 1:
+            raise ValueError("Invalid triangulation culling thresholds")
         torch.cuda.empty_cache()
         verts = self.vertices
-        if high_precision:
-            indices_np = Delaunay(verts.detach().cpu().numpy()).simplices.astype(np.int32)
-        else:
-            v = Del(verts.shape[0])
-            indices_np, prev = v.compute(verts.detach().cpu().double())
-            indices_np = indices_np.numpy()
-            indices_np = indices_np[(indices_np < verts.shape[0]).all(axis=1)]
-            del prev
-
-        # Ensure volume is positive
-        indices = torch.as_tensor(indices_np).cuda()
-        vols = topo_utils.tet_volumes(verts[indices])
-        reverse_mask = vols < 0
-        if reverse_mask.sum() > 0:
-            indices[reverse_mask] = indices[reverse_mask][:, [1, 0, 2, 3]]
-
-        # [SDF-MODIFICATION] 使用 NeuS 风格的裁剪逻辑
-        self.indices = indices
+        points = verts.detach().cpu().double().numpy()
+        indices_np, metadata = self._triangulation.compute(
+            points, high_precision=high_precision, context=self.triangulation_context)
+        # Orientation and geometry have already been checked with float64 source coordinates.
+        indices = torch.as_tensor(indices_np, device=verts.device)
+        mask = None
         if sdf_eps > 0 or alpha_threshold > 0:
-            # 获取所有顶点的 SDF
-            vert_sdf = self.query_vert_sdf()  # (M,)
-
-            # 获取每个四面体 4 个顶点的 SDF
-            tet_vert_sdf = vert_sdf[indices.long()]  # (N, 4)
-
-            # 条件1: 基于 CDF 贡献阈值 ε 计算动态 SDF 阈值
-            # k = ln((1-ε)/ε)，当 |sdf| * inv_s > k 时，CDF 贡献 < ε
-            # 真正的 SDF 阈值 = k / inv_s
+            vert_sdf = self.query_vert_sdf()
+            tet_vert_sdf = vert_sdf[indices.long()]
             if sdf_eps > 0:
                 inv_s = self.backbone.inv_s
-                k = math.log((1 - sdf_eps) / sdf_eps)  # 从 ε 计算 k
-                sdf_threshold = k / inv_s  # 动态计算真正的 SDF 阈值
-                tet_min_abs_sdf = tet_vert_sdf.abs().min(dim=1)[0]  # (N,)
-                sdf_mask = tet_min_abs_sdf < sdf_threshold  # 保留靠近表面的
+                k = math.log((1 - sdf_eps) / sdf_eps)
+                sdf_threshold = k / inv_s
+                sdf_mask = tet_vert_sdf.abs().min(dim=1)[0] < sdf_threshold
             else:
-                sdf_mask = torch.zeros(indices.shape[0], dtype=torch.bool, device=indices.device)
-
-            # 条件2: NeuS alpha 阈值
+                sdf_mask = torch.zeros(len(indices), dtype=torch.bool, device=indices.device)
             if alpha_threshold > 0:
-                tet_alpha = self.calc_tet_alpha()  # 使用新的 NeuS alpha 计算
-                alpha_mask = tet_alpha > alpha_threshold  # 保留有贡献的
+                tet_alpha = self.calc_tet_alpha(indices=indices, vert_sdf=vert_sdf)
+                alpha_mask = tet_alpha > alpha_threshold
             else:
-                alpha_mask = torch.ones(indices.shape[0], dtype=torch.bool, device=indices.device)
-
-            # 两个条件取并集 (只要满足其一就保留)
+                alpha_mask = torch.ones(len(indices), dtype=torch.bool, device=indices.device)
             mask = sdf_mask | alpha_mask
-            self.empty_indices = self.indices[~mask]
-            self.indices = self.indices[mask]
-            self.mask = mask
+            empty_indices = indices[~mask]
+            kept_indices = indices[mask]
         else:
-            self.empty_indices = torch.empty((0, 4), dtype=self.indices.dtype, device='cuda')
-
+            empty_indices = torch.empty((0, 4), dtype=indices.dtype, device=indices.device)
+            kept_indices = indices
+        # Do not publish a candidate topology until validation and field culling both succeed.
+        self.indices = kept_indices
+        self.empty_indices = empty_indices
+        if mask is not None:
+            self.mask = mask
+        self._cached_internal_edges = None
+        self.triangulation_last_metadata = metadata
         torch.cuda.empty_cache()
 
     def __len__(self):
@@ -1297,6 +1356,9 @@ class TetOptimizer:
                  densify_interval: int = 500,
                  densify_end: int = 15000,
                  midpoint: int = 2000,
+                 lr_horizon: int = 0,
+                 lr_mode: str = "legacy_spiking",
+                 lr_peak_start: int = -1,
 
                  percent_alpha: float = 0.02,
 
@@ -1328,6 +1390,10 @@ class TetOptimizer:
             {"params": [model.contracted_vertices], "lr": self.vert_lr_multi*vertices_lr, "name": "contracted_vertices"},
         ])
         self.model = model
+        self.lr_policy = resolve_optimizer_lr(
+            freeze_start, lr_horizon, lr_mode, lr_peak_start, midpoint)
+        effective_lr_horizon = self.lr_policy["effective_lr_horizon"]
+        effective_peak_start = self.lr_policy["effective_lr_peak_start"]
         self.vertex_rgbs_param_grad = None
         self.vertex_grad = None
 
@@ -1341,11 +1407,11 @@ class TetOptimizer:
                                                 lr_final=final_network_lr,
                                                 lr_delay_mult=1e-8,
                                                 lr_delay_steps=lr_delay,
-                                                max_steps=freeze_start)
+                                                max_steps=effective_lr_horizon)
 
         self.net_scheduler_args = SpikingLR(
-            spike_duration, freeze_start, base_net_scheduler,
-            midpoint, densify_interval, densify_end,
+            spike_duration, effective_lr_horizon, base_net_scheduler,
+            effective_peak_start, densify_interval, densify_end,
             network_lr, network_lr)
             # network_lr, final_network_lr)
 
@@ -1353,11 +1419,11 @@ class TetOptimizer:
                                                 lr_final=final_encoding_lr,
                                                 lr_delay_mult=1e-8,
                                                 lr_delay_steps=lr_delay,
-                                                max_steps=freeze_start)
+                                                max_steps=effective_lr_horizon)
 
         self.encoder_scheduler_args = SpikingLR(
-            spike_duration, freeze_start, base_encoder_scheduler,
-            midpoint, densify_interval, densify_end,
+            spike_duration, effective_lr_horizon, base_encoder_scheduler,
+            effective_peak_start, densify_interval, densify_end,
             # encoding_lr, encoding_lr)
             encoding_lr, encoding_lr)
 
@@ -1366,15 +1432,19 @@ class TetOptimizer:
         base_vertex_scheduler = get_expon_lr_func(lr_init=self.vertices_lr,
                                                 lr_final=self.final_vertices_lr,
                                                 lr_delay_mult=vertices_lr_delay_multi,
-                                                max_steps=freeze_start,
+                                                max_steps=effective_lr_horizon,
                                                 lr_delay_steps=vert_lr_delay)
 
         self.vertex_scheduler_args = base_vertex_scheduler
         self.vertex_scheduler_args = SpikingLR(
-            spike_duration, freeze_start, base_vertex_scheduler,
-            midpoint, densify_interval, densify_end,
+            spike_duration, effective_lr_horizon, base_vertex_scheduler,
+            effective_peak_start, densify_interval, densify_end,
             # self.vertices_lr, self.final_vertices_lr)
             self.vertices_lr, self.vertices_lr)
+        if lr_mode == "exponential":
+            self.net_scheduler_args = base_net_scheduler
+            self.encoder_scheduler_args = base_encoder_scheduler
+            self.vertex_scheduler_args = base_vertex_scheduler
         self.iteration = 0
 
     def update_learning_rate(self, iteration):
@@ -1399,12 +1469,14 @@ class TetOptimizer:
                 param_group['lr'] = lr
 
     def add_points(self, new_verts: torch.Tensor, raw_verts=False):
+        self.model.triangulation_context = {**self.model.triangulation_context, "event": "densify"}
         self.model.contracted_vertices = self.vertex_optim.cat_tensors_to_optimizer(dict(
             contracted_vertices = new_verts
         ))['contracted_vertices']
         self.model.update_triangulation()
 
     def remove_points(self, keep_mask: torch.Tensor):
+        self.model.triangulation_context = {**self.model.triangulation_context, "event": "prune"}
         keep_mask = keep_mask[:self.model.contracted_vertices.shape[0]]
         self.model.contracted_vertices = self.vertex_optim.prune_optimizer(keep_mask)['contracted_vertices']
         self.model.update_triangulation()

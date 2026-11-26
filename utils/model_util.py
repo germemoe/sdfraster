@@ -5,6 +5,9 @@ from icecream import ic
 
 from utils.safe_math import safe_exp, safe_div, safe_sqrt
 from utils.eval_sh_py import eval_sh
+from utils.eikonal_sampling import (validate_eikonal_sampling_mode,
+                                    validate_eikonal_sampling_configuration,
+                                    uniform_candidate_indices)
 from utils.topo_utils import calculate_circumcenters_torch
 
 def RGB2SH(rgb):
@@ -160,7 +163,8 @@ def curvature_loss(hessian_diag: torch.Tensor, mask: torch.Tensor = None) -> tor
         return laplacian.mean()
 
 
-def sample_eikonal_points(model, num_samples: int = 50000, band: float = 0.1, use_tet_sampling: bool = True):
+def sample_eikonal_points(model, num_samples: int = 50000, band: float = 0.1, use_tet_sampling: bool = True,
+                          *, sampling_mode="nearest_abs_sdf", seed=None, step=None):
     """
     采样 Eikonal loss 计算点
 
@@ -174,7 +178,9 @@ def sample_eikonal_points(model, num_samples: int = 50000, band: float = 0.1, us
         model: Model 实例
         num_samples: 目标总采样点数
         band: SDF band 阈值（世界坐标），None 表示使用所有内部顶点
-        use_tet_sampling: 当候选点不足时，是否在邻域内采样补足
+        use_tet_sampling: 当候选点不足时，是否在邻域内采样补足（uniform必须False）
+        sampling_mode: nearest_abs_sdf保留原策略；uniform在同候选池均匀无放回
+        seed/step: uniform绑定的训练seed和本次run零基iteration，不消费全局RNG
 
     Returns:
         all_points: (M, 3) 采样点坐标
@@ -182,6 +188,15 @@ def sample_eikonal_points(model, num_samples: int = 50000, band: float = 0.1, us
         num_band: band 内顶点数（原始候选点数）
         num_tet_samples: 邻域内额外采样点数
     """
+    validate_eikonal_sampling_mode(sampling_mode)
+    if sampling_mode == "uniform":
+        validate_eikonal_sampling_configuration({
+            "eikonal_sampling_mode": sampling_mode, "seed": seed,
+            "num_eikonal_samples": num_samples, "eikonal_tet_sampling": use_tet_sampling,
+        })
+        # Validate a bound step even when no candidates will be returned.
+        from utils.eikonal_sampling import uniform_step_seed
+        uniform_step_seed(seed, step)
     device = model.device
 
     # 1. 只在内部顶点上操作（排除 ext_vertices）
@@ -200,6 +215,10 @@ def sample_eikonal_points(model, num_samples: int = 50000, band: float = 0.1, us
         candidate_indices = torch.arange(num_internal, device=device)
 
     num_candidates = candidate_indices.shape[0]
+
+    if sampling_mode == "uniform":
+        selected_indices = uniform_candidate_indices(candidate_indices, num_samples, seed, step)
+        return internal_verts[selected_indices], selected_indices, selected_indices.numel(), 0
 
     # 3. 根据候选点数量决定策略
     if num_candidates >= num_samples:

@@ -232,7 +232,7 @@ class MeshRegularizer(nn.Module):
 
         return normals_view, valid_mask, mesh_depth
 
-    def compute_gaussian_normal(self, depth_map, camera):
+    def compute_gaussian_normal(self, depth_map, camera, pixel_offsets=None):
         """Compute normal from Gaussian-rendered depth map.
 
         Args:
@@ -242,7 +242,7 @@ class MeshRegularizer(nn.Module):
         Returns:
             normal_map: (3, H, W) normal map in view space
         """
-        return depth_to_normal(camera, depth_map)
+        return depth_to_normal(camera, depth_map, pixel_offsets=pixel_offsets)
 
     def compute_normal_consistency_loss(
         self,
@@ -528,6 +528,7 @@ class MeshRegularizer(nn.Module):
         iteration: int = None,
         gt_mask: torch.Tensor = None,  # GT alpha mask，排除背景散乱法线
         train_cameras = None,
+        pixel_offsets = None,  # Original Gaussian render jitter; mesh raster stays centered.
     ) -> dict:
         """Compute mesh regularization losses.
 
@@ -545,6 +546,7 @@ class MeshRegularizer(nn.Module):
             iteration: Current training iteration (for scheduling)
             gt_mask: (H, W) or (1, H, W) GT alpha mask，背景为0前景为1
             train_cameras: List of all training cameras (for occupancy labels loss)
+            pixel_offsets: Optional (H, W, 2) actual Gaussian-render ray offsets
 
         Returns:
             dict with:
@@ -601,10 +603,10 @@ class MeshRegularizer(nn.Module):
             computed_gaussian_normal = gn_view.permute(2, 0, 1)  # (3, H, W)
         elif normal_source == "depth_med" and gaussian_depth_med is not None:
             # 使用中位深度推导法线
-            computed_gaussian_normal = self.compute_gaussian_normal(gaussian_depth_med, camera)
+            computed_gaussian_normal = self.compute_gaussian_normal(gaussian_depth_med, camera, pixel_offsets=pixel_offsets)
         else:
             # 默认：使用期望深度推导法线
-            computed_gaussian_normal = self.compute_gaussian_normal(gaussian_depth, camera)
+            computed_gaussian_normal = self.compute_gaussian_normal(gaussian_depth, camera, pixel_offsets=pixel_offsets)
 
         # Build combined mask
         H, W = gaussian_depth.shape

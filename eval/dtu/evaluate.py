@@ -313,6 +313,10 @@ def evaluate_dtu_mesh(
     dilation_radius=6,
     dataset_path=None,
     model_output_path=None,
+    seed=None,
+    downsample_method="batch",
+    cpu_workers=None,
+    write_visualizations=True,
 ):
     """
     完整的DTU mesh评估流程。
@@ -338,11 +342,14 @@ def evaluate_dtu_mesh(
         dilation_radius: mask膨胀半径
         dataset_path: 数据集路径（包含 cameras.npz），用于 scale_mat
         model_output_path: 模型输出目录（包含 transform.txt），用于 PCA 变换
+        cpu_workers: 采样和近邻 worker 上限；None 保留原自动 worker 行为
 
     Returns:
         评估结果字典
     """
     from eval.dtu.eval_core import evaluate_mesh as eval_core
+    if type(write_visualizations) is not bool:
+        raise TypeError("write_visualizations must be a bool")
 
     if output_dir is None:
         output_dir = os.path.dirname(mesh_path)
@@ -357,10 +364,12 @@ def evaluate_dtu_mesh(
     if cull:
         print(f"[DTU-EVAL] Culling mesh (dilation={dilation_radius})...")
         mesh = cull_mesh(train_cameras, mesh, dilation_radius=dilation_radius)
-        culled_path = os.path.join(output_dir, "mesh_culled.ply")
-        mesh.export(culled_path)
+        if write_visualizations:
+            culled_path = os.path.join(output_dir, "mesh_culled.ply")
+            mesh.export(culled_path)
         print(f"    After cull: {len(mesh.vertices)} verts, {len(mesh.faces)} faces")
-        print(f"    Saved: {culled_path}")
+        if write_visualizations:
+            print(f"    Saved: {culled_path}")
 
     # 加载变换矩阵
     pca_transform = None
@@ -419,11 +428,19 @@ def evaluate_dtu_mesh(
         mesh_path=aligned_path,
         scan_id=scan_id,
         dataset_dir=dtu_path,
-        vis_out_dir=vis_dir,
+        vis_out_dir=vis_dir if write_visualizations else None,
+        seed=seed,
+        downsample_method=downsample_method,
+        cpu_workers=cpu_workers,
     )
 
     # 保存结果
     import json
+    if not write_visualizations:
+        # Core None suppresses its small legacy JSON too; preserve that JSON.
+        os.makedirs(vis_dir, exist_ok=True)
+        with open(f'{vis_dir}/results.json', 'w') as fp:
+            json.dump(results, fp, indent=2)
     results_path = os.path.join(output_dir, "results.json")
     with open(results_path, 'w') as f:
         json.dump(results, f, indent=2)

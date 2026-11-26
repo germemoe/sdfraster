@@ -6,6 +6,7 @@ Adapted from MILo project.
 from typing import List, Union, Optional
 import torch
 import torch.nn as nn
+from utils.mesh_normal_gather import gather_face_normals_compact
 
 try:
     import nvdiffrast.torch as dr
@@ -382,8 +383,8 @@ class MeshRenderer(nn.Module):
                 fragments.pix_to_face = torch.clamp(fragments.pix_to_face, min=0, max=mesh.faces.shape[0] - 1)
                 valid_mask = valid_mask & ~error_mask
             # normals: (H, W, 3), valid_mask: (H, W) -> (H, W, 1) for broadcast
-            normals = mesh.face_normals[fragments.pix_to_face.squeeze()]  # (H, W, 3)
-            output_pkg["normals"] = normals * valid_mask.squeeze()[..., None]  # (H, W, 3)
+            output_pkg["normals"] = gather_face_normals_compact(
+                mesh.face_normals, fragments.pix_to_face.squeeze(), valid_mask.squeeze())
 
         if return_pix_to_face:
             output_pkg["pix_to_face"] = fragments.pix_to_face

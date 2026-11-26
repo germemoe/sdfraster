@@ -136,6 +136,10 @@ def psnr(img1, img2):
     return 20 * torch.log10(1.0 / torch.sqrt(mse))
 
 def evaluate_and_save(model, splits, output_path, tile_size, min_t):
+    splits = [(split, cameras) for split, cameras in splits if len(cameras) > 0]
+    if not splits:
+        print("[IMAGE-EVAL] No evaluation cameras; skipping image metrics.")
+        return {}
     gt_path = os.path.join(output_path, "images", "gt")
     pred_path = os.path.join(output_path, "images", "pred")
     os.makedirs(gt_path, exist_ok=True)

@@ -87,7 +87,7 @@ class BaseModel(nn.Module):
         return vertex_density
 
     # [SDF-MODIFICATION] 基于 NeuS 公式计算四面体的最大可能 alpha
-    def calc_tet_alpha(self, inv_s=None, **kwargs):
+    def calc_tet_alpha(self, inv_s=None, indices=None, vert_sdf=None, **kwargs):
         """
         基于 NeuS 公式计算四面体的最大可能 alpha 贡献
 
@@ -103,10 +103,13 @@ class BaseModel(nn.Module):
             inv_s = self.backbone.inv_s
 
         # 获取所有顶点的 SDF
-        vert_sdf = self.query_vert_sdf()  # (M,)
+        if vert_sdf is None:
+            vert_sdf = self.query_vert_sdf()  # (M,)
+        if indices is None:
+            indices = self.indices
 
         # 获取每个四面体 4 个顶点的 SDF
-        tet_vert_sdf = vert_sdf[self.indices.long()]  # (N, 4)
+        tet_vert_sdf = vert_sdf[indices.long()]  # (N, 4)
 
         sdf_max = tet_vert_sdf.max(dim=1)[0]  # (N,)
         sdf_min = tet_vert_sdf.min(dim=1)[0]  # (N,)

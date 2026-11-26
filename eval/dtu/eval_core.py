@@ -38,6 +38,42 @@ def write_vis_pcd(file, points, colors):
     o3d.io.write_point_cloud(file, pcd)
 
 
+def _nn_jobs_for_workers(cpu_workers):
+    """None preserves the legacy automatic Pool/all-core NN behavior."""
+    if cpu_workers is not None and (isinstance(cpu_workers, bool) or
+            not isinstance(cpu_workers, int) or cpu_workers < 1):
+        raise ValueError("cpu_workers must be a positive integer or None")
+    return -1 if cpu_workers is None else cpu_workers
+
+
+def greedy_radius_downsample_mask(points, radius, method="batch", cpu_workers=None):
+    """Preserve shuffled greedy selection; skip queries for already-removed rows."""
+    nn_jobs = _nn_jobs_for_workers(cpu_workers)
+    if method not in ("batch", "streaming"):
+        raise ValueError(f"Unknown downsample method: {method}")
+    mask = np.ones(points.shape[0], dtype=np.bool_)
+    if method == "batch":
+        engine = skln.NearestNeighbors(n_neighbors=1, radius=radius,
+                                      algorithm="kd_tree", n_jobs=nn_jobs)
+        engine.fit(points)
+        neighbors = engine.radius_neighbors(points, radius=radius, return_distance=False)
+        for curr, idxs in enumerate(neighbors):
+            if not mask[curr]:
+                continue
+            mask[idxs] = False
+            mask[curr] = True
+    else:
+        tree = skln.KDTree(points)
+        for curr in range(len(points)):
+            if not mask[curr]:
+                continue
+            idxs = tree.query_radius(points[curr:curr+1], r=radius,
+                                     return_distance=False)[0]
+            mask[idxs] = False
+            mask[curr] = True
+    return mask
+
+
 def evaluate_mesh(
     mesh_path: str,
     scan_id: int,
@@ -47,6 +83,9 @@ def evaluate_mesh(
     patch_size: float = 60,
     max_dist: float = 20,
     visualize_threshold: float = 10,
+    seed: int = None,
+    downsample_method: str = "batch",
+    cpu_workers: int = None,
 ):
     """
     Evaluate mesh against DTU ground truth.
@@ -60,10 +99,12 @@ def evaluate_mesh(
         patch_size: Bounding box patch size
         max_dist: Maximum distance for evaluation
         visualize_threshold: Threshold for visualization
+        cpu_workers: Positive sampling/NN worker limit; None preserves legacy automatic workers
 
     Returns:
         dict with 'mean_d2s', 'mean_s2d', 'overall' metrics
     """
+    nn_jobs = _nn_jobs_for_workers(cpu_workers)
     mp.freeze_support()
 
     thresh = downsample_density
@@ -96,7 +137,7 @@ def evaluate_mesh(
     n1 = np.floor(l1 / thr)
     n2 = np.floor(l2 / thr)
 
-    with mp.Pool() as mp_pool:
+    with mp.Pool(processes=cpu_workers) as mp_pool:
         new_pts = mp_pool.map(
             sample_single_tri,
             ((n1[i, 0], n2[i, 0], v1[i:i+1], v2[i:i+1], tri_vert[i:i+1, 0]) for i in range(len(n1))),
@@ -108,19 +149,13 @@ def evaluate_mesh(
 
     pbar.update(1)
     pbar.set_description('random shuffle pcd index')
-    shuffle_rng = np.random.default_rng()
+    shuffle_rng = np.random.default_rng(seed)
     shuffle_rng.shuffle(data_pcd, axis=0)
 
     pbar.update(1)
     pbar.set_description('downsample pcd')
-    nn_engine = skln.NearestNeighbors(n_neighbors=1, radius=thresh, algorithm='kd_tree', n_jobs=-1)
-    nn_engine.fit(data_pcd)
-    rnn_idxs = nn_engine.radius_neighbors(data_pcd, radius=thresh, return_distance=False)
-    mask = np.ones(data_pcd.shape[0], dtype=np.bool_)
-    for curr, idxs in enumerate(rnn_idxs):
-        if mask[curr]:
-            mask[idxs] = 0
-            mask[curr] = 1
+    nn_engine = skln.NearestNeighbors(n_neighbors=1, radius=thresh, algorithm='kd_tree', n_jobs=nn_jobs)
+    mask = greedy_radius_downsample_mask(data_pcd, thresh, downsample_method, cpu_workers=cpu_workers)
     data_down = data_pcd[mask]
 
     pbar.update(1)
@@ -194,6 +229,10 @@ def evaluate_mesh(
         'mean_d2s': float(mean_d2s),
         'mean_s2d': float(mean_s2d),
         'overall': float(over_all),
+        'downsample_seed': seed,
+        'downsample_method': downsample_method,
+        'cpu_workers': cpu_workers,
+        'nn_jobs': nn_jobs,
     }
 
     if vis_out_dir is not None:
@@ -214,6 +253,10 @@ if __name__ == '__main__':
     parser.add_argument('--patch_size', type=float, default=60)
     parser.add_argument('--max_dist', type=float, default=20)
     parser.add_argument('--visualize_threshold', type=float, default=10)
+    parser.add_argument('--seed', type=int, default=52)
+    parser.add_argument('--downsample-method', choices=('batch', 'streaming'), default='batch')
+    parser.add_argument('--cpu-workers', type=int, default=14,
+                        help='Positive worker limit for mesh sampling and NN queries (default: 14)')
     args = parser.parse_args()
 
     evaluate_mesh(
@@ -225,4 +268,7 @@ if __name__ == '__main__':
         patch_size=args.patch_size,
         max_dist=args.max_dist,
         visualize_threshold=args.visualize_threshold,
+        seed=args.seed,
+        downsample_method=args.downsample_method,
+        cpu_workers=args.cpu_workers,
     )

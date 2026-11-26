@@ -14,10 +14,11 @@ class AlphaBlendTiledRender(torch.autograd.Function):
                 # [SDF-MODIFICATION] NeuS 渲染新增参数
                 vert_sdf,  # (M,) 全局顶点SDF
                 inv_s_tensor,     # (1,) tensor, exp(s_var) for NeuS alpha (可微)
-                tcam, ray_jitter, device="cuda") -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                tcam, ray_jitter, device="cuda", tet_normal_mode="raw") -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # === [DENSITY-RELATED] 原密度代码签名 (已注释) ===
         # indices, vertices, tet_density, render_grid, tcam, ray_jitter
         # === [DENSITY-RELATED] 原密度代码结束 ===
+        ctx.tet_normal_mode = tet_normal_mode
         distortion_img = torch.zeros((render_grid.image_height,
                                   render_grid.image_width, 5),
                                  device=device)
@@ -51,7 +52,8 @@ class AlphaBlendTiledRender(torch.autograd.Function):
         if inv_s_tensor.dim() == 0:
             inv_s_tensor = inv_s_tensor.unsqueeze(0)
 
-        alpha_blend_tile_shader = slang_modules.alpha_blend_shaders_interp[(render_grid.tile_height, render_grid.tile_width)]
+        alpha_blend_tile_shader = slang_modules.get_alpha_blend_shader_interp(
+            render_grid.tile_height, render_grid.tile_width, ctx.tet_normal_mode)
         st = time.time()
         splat_kernel_with_args = alpha_blend_tile_shader.splat_tiled(
             sorted_gauss_idx=sorted_tetra_idx,
@@ -119,7 +121,8 @@ class AlphaBlendTiledRender(torch.autograd.Function):
             f' {slang_modules.alpha_blend_shaders_interp.keys()}'
         )
 
-        alpha_blend_tile_shader = slang_modules.alpha_blend_shaders_interp[(render_grid.tile_height, render_grid.tile_width)]
+        alpha_blend_tile_shader = slang_modules.get_alpha_blend_shader_interp(
+            render_grid.tile_height, render_grid.tile_width, ctx.tet_normal_mode)
 
         tet_alive = torch.zeros((indices.shape[0]), dtype=bool, device=vertices.device)
         st = time.time()
@@ -153,4 +156,4 @@ class AlphaBlendTiledRender(torch.autograd.Function):
         # 顺序: sorted_tetra_idx, tile_ranges, indices, vertices, tet_sdf, render_grid, vert_sdf, inv_s_tensor, tcam, ray_jitter, device
         # inv_s_tensor 现在是可微的，返回其梯度
         return (None, None, None, vertices_grad, tet_sdf_grad,
-                None, vert_sdf_grad, inv_s_grad, None, None, None)
+                None, vert_sdf_grad, inv_s_grad, None, None, None, None)

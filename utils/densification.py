@@ -6,6 +6,7 @@ from utils import safe_math
 from typing import NamedTuple, List
 from delaunay_rasterization.internal.render_err import render_err
 from icecream import ic
+from utils.densification_budget import split_capacity, select_candidates
 
 
 @torch.no_grad()
@@ -250,6 +251,16 @@ def apply_densification(
     target_addition
 ):
     """Turns accumulated statistics into actual vertex cloning / splitting."""
+    # The fixed external shell counts toward the total vertex budget, but
+    # all split points below are added as internal vertices.
+    capacity = split_capacity(
+        model.vertices.shape[0], args.budget,
+        getattr(args, 'max_split_per_iter', 50000), target_addition,
+    )
+    if capacity == 0:
+        print("[Densification] No split capacity; preserving existing vertices")
+        return
+
     # ---------- Calculate scores from variances ------------------------------
     # 1. Total Variance Score (for growing)
     s0_t, s1_t, s2_t = stats.total_var_moments.T
@@ -275,10 +286,6 @@ def apply_densification(
     keep_verts.scatter_reduce_(dim=0, index=indices[..., 1], src=mask_alive_i, reduce=reduce_type)
     keep_verts.scatter_reduce_(dim=0, index=indices[..., 2], src=mask_alive_i, reduce=reduce_type)
     keep_verts.scatter_reduce_(dim=0, index=indices[..., 3], src=mask_alive_i, reduce=reduce_type)
-
-    target_addition = int(min(target_addition, stats.tet_view_count.shape[0]))
-    if target_addition < 0:
-        return
 
 
     total_mask = torch.zeros_like(total_var, dtype=torch.bool)
@@ -323,7 +330,15 @@ def apply_densification(
     within_mask = (within_var > args.within_thresh)
     total_mask = (total_var > args.total_thresh)
     error_driven_mask = within_mask | total_mask
-    n_error_split = error_driven_mask.sum().item()
+    # Error proposals retain their existing priority over the appended SDF
+    # proposals. Under a cap, rank error severity relative to its trigger.
+    error_priority = torch.maximum(
+        within_var / max(float(args.within_thresh), 1e-8),
+        total_var / max(float(args.total_thresh), 1e-8),
+    )
+    error_indices = select_candidates(error_priority, error_driven_mask, capacity)
+    remaining_capacity = capacity - error_indices.numel()
+    n_error_split = error_indices.numel()
 
     # [SDF-DENSIFY] 基于 SDF 的分裂策略
     # 数量 = 当前顶点数 × ratio
@@ -332,7 +347,8 @@ def apply_densification(
     sdf_driven_mask = torch.zeros_like(error_driven_mask, dtype=torch.bool)
     sdf_split_points = None  # 单独存储 SDF 分裂的点位置
 
-    if (hasattr(args, 'sdf_densify_enabled') and args.sdf_densify_enabled
+    if (remaining_capacity > 0
+        and hasattr(args, 'sdf_densify_enabled') and args.sdf_densify_enabled
         and iteration >= getattr(args, 'sdf_densify_start', 5000)
         and iteration <= getattr(args, 'sdf_densify_end', 15000)):
 
@@ -364,8 +380,10 @@ def apply_densification(
                 surface_radii = circumradii.clone()
                 surface_radii[~surface_mask] = -1  # 非表面四面体设为 -1
 
-                n_sdf_split = min(n_sdf_split, surface_mask.sum().item())
-                _, topk_indices = torch.topk(surface_radii, n_sdf_split)
+                n_sdf_split = min(n_sdf_split, remaining_capacity)
+                topk_indices = select_candidates(
+                    surface_radii, surface_mask, n_sdf_split, sort_all=True
+                )
                 sdf_driven_mask[topk_indices] = True
 
                 # 计算分裂点 = 四面体重心
@@ -373,12 +391,12 @@ def apply_densification(
                 sdf_split_points = sdf_tet_vertices.mean(dim=1)  # (K, 3) 重心
 
     # 误差驱动分裂的点位置
-    error_split_point, bad = get_approx_ray_intersections(stats.within_var_rays)
-    error_split_point = error_split_point[error_driven_mask]
-    bad = bad[error_driven_mask]
+    error_split_point, bad = get_approx_ray_intersections(
+        stats.within_var_rays[error_indices]
+    )
 
     # 使用四面体内的随机重心坐标位置作为回退
-    error_clone_indices = model.indices[error_driven_mask]
+    error_clone_indices = model.indices[error_indices]
     if error_clone_indices.shape[0] > 0:
         barycentric = torch.rand((error_clone_indices.shape[0], 4, 1), device=device).clip(min=0.1, max=0.9)
         barycentric_weights = barycentric / barycentric.sum(dim=1, keepdim=True)
@@ -402,5 +420,6 @@ def apply_densification(
 
     print(
         f"#Grow: {total_mask.sum():4d} #Split: {within_mask.sum():4d} #SDF: {n_sdf_split_actual:4d} "
-        f"#Total: {n_total_split:5d} | Total Avg: {total_var.mean():.4f} Within Avg: {within_var.mean():.4f}"
+        f"#Error: {n_error_split:5d} #Total: {n_total_split:5d}/{capacity} | "
+        f"Total Avg: {total_var.mean():.4f} Within Avg: {within_var.mean():.4f}"
     )

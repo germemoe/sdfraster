@@ -113,7 +113,10 @@ static const bool USE_GRADIENT_SDF = false;
 
 // [NORMAL-MODE] 开关：true = 不归一化四面体梯度（在Python端统一归一化），false = 每个四面体归一化
 // 默认 true，与 svraster 保持一致：不归一化的梯度可以让距离表面较远区域的贡献自然衰减
-static const bool SKIP_GRADIENT_NORMALIZE = true;
+#ifndef SDFRASTER_TET_NORMAL_UNIT
+#define SDFRASTER_TET_NORMAL_UNIT 0
+#endif
+static const bool SKIP_GRADIENT_NORMALIZE = (SDFRASTER_TET_NORMAL_UNIT == 0);
 
 [Differentiable]
 inline CtrlPt integrate_tetra_segment(

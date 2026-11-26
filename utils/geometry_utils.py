@@ -9,12 +9,15 @@ import torch
 import torch.nn.functional as F
 
 
-def depths_to_points(camera, depth_map):
+def depths_to_points(camera, depth_map, pixel_offsets=None):
     """Convert depth map to 3D points in view space.
 
     Args:
         camera: Camera object with fovx, fovy, image_width, image_height
-        depth_map: (H, W) depth values
+        depth_map: (H, W) camera-z depth values
+        pixel_offsets: optional original float32 (H, W, 2) render offsets;
+            channels are (x, y), measured from integer pixel coordinates.
+            None preserves the exact legacy +0.5 path. Offsets are no_diff.
 
     Returns:
         points: (3, H, W) 3D points in view space
@@ -33,12 +36,30 @@ def depths_to_points(camera, depth_map):
         [0., 0., 1.0]
     ], dtype=torch.float32, device=device)
 
-    # Create pixel grid (centered at pixel centers)
-    grid_x, grid_y = torch.meshgrid(
-        torch.arange(W, device=device) + 0.5,
-        torch.arange(H, device=device) + 0.5,
-        indexing='xy'
-    )
+    if pixel_offsets is None:
+        # Exact legacy grid and dtype; no offset validation or new tensor work.
+        grid_x, grid_y = torch.meshgrid(
+            torch.arange(W, device=device) + 0.5,
+            torch.arange(H, device=device) + 0.5,
+            indexing='xy'
+        )
+    else:
+        # Metadata only: production torch.rand already guarantees finite [0, 1).
+        # Do not add GPU all/item/minmax readbacks or clamp/change the offsets.
+        if not isinstance(pixel_offsets, torch.Tensor):
+            raise ValueError("pixel_offsets must be a Tensor or None")
+        if tuple(pixel_offsets.shape) != (H, W, 2):
+            raise ValueError("pixel_offsets must have shape (H, W, 2)")
+        if pixel_offsets.device != device or pixel_offsets.dtype != torch.float32:
+            raise ValueError("pixel_offsets must share the depth device and use float32")
+        grid_x, grid_y = torch.meshgrid(
+            torch.arange(W, device=device),
+            torch.arange(H, device=device),
+            indexing='xy'
+        )
+        offsets = pixel_offsets.detach()  # Slang declares ray jitter no_diff.
+        grid_x = grid_x + offsets[..., 0]
+        grid_y = grid_y + offsets[..., 1]
 
     # Homogeneous pixel coordinates
     points = torch.stack([grid_x, grid_y, torch.ones_like(grid_x)], dim=0).reshape(3, -1)
@@ -80,12 +101,13 @@ def points_to_normal(points):
     return output
 
 
-def depth_to_normal(camera, depth_map):
+def depth_to_normal(camera, depth_map, pixel_offsets=None):
     """Convert depth map to normal map.
 
     Args:
         camera: Camera object
         depth_map: (H, W) or (1, H, W) or (1, 1, H, W) depth values
+        pixel_offsets: optional (H, W, 2) actual renderer offsets, no_diff
 
     Returns:
         normal_map: (3, H, W) surface normals in view space
@@ -96,7 +118,7 @@ def depth_to_normal(camera, depth_map):
     elif depth_map.dim() == 3:
         depth_map = depth_map.squeeze(0)
 
-    points = depths_to_points(camera, depth_map)
+    points = depths_to_points(camera, depth_map, pixel_offsets=pixel_offsets)
     normal = points_to_normal(points)
 
     return normal

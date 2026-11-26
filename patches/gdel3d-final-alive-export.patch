@@ -1,0 +1,115 @@
+--- a/GDelFlipping/src/bindings.cpp
++++ b/GDelFlipping/src/bindings.cpp
+@@ -1,6 +1,8 @@
+ #include <pybind11/pybind11.h>
+ #include <pybind11/numpy.h>
+ #include <torch/extension.h>
++#include <cstring>
++#include <cstdint>
+ 
+ #include "gDel3D/GpuDelaunay.h"
+ #include "DelaunayChecker.h"
+@@ -34,13 +36,63 @@
+     std::cout << "# Final stars  " << std::setw( 10 ) << output.stats.finalStarNum << std::endl; 
+ }
+ 
++// SOURCE-ONLY candidate: output interpretation, not a triangulation change.
++// Single owned CPU allocation; original GDelOutput raw rows are retained.
++static torch::Tensor exportTetRows(const GDelOutput& output, bool finalAliveOnly) {
++    static_assert(sizeof(int) == sizeof(int32_t), "Native Tet int must be int32");
++    const int64_t rawCount = static_cast<int64_t>(output.tetVec.size());
++    int64_t keepCount = rawCount;
++    if (finalAliveOnly) {
++        TORCH_CHECK(output.tetInfoVec.size() == output.tetVec.size(),
++                    "Final tetInfoVec/tetVec row alignment mismatch");
++        keepCount = 0;
++        for (int64_t row = 0; row < rawCount; ++row) {
++            if (isTetAlive(output.tetInfoVec[row])) ++keepCount;
++        }
++    }
++    torch::Tensor rows = torch::empty({keepCount, 4},
++        torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU));
++    int32_t* destination = rows.data_ptr<int32_t>();
++    int64_t written = 0;
++    for (int64_t row = 0; row < rawCount; ++row) {
++        if (!finalAliveOnly || isTetAlive(output.tetInfoVec[row])) {
++            std::memcpy(destination + 4 * written, output.tetVec[row]._v,
++                        4 * sizeof(int32_t));
++            ++written;
++        }
++    }
++    TORCH_CHECK(written == keepCount, "Final tet export count changed");
++    return rows;
++}
++
+ class PyGDelOutput {
+     public:
+         GDelOutput   output; 
++        torch::Tensor getTetInfo() const;
++        torch::Tensor getRawTets() const;
+         bool checkCorrectness(torch::Tensor &points);
+         torch::Tensor computePointImportance(torch::Tensor &points);
+         torch::Tensor getBoundaryTets(torch::Tensor &points);
+ };
++// Read-only diagnostic rows remain the original complete native output.
++torch::Tensor PyGDelOutput::getRawTets() const {
++    return exportTetRows(output, false);
++}
++
++// Diagnostic-only owned CPU copy; aligned with get_raw_tets(), not filtered return.
++torch::Tensor PyGDelOutput::getTetInfo() const {
++    const auto count = static_cast<int64_t>(output.tetInfoVec.size());
++    TORCH_CHECK(count == static_cast<int64_t>(output.tetVec.size()),
++                "tetInfoVec/tetVec row alignment mismatch");
++    torch::Tensor info = torch::empty({count},
++        torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
++    if (count > 0) {
++        std::memcpy(info.data_ptr<uint8_t>(), output.tetInfoVec.data(),
++                    static_cast<std::size_t>(count) * sizeof(char));
++    }
++    return info;
++}
++
+ torch::Tensor PyGDelOutput::getBoundaryTets(torch::Tensor &points) {
+     const Point3* dataPtr = reinterpret_cast<const Point3*>(points.data_ptr());
+     
+@@ -136,12 +188,7 @@
+     timer.stop(); 
+     triangulator._output->stats.totalTime = timer.value(); 
+ 
+-    torch::Tensor output_tensor = torch::from_blob(
+-        reinterpret_cast<int*>(pyOutput.output.tetVec.data()), 
+-        {static_cast<long>(pyOutput.output.tetVec.size()), 4},
+-        torch::TensorOptions().dtype(torch::kInt32)
+-    );
+-    return std::make_tuple(output_tensor.clone(), pyOutput);
++    return std::make_tuple(exportTetRows(pyOutput.output, true), pyOutput);
+ }
+ 
+ std::tuple<torch::Tensor, PyGDelOutput>
+@@ -179,12 +226,7 @@
+     triangulator._output->stats.totalTime = timer.value(); 
+ 
+     // summarize( size, output ); 
+-    torch::Tensor output_tensor = torch::from_blob(
+-        reinterpret_cast<int*>(pyOutput.output.tetVec.data()), 
+-        {static_cast<long>(pyOutput.output.tetVec.size()), 4},
+-        torch::TensorOptions().dtype(torch::kInt32)
+-    );
+-    return std::make_tuple(output_tensor.clone(), pyOutput);
++    return std::make_tuple(exportTetRows(pyOutput.output, true), pyOutput);
+ }
+ 
+ 
+@@ -194,6 +236,11 @@
+     m.doc() = "Python bindings for gdel3d";
+     m.def("get_dtype", []() { return sizeof(RealType) == 8 ? "float64" : "float32"; });
+     py::class_<PyGDelOutput>(m, "DelOutput")
++        .def("get_raw_tets", &PyGDelOutput::getRawTets)
++        .def("get_tet_info", &PyGDelOutput::getTetInfo)
++        .def_property_readonly("failed_vertex_count", [](const PyGDelOutput &self) {
++            return static_cast<int64_t>(self.output.failVertVec.size());
++        })
+         .def("check_correctness", &PyGDelOutput::checkCorrectness)
+         .def("get_boundary_tets", &PyGDelOutput::getBoundaryTets);
+     py::class_<PyGPUDel>(m, "Del")

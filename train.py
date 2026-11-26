@@ -28,6 +28,19 @@ torch.cuda.manual_seed_all(SEED)
 # torch.backends.cudnn.benchmark = False
 
 from utils import cam_util
+from utils.regularization_pairing import validate_regularization_pairing
+from utils.eikonal_sampling import (validate_eikonal_sampling_configuration,
+                                    eikonal_sampling_metadata)
+from utils.depth_normal_coordinates import (validate_depth_normal_coordinate_mode,
+                                            depth_normal_pixel_offsets)
+from utils.training_clocks import (resolve_training_clocks, resolve_checkpoint_milestones,
+                                   resolve_curvature_weight_clock, curvature_weight_factor,
+                                   training_clock_metadata)
+from utils.triangulation_backend import validate_triangulation_configuration
+from utils.delaunay_isolation import is_external_termination
+from utils.curvature_dispatch import (compute_regularization_derivatives,
+                                      resolve_curvature_settings,
+                                      validate_curvature_configuration)
 from utils.train_util import *
 from utils.model_util import eikonal_loss, curvature_loss, sample_eikonal_points, edge_sdf_loss, gradient_tv_loss, gradient_tv_loss_from_sampled, gradient_tv_loss_surface_edges
 # from models.vertex_color import Model, TetOptimizer
@@ -38,7 +51,14 @@ from models.frozen import freeze_model
 from fused_ssim import fused_ssim
 from pathlib import Path, PosixPath
 from utils.args import Args
+from utils.encoding_precision import validate_encoding_precision, reconcile_checkpoint_precision
+from utils.matmul_precision import (configure_float32_matmul_precision,
+                                    validate_float32_matmul_precision,
+                                    checkpoint_float32_matmul_precision,
+                                    reconcile_checkpoint_matmul_precision,
+                                    matmul_precision_state)
 import json
+from argparse import Namespace
 import imageio
 from utils import test_util
 import termplotlib as tpl
@@ -117,6 +137,7 @@ args.eval = False
 args.dataset_path = Path("/optane/nerf_datasets/360/bonsai")
 args.output_path = Path("output/test/")
 args.iterations = 18000
+args.stop_after_steps = 0  # optional cap; planned event and LR clocks are preserved
 args.ckpt = ""
 args.resolution = 1
 args.render_train = False
@@ -129,6 +150,10 @@ args.sh_step = 1
 
 # iNGP Settings
 args.use_tcnn = True  # True: 使用 tiny-cuda-nn (更快), False: 使用 PyTorch 实现
+args.encoding_precision = "float16"  # Native TCNN encoding/output precision; ignored by PyTorch encoding
+args.float32_matmul_precision = "high"  # Legacy TF32-eligible GEMM; highest uses FP32 internals
+args.triangulation_backend = "isolated_native"
+args.triangulation_timeout_seconds = 120.0
 args.use_contraction = True  # True: 使用 Mip-NeRF 360 空间收缩, False: 仅线性归一化 (推荐关闭以正确计算 eikonal)
 args.ext_sdf_fixed = False   # True: 外部点SDF使用固定值（基于距离），False: 通过哈希网格查询
 # [GEOMETRIC-INIT] Neuralangelo 风格的几何初始化
@@ -142,7 +167,7 @@ args.final_network_lr = 1e-4
 args.hidden_dim = 64
 args.scale_multi = 0.35 # chosen such that 96% of the distribution is within the sphere
 args.log2_hashmap_size = 22
-args.per_level_scale = 2
+args.per_level_scale = 2.0
 args.L = 8
 args.hashmap_dim = 8
 args.base_resolution = 64
@@ -153,9 +178,12 @@ args.coarse2fine_init_level = 4   # 初始激活的 hash grid 层数
 args.coarse2fine_step = 3000      # 每隔多少 iteration 增加一层
 
 args.density_offset = -4
-args.lambda_weight_decay = 1
+args.lambda_weight_decay = 1.0
 args.percent_alpha = 0.0 # preconditioning
 args.spike_duration = 500
+args.lr_horizon = 0  # 0 follows legacy freeze_start; explicit positive value changes LR clock only
+args.lr_mode = "legacy_spiking"  # or exponential; legacy formula is unchanged
+args.lr_peak_start = -1  # -1 follows legacy TetOptimizer midpoint (2000)
 
 args.g_init=1.0
 args.s_init=1e-4
@@ -179,7 +207,7 @@ args.lambda_dist = 0.0
 args.lambda_sh = 0.0
 
 # [SDF-MODIFICATION] NeuS s_var 学习率设置
-args.s_var_lr_multiplier = 10   # s_var 学习率倍率（相对于 network_lr）
+args.s_var_lr_multiplier = 10.0   # s_var 学习率倍率（相对于 network_lr）
 
 # [SDF-MODIFICATION] Eikonal 和 Curvature Loss 设置（参考 Neuralangelo）
 args.lambda_eikonal = 0.0 #0.1       # Eikonal loss 权重
@@ -190,9 +218,22 @@ args.curvature_start = 0         # 开始使用 curvature loss 的迭代
 args.curvature_end = 18000        # 停止使用 curvature loss 的迭代
 args.curvature_warmup = 2000      # curvature loss warmup 迭代数（从 curvature_start 开始）
 args.curvature_decay_enabled = True  # 是否启用 curvature 权重衰减
+args.curvature_weight_origin = -1  # legacy start+warmup coupling; >=0 selects independent weight clock
+args.curvature_weight_end = -1  # -1 follows curvature_end; otherwise an absolute weight endpoint
+args.hessian_mode = "diagonal"  # legacy_row_sum retains the old analytical operator for ablation
+args.mesh_raster_backend = "gl"  # cuda is available for headless environments
+args.tet_normal_mode = "raw"  # preserve existing magnitude-weighted normals
+args.config = None  # optional JSON input
+args.checkpoint_milestones = ""  # comma-separated completed steps, sharing one LR horizon
+args.metrics_interval = 0  # opt-in windowed JSONL logging; ablation candidates use 100 steps
+args.seed = 52
 args.gradient_mode = "analytical"  # "analytical" 或 "numerical"
 args.gradient_taps = 4            # 数值梯度采样点数：4 或 6
-args.gradient_eps = 1e-3          # 数值梯度步长
+args.gradient_eps = 1e-3          # fixed world-space finite-difference step
+args.gradient_eps_mode = "fixed"  # hash_level uses Neuralangelo-style active resolution
+args.curvature_mode = "inherit"  # inherit follows gradient_mode and gradient_taps
+args.curvature_taps = 6  # applies only to explicit numerical curvature
+args.eikonal_sampling_mode = "nearest_abs_sdf"  # uniform: seeded, step-bound internal candidates
 args.num_eikonal_samples = 500000  # Eikonal loss 采样点数
 args.eikonal_band_threshold = None # SDF band 阈值：仅计算 |SDF| < threshold 的顶点的 loss
                                    # 设为 None 则计算所有内部顶点
@@ -225,6 +266,7 @@ args.mesh_depth_ratio = 1.0      # MILo: median深度的混合比例 (0.0=仅期
 args.mesh_normal_start = 5001     # 开始使用 mesh normal loss 的迭代
 args.mesh_normal_stop = 18000     # 停止使用 mesh normal loss 的迭代
 args.mesh_sdf_threshold = 0.0     # mesh 提取的 SDF 阈值
+args.depth_normal_coordinate_mode = "legacy"  # legacy centers / actual render ray_jitter
 args.mesh_normal_source = "depth_med"  # 计算 gaussian normal 的来源:
                                    # "depth": 使用期望深度推导法线 (默认)
                                    # "depth_med": 使用中位深度推导法线
@@ -235,6 +277,7 @@ args.lambda_normal_depth = 0.0      # 渲染的normal vs 期望深度推导的no
 args.lambda_normal_depth_med = 0.0  # 渲染的normal vs 中位深度推导的normal
 args.normal_depth_start = 5001         # 开始使用 normal-depth loss 的迭代
 args.normal_depth_end = 30000       # 停止使用 normal-depth loss 的迭代
+args.normal_depth_med_warmup_end = 0  # >normal_depth_start: NDmed weight ramps linearly from normal_depth_start to this step (0 = constant)
 
 # [MASK-LOSS] Mask Loss 和 Transmittance Concentration Loss（参考 SVRaster）
 args.lambda_mask = 0.1              # mask loss 权重：约束 T 与 GT mask 对齐
@@ -247,11 +290,16 @@ args.num_samples = 200
 args.k_samples = 1
 args.trunc_sigma = 0.35
 args.min_tet_count = 9
+args.densify_enabled = True     # Disable growth without changing optimizer LR schedule
 args.densify_start = 2000
 args.densify_end = 16000
 args.densify_interval = 500
 args.budget = 2_000_000
 args.max_split_per_iter = 50000         # 每次分裂的最大顶点数
+args.split_cap_change_step = 0          # >0: from this iteration on, use max_split_per_iter_after
+args.max_split_per_iter_after = 50000   # split cap after split_cap_change_step
+args.densify_render_min_t = -1.0        # >=0: near limit used by densification error renders (default render_err min_t=0.1)
+args.compact_tile_sort = False          # faster in-place CUB tile sort (same order, lower peak memory)
 args.within_thresh = 0.5
 args.total_thresh = 2.0
 args.clone_min_contrib = 0.003
@@ -292,8 +340,9 @@ args.ablate_circumsphere = True
 args.ablate_downweighing = False
 
 # 渲染图保存设置
+args.save_viewer_ply = True  # optional final Radiance Mesh viewer export
 args.save_render_interval = 500  # 每k次迭代保存渲染图，0表示不保存
-args.save_mesh_interval = 1000   # 每k次迭代用MT提取mesh并保存，0表示不保存
+args.save_mesh_interval = 0   # 每k次迭代用MT提取mesh并保存，0表示不保存
 
 # [MESH-EVAL] Mesh 提取与评估设置（复用 MILo 评估代码）
 # ┌─────────────────────────────────────────────────────────────────────┐
@@ -319,7 +368,77 @@ args.tsdf_sdf_trunc = 0.01      # SDF 截断
 args.tsdf_num_cluster = 50      # 后处理保留的最大 cluster 数
 
 
-args = Args.from_namespace(args.get_parser().parse_args())
+args = args.parse_args()
+
+if args.densify_render_min_t >= 0:
+    import functools
+    from utils import densification as _densification
+    _densification.render_err = functools.partial(
+        _densification.render_err, min_t=float(args.densify_render_min_t))
+if args.compact_tile_sort:
+    from types import SimpleNamespace
+    from torch.utils.cpp_extension import load as _load_extension
+    from delaunay_rasterization.internal import tile_shader_slang as _tile_shader
+    _compact_sort = _load_extension(
+        name="sort_by_keys_compact",
+        sources=[str(Path(__file__).resolve().parent / "delaunay_rasterization/internal/sort_by_keys/compact_sort.cu")],
+        verbose=False)
+
+    def _sort_by_keys(keys, values, tile_bits):
+        sorted_keys, sorted_values, _ = _compact_sort.sort_in_place(keys, values, tile_bits)
+        return sorted_keys, sorted_values
+    _tile_shader.sort_by_keys_cub = SimpleNamespace(sort_by_keys=_sort_by_keys)
+
+
+def normal_depth_med_weight(iteration):
+    """Constant NDmed weight, or a linear warm-up ending at normal_depth_med_warmup_end."""
+    weight = float(args.lambda_normal_depth_med)
+    start, end = args.normal_depth_start, args.normal_depth_med_warmup_end
+    if end > start:
+        weight *= min(1., max(0., (iteration - start) / float(end - start)))
+    return weight
+validate_depth_normal_coordinate_mode(args.depth_normal_coordinate_mode)
+training_clocks = resolve_training_clocks(args)
+curvature_weight_clock = resolve_curvature_weight_clock(args)
+validate_encoding_precision(args.encoding_precision)
+validate_triangulation_configuration(args.triangulation_backend, args.triangulation_timeout_seconds)
+# Apply after the model import, and before dataset/camera setup. --ckpt
+# uses the source math mode; the explicit-request policy is checked after load.
+validate_float32_matmul_precision(args.float32_matmul_precision)
+configure_float32_matmul_precision(
+    checkpoint_float32_matmul_precision(Path(args.ckpt)) if args.ckpt
+    else args.float32_matmul_precision)
+if args.iterations <= 0:
+    raise ValueError("iterations must be positive")
+if args.metrics_interval < 0:
+    raise ValueError("metrics_interval must be nonnegative")
+if args.curvature_warmup < 0:
+    raise ValueError("curvature_warmup must be nonnegative")
+if args.mesh_raster_backend not in ("gl", "cuda"):
+    raise ValueError("mesh_raster_backend must be gl or cuda")
+if args.tet_normal_mode not in ("raw", "unit"):
+    raise ValueError("tet_normal_mode must be raw or unit")
+if args.hessian_mode not in ("diagonal", "legacy_row_sum"):
+    raise ValueError("hessian_mode must be diagonal or legacy_row_sum")
+if args.gradient_mode not in ("analytical", "numerical"):
+    raise ValueError("gradient_mode must be analytical or numerical")
+if args.gradient_eps_mode not in ("fixed", "hash_level"):
+    raise ValueError("gradient_eps_mode must be fixed or hash_level")
+if args.gradient_mode == "numerical" and (args.gradient_taps not in (4, 6) or (args.gradient_eps_mode == "fixed" and args.gradient_eps <= 0)):
+    raise ValueError("Numerical gradients require 4/6 taps and positive gradient_eps")
+validate_curvature_configuration(args.curvature_mode, args.curvature_taps)
+if args.curvature_mode == "numerical" and args.gradient_eps_mode == "fixed" and args.gradient_eps <= 0:
+    raise ValueError("Numerical curvature requires positive gradient_eps")
+eikonal_sampling_configuration = validate_eikonal_sampling_configuration(args)
+regularization_pairing = validate_regularization_pairing(args)
+planned_checkpoint_milestones, checkpoint_milestones = resolve_checkpoint_milestones(
+    args.checkpoint_milestones, training_clocks)
+if args.ckpt and Path(args.ckpt).resolve() == args.output_path.resolve():
+    raise ValueError("Use a new output_path when loading ckpt; this protects its source config.json")
+random.seed(args.seed)
+np.random.seed(args.seed)
+torch.manual_seed(args.seed)
+torch.cuda.manual_seed_all(args.seed)
 
 # [EIKONAL-FIX] 几何初始化时自动禁用 contraction
 # contraction 是非线性变换，会破坏 eikonal loss 的梯度缩放
@@ -327,6 +446,10 @@ if args.use_geometric_init and args.use_contraction:
     print("[EIKONAL-FIX] use_geometric_init=True, 自动禁用 contraction")
     args.use_contraction = False
 
+if not args.densify_enabled:
+    args.sdf_densify_enabled = False
+
+setup_started = time.perf_counter()
 args.output_path.mkdir(exist_ok=True, parents=True)
 
 train_cameras, test_cameras, scene_info = loader.load_dataset(
@@ -358,16 +481,46 @@ print(f"[MILo] Saved camera poses: {poses.shape}")
 
 args.num_samples = min(len(train_cameras), args.num_samples)
 
-with (args.output_path / "config.json").open("w") as f:
-    json.dump(args.as_dict(), f, cls=CustomEncoder)
-
 device = torch.device('cuda')
-if len(args.ckpt) > 0: 
+checkpoint_precision_load = None
+checkpoint_matmul_precision_load = None
+if len(args.ckpt) > 0:
     model = Model.load_ckpt(Path(args.ckpt), device)
+    checkpoint_precision_load = reconcile_checkpoint_precision(args, model, sys.argv[1:])
+    checkpoint_matmul_precision_load = reconcile_checkpoint_matmul_precision(args, model, sys.argv[1:])
 else:
     model = Model.init_from_pcd(scene_info.point_cloud, train_cameras, device,
                                 current_sh_deg = args.max_sh_deg if args.sh_interval <= 0 else 0,
                                 **args.as_dict())
+model.tet_normal_mode = args.tet_normal_mode
+if args.ckpt:
+    model.configure_triangulation(args.triangulation_backend, args.triangulation_timeout_seconds, args.output_path)
+scene_scaling_scalar = float(model.scene_scaling)
+
+# Save only after checkpoint native precision and actual global math mode are reconciled.
+with (args.output_path / "config.json").open("w") as f:
+    json.dump(args.as_dict(), f, cls=CustomEncoder)
+
+with (args.output_path / "config_sources.json").open("w") as f:
+    json.dump({
+        "priority": ["defaults", "explicit_config_json", "explicit_cli"],
+        "explicit_config": str(args.config) if args.config else None,
+        "checkpoint_model_config": str(Path(args.ckpt) / "config.json") if args.ckpt else None,
+        "checkpoint_load": "model_weights_only; optimizer and iteration are not resumed",
+        "training_clocks": training_clocks,
+        "curvature_weight_schedule": curvature_weight_clock,
+        "planned_checkpoint_milestones": sorted(planned_checkpoint_milestones),
+        "effective_checkpoint_milestones": sorted(checkpoint_milestones),
+        "encoding_precision_load": checkpoint_precision_load,
+        "float32_matmul_precision_load": checkpoint_matmul_precision_load,
+        "actual_matmul_precision": matmul_precision_state(model),
+        "eikonal_sampling": eikonal_sampling_configuration,
+        "eikonal_sampling_checkpoint_policy": "current_run_config; weights_only_load_resets_iteration; no_mutable_sampler_rng",
+        "triangulation_backend": args.triangulation_backend,
+        "triangulation_timeout_seconds": args.triangulation_timeout_seconds,
+        "argv": sys.argv[1:],
+    }, f, indent=2)
+
 min_t = args.min_t
 
 tet_optim = TetOptimizer(model, **args.as_dict())
@@ -384,7 +537,7 @@ mesh_regularizer = MeshRegularizer(
     depth_scale=args.mesh_depth_scale,
     depth_ratio=args.mesh_depth_ratio,  # MILo: 期望/中位深度混合比例
     sdf_threshold=args.mesh_sdf_threshold,
-    use_opengl=True,
+    use_opengl=(args.mesh_raster_backend == "gl"),
 )
 
 # [DEBUG-MEMORY] 初始化显存监控
@@ -415,7 +568,8 @@ num_densify_iter = args.densify_end - args.densify_start
 N = num_densify_iter // args.densify_interval + 1
 S = model.vertices.shape[0]
 
-dschedule = list(range(args.densify_start, args.densify_end, args.densify_interval))
+dschedule = (list(range(args.densify_start, args.densify_end, args.densify_interval))
+             if args.densify_enabled else [])
 
 print("Encoding LR")
 # xs = list(range(args.iterations))
@@ -439,9 +593,21 @@ mesh_save_dir = args.output_path / "meshes"
 if args.save_mesh_interval > 0:
     mesh_save_dir.mkdir(exist_ok=True, parents=True)
 
-progress_bar = tqdm(range(args.iterations))
+progress_bar = tqdm(range(training_clocks["training_budget_steps"]))
 torch.cuda.empty_cache()
+torch.cuda.synchronize()
+setup_seconds = time.perf_counter() - setup_started
+training_started = time.perf_counter()
+from utils.training_metrics import (TrainingMetricWindow, gradient_norm_statistics,
+                                    optimizer_learning_rates)
+metric_window = TrainingMetricWindow(args.output_path / "training_metrics.jsonl", args.metrics_interval)
+checkpoint_seconds = 0.0
+peak_training_allocated = 0
+torch.cuda.reset_peak_memory_stats()
+completed_step = 0
+vertex_optimizer_updates = 0
 for iteration in progress_bar:
+    model.triangulation_context = {"iteration": int(iteration), "event": "periodic"}
     do_delaunay = iteration % args.delaunay_interval == 0 and iteration < args.freeze_start
     do_freeze = iteration == args.freeze_start
     do_cloning = iteration in dschedule
@@ -451,6 +617,13 @@ for iteration in progress_bar:
     # Coarse-to-Fine: 更新激活的 hash grid 层数
     if args.coarse2fine_enabled:
         model.backbone.set_active_levels(iteration)
+
+    effective_gradient_eps = (args.gradient_eps if args.gradient_eps_mode == "fixed" else
+                              scene_scaling_scalar * model.backbone.get_normal_epsilon())
+    curvature_settings = resolve_curvature_settings(
+        args.gradient_mode, args.gradient_taps, args.curvature_mode,
+        args.curvature_taps, effective_gradient_eps,
+    )
 
     if do_delaunay or do_freeze:
         st = time.time()
@@ -467,6 +640,7 @@ for iteration in progress_bar:
             # model.train()
             print(f"Kept {mask.sum()} tets")
             model, tet_optim = freeze_model(model, mask, args)
+            model.tet_normal_mode = args.tet_normal_mode
             # model, tet_optim = freeze_model(model, **args.as_dict())
             gc.collect()
             torch.cuda.empty_cache()
@@ -486,6 +660,7 @@ for iteration in progress_bar:
 
     st = time.time()
     ray_jitter = torch.rand((camera.image_height, camera.image_width, 2), device=device)
+    normal_pixel_offsets = depth_normal_pixel_offsets(args.depth_normal_coordinate_mode, ray_jitter)
 
     # [DEBUG-MEMORY] 捕获 OOM 异常并打印详细信息
     try:
@@ -530,18 +705,29 @@ for iteration in progress_bar:
             model,
             num_samples=args.num_eikonal_samples,
             band=args.eikonal_band_threshold,  # None 表示使用所有内部顶点
-            use_tet_sampling=args.eikonal_tet_sampling  # False 则仅使用 band 内顶点
+            use_tet_sampling=args.eikonal_tet_sampling,  # False 则仅使用 band 内顶点
+            sampling_mode=args.eikonal_sampling_mode, seed=args.seed, step=iteration,
         )
         eik_num_samples = sampled_points.shape[0]
 
         # 如果采样点为空，跳过 loss 计算
         if sampled_points.shape[0] > 0:
-            # 在采样点上计算 SDF 梯度
-            _, gradients, hessian_diag = model.compute_sdf_gradients(
+            # Keep Eikonal/TV derivatives independent from explicit curvature.
+            need_regularization_gradient = eikonal_active or (
+                args.lambda_gradient_tv > 0 and
+                args.gradient_tv_start <= iteration < args.gradient_tv_end
+            )
+            gradients, hessian_diag = compute_regularization_derivatives(
+                model,
                 points=sampled_points,
-                mode=args.gradient_mode,
-                taps=args.gradient_taps,
-                eps=args.gradient_eps
+                gradient_mode=args.gradient_mode,
+                gradient_taps=args.gradient_taps,
+                eps=effective_gradient_eps,
+                hessian_mode=args.hessian_mode,
+                curvature_mode=args.curvature_mode,
+                curvature_taps=args.curvature_taps,
+                need_gradient=need_regularization_gradient,
+                curvature_active=curvature_active,
             )
             eik_gradients = gradients  # 保存梯度用于 gradient TV loss
 
@@ -551,12 +737,8 @@ for iteration in progress_bar:
                 curv_loss = curvature_loss(hessian_diag)
                 # [Neuralangelo] curvature 权重调度
                 if hasattr(model.backbone, 'get_curvature_weight_decay'):
-                    curv_weight_decay = model.backbone.get_curvature_weight_decay(
-                        iteration=iteration,
-                        warmup_end=args.curvature_start + args.curvature_warmup,
-                        decay_end=args.curvature_end,
-                        decay_enabled=args.curvature_decay_enabled
-                    )
+                    curv_weight_decay = curvature_weight_factor(
+                        model.backbone, iteration, curvature_weight_clock)
 
     # [EDGE-SDF-LOSS] Edge SDF Loss（参考 svraster TV loss）
     # [GRADIENT-TV-LOSS] Gradient TV Loss（促进SDF梯度平滑）
@@ -601,7 +783,9 @@ for iteration in progress_bar:
                     points=grad_tv_points,
                     mode=args.gradient_mode,
                     taps=args.gradient_taps,
-                    eps=args.gradient_eps
+                    eps=effective_gradient_eps,
+                    hessian_mode=args.hessian_mode,
+                    compute_hessian=False
                 )
             else:
                 grad_tv_gradients = None
@@ -630,6 +814,7 @@ for iteration in progress_bar:
         gaussian_depth = render_pkg['depth']  # (H, W)
         gaussian_depth_med = render_pkg['depth_med']  # (H, W) 中位深度
         rendered_normal_for_mesh = render_pkg['normal']  # (3, H, W) 世界空间
+        torch.cuda.empty_cache()
         mesh_reg_result = mesh_regularizer(
             model=model,
             camera=camera,
@@ -641,6 +826,7 @@ for iteration in progress_bar:
             iteration=iteration,
             gt_mask=gt_mask,  # 传入GT alpha mask，排除背景散乱法线
             train_cameras=train_cameras,
+            pixel_offsets=normal_pixel_offsets,
         )
         mesh_loss = mesh_reg_result['loss']
         mesh_loss_active = mesh_reg_result['active']
@@ -650,6 +836,7 @@ for iteration in progress_bar:
     # [DEPTH-NORMAL-LOSS] 深度推导法线与渲染法线一致性 Loss
     normal_depth_loss = torch.tensor(0.0, device=device)
     normal_depth_med_loss = torch.tensor(0.0, device=device)
+    ndmed_weight = normal_depth_med_weight(iteration)
     normal_depth_active = (
         (args.lambda_normal_depth > 0 or args.lambda_normal_depth_med > 0)
         and iteration >= args.normal_depth_start
@@ -680,14 +867,14 @@ for iteration in progress_bar:
 
         if args.lambda_normal_depth > 0:
             # 从期望深度推导法线（相机空间）
-            depth_normal = depth_to_normal(camera, render_pkg['depth'])  # (3, H, W)
+            depth_normal = depth_to_normal(camera, render_pkg['depth'], pixel_offsets=normal_pixel_offsets)  # (3, H, W)
             normal_depth_loss = compute_normal_consistency_loss(
                 rendered_normal_view, depth_normal, valid_mask
             )
 
         if args.lambda_normal_depth_med > 0:
             # 从中位深度推导法线（相机空间）
-            depth_med_normal = depth_to_normal(camera, render_pkg['depth_med'])  # (3, H, W)
+            depth_med_normal = depth_to_normal(camera, render_pkg['depth_med'], pixel_offsets=normal_pixel_offsets)  # (3, H, W)
             normal_depth_med_loss = compute_normal_consistency_loss(
                 rendered_normal_view, depth_med_normal, valid_mask
             )
@@ -719,7 +906,7 @@ for iteration in progress_bar:
            (args.lambda_curvature * curv_weight_decay * curv_loss if curvature_active else 0.0) + \
            mesh_loss + \
            (args.lambda_normal_depth * normal_depth_loss if normal_depth_active and args.lambda_normal_depth > 0 else 0.0) + \
-           (args.lambda_normal_depth_med * normal_depth_med_loss if normal_depth_active and args.lambda_normal_depth_med > 0 else 0.0) + \
+           (ndmed_weight * normal_depth_med_loss if normal_depth_active and args.lambda_normal_depth_med > 0 else 0.0) + \
            args.lambda_mask * mask_loss + \
            args.lambda_T_concen * T_concen_loss + \
            (args.lambda_edge_sdf * edge_loss if edge_sdf_active else 0.0) + \
@@ -731,6 +918,10 @@ for iteration in progress_bar:
     if DEBUG_MEMORY:
         memory_monitor.log_delta(iteration, "after_backward", model)
 
+    vertex_optimizer_stepped = bool(do_delaunay and tet_optim.vertex_optim is not None)
+    applied_learning_rates = (
+        optimizer_learning_rates(tet_optim, vertex_stepped=vertex_optimizer_stepped)
+        if args.metrics_interval > 0 or iteration + 1 in checkpoint_milestones else None)
     tet_optim.main_step()
     tet_optim.main_zero_grad()
 
@@ -740,6 +931,7 @@ for iteration in progress_bar:
 
     if do_delaunay:
         tet_optim.vertex_optim.step()
+        vertex_optimizer_updates += 1
         tet_optim.vertex_optim.zero_grad()
 
     tet_optim.update_learning_rate(iteration)
@@ -778,22 +970,24 @@ for iteration in progress_bar:
             if DEBUG_MEMORY:
                 memory_monitor.log(iteration, "before_collect_stats", model, print_now=True)
 
+            target_addition = args.budget - model.vertices.shape[0]
+            densify_args = args
+            if args.split_cap_change_step > 0 and iteration >= args.split_cap_change_step:
+                densify_args = type(args).from_namespace(Namespace(**args.as_dict()))
+                densify_args.max_split_per_iter = args.max_split_per_iter_after
             model.eval()
-            stats = collect_render_stats(sampled_cams, model, args, device)
+            stats = collect_render_stats(sampled_cams, model, args, device) if target_addition > 0 else None
             model.train()
 
             # [DEBUG-MEMORY] collect_render_stats 后
             if DEBUG_MEMORY:
                 memory_monitor.log_delta(iteration, "after_collect_stats", model)
 
-            # target_addition = targets[dschedule.index(iteration)] - model.vertices.shape[0]
-            target_addition = args.budget - model.vertices.shape[0]
-
             apply_densification(
                 stats,
                 model       = model,
                 tet_optim   = tet_optim,
-                args        = args,
+                args        = densify_args,
                 iteration   = iteration,
                 device      = device,
                 sample_cam  = sample_camera,
@@ -1063,8 +1257,157 @@ for iteration in progress_bar:
                     imageio.imwrite(str(mesh_render_path), combined_mesh)
                     print(f"[Mesh] Saved mesh renders at iter {iteration}")
                 except Exception as e:
+                    if is_external_termination(e):
+                        raise
                     print(f"[Mesh] Failed to render mesh at iter {iteration}: {e}")
 
+    completed_step = iteration + 1
+    eikonal_norm_stats = (gradient_norm_statistics(
+        eik_gradients, active=eikonal_active and eik_num_samples > 0,
+    ) if args.metrics_interval > 0 or completed_step in checkpoint_milestones else {})
+    if args.metrics_interval > 0:
+        eik_valid = eikonal_active and eik_num_samples > 0
+        curv_valid = curvature_active and eik_num_samples > 0
+        learning_rates = optimizer_learning_rates(tet_optim)
+        metric_window.add(
+            completed_step,
+            values={
+                "total_loss": loss, "l1": l1_loss, "ssim": ssim_loss,
+                "photo_contribution": (1 - args.lambda_ssim) * l1_loss + args.lambda_ssim * ssim_loss,
+                "regularizer_contribution": reg,
+                "distortion_contribution": args.lambda_dist * dl_loss,
+                "sh_contribution": args.lambda_sh * render_pkg["sh_reg"],
+                "mask_contribution": args.lambda_mask * mask_loss,
+                "transmittance_concentration_contribution": args.lambda_T_concen * T_concen_loss,
+                "edge_sdf_contribution": args.lambda_edge_sdf * edge_loss if edge_sdf_active else edge_loss * 0,
+                "gradient_tv_contribution": args.lambda_gradient_tv * grad_tv_loss if grad_tv_active else grad_tv_loss * 0,
+                "eikonal_raw_active": eik_loss, "curvature_raw_active": curv_loss,
+                "eikonal_contribution": args.lambda_eikonal * eik_loss if eikonal_active else eik_loss * 0,
+                "curvature_contribution": args.lambda_curvature * curv_weight_decay * curv_loss if curvature_active else curv_loss * 0,
+                "mesh_contribution": mesh_loss,
+                "normal_depth_contribution": args.lambda_normal_depth * normal_depth_loss if normal_depth_active else normal_depth_loss * 0,
+                "normal_depth_med_contribution": ndmed_weight * normal_depth_med_loss if normal_depth_active else normal_depth_med_loss * 0,
+                "normal_depth_med_effective_weight": loss.new_tensor(ndmed_weight if normal_depth_active else 0.),
+                "eikonal_effective_weight": loss.new_tensor(args.lambda_eikonal if eik_valid else 0),
+                "curvature_effective_weight": loss.new_tensor(args.lambda_curvature * curv_weight_decay if curv_valid else 0),
+                "sdf_gradient_samples": loss.new_tensor(eik_num_samples),
+                **eikonal_norm_stats,
+            },
+            eligible={"eikonal_raw_active": eik_valid, "curvature_raw_active": curv_valid,
+                      **{name: eik_valid for name in eikonal_norm_stats}},
+            vertices=int(model.vertices.shape[0]), tetrahedra=int(model.indices.shape[0]),
+            learning_rates=learning_rates, epsilon=effective_gradient_eps,
+            applied_learning_rates=applied_learning_rates,
+            vertex_optimizer_stepped=vertex_optimizer_stepped,
+        )
+        if metric_window.due():
+            metric_window.flush("interval")
+    if completed_step in checkpoint_milestones:
+        metric_window.flush("checkpoint")
+        torch.cuda.synchronize()
+        checkpoint_started = time.perf_counter()
+        checkpoint_dir = args.output_path / "checkpoints" / f"step_{completed_step:06d}"
+        checkpoint_dir.mkdir(parents=True, exist_ok=False)
+        checkpoint_state = model.state_dict()
+        checkpoint_state["indices"] = model.indices
+        checkpoint_state["empty_indices"] = model.empty_indices
+        torch.save(checkpoint_state, checkpoint_dir / "ckpt.pth")
+        from utils.checkpoint_util import save_runtime_state
+        runtime_state = save_runtime_state(model, checkpoint_dir / "runtime_state.json")
+        del checkpoint_state
+        for filename in ("config.json", "transform.txt", "poses.npy"):
+            original = args.output_path / filename
+            if original.exists():
+                import shutil
+                shutil.copy2(original, checkpoint_dir / filename)
+        peak_training_allocated = max(peak_training_allocated, torch.cuda.max_memory_allocated())
+        metadata = {
+            **training_clock_metadata(training_clocks, completed_step),
+            "vertex_optimizer_updates": vertex_optimizer_updates,
+            "curvature_weight_schedule": curvature_weight_clock,
+            "planned_checkpoint_milestones": sorted(planned_checkpoint_milestones),
+            "effective_checkpoint_milestones": sorted(checkpoint_milestones),
+            "training_seconds_excluding_checkpoints": checkpoint_started - training_started - checkpoint_seconds,
+            "checkpoint_seconds_before_this": checkpoint_seconds,
+            "peak_allocated_bytes": peak_training_allocated,
+            "vertices": int(model.vertices.shape[0]),
+            "tetrahedra": int(model.indices.shape[0]),
+            "tet_normal_mode": args.tet_normal_mode,
+            "seed": args.seed,
+            "eikonal_sampling": eikonal_sampling_metadata(args.eikonal_sampling_mode, args.seed, iteration),
+            "runtime_state": runtime_state,
+            **matmul_precision_state(model),
+            "last_training_sample": {
+                "camera_index": ind,
+                "learning_rates_applied": applied_learning_rates,
+                "learning_rates_next": optimizer_learning_rates(tet_optim),
+                "vertex_optimizer_stepped": vertex_optimizer_stepped,
+                "curvature_weight_schedule": curvature_weight_clock,
+                "psnr": psnr,
+                "loss": float(loss.detach()),
+                "eikonal": float(eik_loss.detach()),
+                "curvature": float(curv_loss.detach()),
+                "eikonal_samples": int(eik_num_samples),
+                "eikonal_sampling_mode": args.eikonal_sampling_mode,
+                "eikonal_sampling_bound_step": iteration,
+                **{name: None if value is None else float(value)
+                   for name, value in eikonal_norm_stats.items()},
+                "effective_eikonal_weight": args.lambda_eikonal if eikonal_active else 0.0,
+                "effective_normal_depth_med_weight": ndmed_weight if normal_depth_active else 0.,
+                "effective_curvature_weight": args.lambda_curvature * curv_weight_decay if curvature_active else 0.0,
+                "gradient_mode": args.gradient_mode,
+                "gradient_taps": args.gradient_taps,
+                "effective_gradient_eps": effective_gradient_eps,
+                "gradient_eps_mode": args.gradient_eps_mode,
+                "curvature_mode": args.curvature_mode,
+                "curvature_taps": args.curvature_taps,
+                "curvature_eps": args.gradient_eps,
+                "effective_curvature_mode": curvature_settings["effective_mode"],
+                "effective_curvature_taps": curvature_settings["effective_taps"],
+                "effective_curvature_eps": curvature_settings["effective_eps"],
+                "curvature_eps_mode": args.gradient_eps_mode,
+                "hessian_mode": args.hessian_mode,
+            },
+        }
+        from utils.normal_diagnostics import normal_geometry_diagnostics
+        try:
+            metadata["normal_geometry"] = normal_geometry_diagnostics(model)
+        except Exception as error:
+            if is_external_termination(error):
+                raise
+            metadata["normal_geometry"] = {"status": "failed", "error": str(error)}
+            print(f"[NORMAL-DIAGNOSTICS] {error}")
+        with (checkpoint_dir / "checkpoint_info.json").open("w") as f:
+            json.dump(metadata, f, indent=2)
+        torch.cuda.synchronize()
+        checkpoint_seconds += time.perf_counter() - checkpoint_started
+        torch.cuda.reset_peak_memory_stats()
+        print(f"[CHECKPOINT] step={completed_step} path={checkpoint_dir}")
+
+metric_window.flush("final")
+torch.cuda.synchronize()
+with (args.output_path / "training_runtime.json").open("w") as f:
+    json.dump({
+        **training_clock_metadata(training_clocks, completed_step),
+        "vertex_optimizer_updates": vertex_optimizer_updates,
+        "curvature_weight_schedule": curvature_weight_clock,
+        "planned_checkpoint_milestones": sorted(planned_checkpoint_milestones),
+        "effective_checkpoint_milestones": sorted(checkpoint_milestones),
+        **matmul_precision_state(model),
+        "setup_seconds": setup_seconds,
+        "training_seconds_excluding_checkpoints": time.perf_counter() - training_started - checkpoint_seconds,
+        "checkpoint_seconds": checkpoint_seconds,
+        "peak_allocated_bytes": max(peak_training_allocated, torch.cuda.max_memory_allocated()),
+        "curvature_derivatives": {**curvature_settings, "eps_mode": args.gradient_eps_mode},
+        "regularization_pairing": regularization_pairing,
+        "eikonal_sampling": eikonal_sampling_metadata(args.eikonal_sampling_mode, args.seed, completed_step - 1),
+        "vertices": int(model.vertices.shape[0]),
+        "tetrahedra": int(model.indices.shape[0]),
+        "tet_normal_mode": args.tet_normal_mode,
+        "seed": args.seed,
+    }, f, indent=2)
+
+export_eval_started = time.perf_counter()
 avged_psnrs = [sum(v)/len(v) for v in psnrs if len(v) == len(train_cameras)]
 # video_writer.release()
 
@@ -1095,11 +1438,14 @@ with (args.output_path / "results.json").open("w") as f:
 #         eimages.append(pad_image2even(image))
 # mediapy.write_video(args.output_path / "rotating.mp4", eimages)
 
-model.save2ply(args.output_path / "ckpt.ply")
+if args.save_viewer_ply:
+    model.save2ply(args.output_path / "ckpt.ply")
 sd = model.state_dict()
 sd['indices'] = model.indices
 sd['empty_indices'] = model.empty_indices
 torch.save(sd, args.output_path / "ckpt.pth")
+from utils.checkpoint_util import save_runtime_state
+save_runtime_state(model, args.output_path / "runtime_state.json")
 
 # ============================================================================
 # [MESH-EVAL] Mesh 提取与评估（复用 MILo 评估代码）
@@ -1424,5 +1770,18 @@ if DEBUG_MEMORY:
     memory_monitor.summary()
 
 print("\n" + "="*60)
+runtime_path = args.output_path / "training_runtime.json"
+runtime_data = json.loads(runtime_path.read_text())
+runtime_data["export_eval_seconds"] = time.perf_counter() - export_eval_started
+runtime_data["total_setup_training_checkpoint_export_seconds"] = (
+    runtime_data["setup_seconds"] +
+    runtime_data["training_seconds_excluding_checkpoints"] +
+    runtime_data["checkpoint_seconds"] +
+    runtime_data["export_eval_seconds"])
+runtime_data["status"] = "completed"
+runtime_path.write_text(json.dumps(runtime_data, indent=2))
 print("[DONE] Training and evaluation completed.")
 print("="*60)
+
+if hasattr(model, "close_triangulation"):
+    model.close_triangulation()

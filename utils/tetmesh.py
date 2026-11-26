@@ -50,6 +50,20 @@ base_tet_edges = torch.tensor([0, 1, 0, 2, 0, 3, 1, 2, 1, 3, 2, 3], dtype=torch.
 v_id = torch.pow(2, torch.arange(4, dtype=torch.long))
 
 
+def _unique_edges_with_packed_keys(all_edges, num_vertices):
+    # For valid nonnegative vertex IDs, i*N+j has exactly the same order as (i,j).
+    # Keep the original operation for inputs outside that bijection's domain.
+    base = int(num_vertices)
+    if (base <= 0 or base > 3037000499 or all_edges.numel() == 0
+            or int(all_edges.min()) < 0 or int(all_edges.max()) >= base):
+        return torch.unique(all_edges, dim=0, return_inverse=True)
+    keys = all_edges[:, 0].long() * base + all_edges[:, 1].long()
+    unique_keys, inverse = torch.unique(keys, sorted=True, return_inverse=True)
+    edges = torch.stack((torch.div(unique_keys, base, rounding_mode='floor'),
+                         torch.remainder(unique_keys, base)), dim=1)
+    return edges, inverse
+
+
 def _unbatched_marching_tetrahedra(vertices, tets, sdf, num_internal=None):
     """Unbatched marching tetrahedra - extracts triangle mesh from SDF on tetrahedra.
 
@@ -135,7 +149,7 @@ def _unbatched_marching_tetrahedra(vertices, tets, sdf, num_internal=None):
         all_edges[order] = all_edges[order][:, [1, 0]]
 
         # Find unique edges
-        unique_edges, idx_map = torch.unique(all_edges, dim=0, return_inverse=True)
+        unique_edges, idx_map = _unique_edges_with_packed_keys(all_edges, vertices.shape[0])
         unique_edges = unique_edges.long()
 
         # Only keep edges that cross the surface (one endpoint inside, one outside)

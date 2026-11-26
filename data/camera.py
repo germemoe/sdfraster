@@ -1,4 +1,5 @@
 import torch
+from utils.delaunay_isolation import is_external_termination
 from torch import nn
 import numpy as np
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix
@@ -40,6 +41,8 @@ class Camera(nn.Module):
         try:
             self.data_device = torch.device(data_device)
         except Exception as e:
+            if is_external_termination(e):
+                raise
             print(e)
             print(f"[Warning] Custom device {data_device} failed, fallback to default cuda device" )
             self.data_device = torch.device("cuda")

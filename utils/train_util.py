@@ -63,7 +63,9 @@ def render(camera: Camera, model, cell_values=None, tile_size=16, min_t=0.1,
         vert_sdf,      # [SDF-MODIFICATION] 全局顶点SDF数组
         inv_s,         # [SDF-MODIFICATION] NeuS inv_s 参数
         tcam,
-        ray_jitter)
+        ray_jitter,
+        str(vertices.device),
+        kwargs.get("tet_normal_mode", getattr(model, "tet_normal_mode", "raw")))
     alpha_log_T = image_rgb.permute(2,0,1)[3, ...]  # log_transmittance (负值)
     alpha = 1.0 - torch.exp(alpha_log_T)  # 转换为真正的 alpha = 1 - T
     total_density = (distortion_img[:, :, 2]**2).clip(min=1e-6)
